@@ -4,6 +4,7 @@
 //! probes found, and never reads tool state itself. Formatting lives in
 //! [`render`]; this file is argument parsing, dispatch and exit codes.
 
+mod keys;
 mod render;
 
 use anyhow::Result;
@@ -52,6 +53,11 @@ enum Command {
         tool: String,
         #[arg(long)]
         json: bool,
+    },
+    /// The key vault: standalone API keys and tokens no CLI tracks.
+    Key {
+        #[command(subcommand)]
+        command: keys::Command,
     },
 }
 
@@ -119,6 +125,9 @@ fn run() -> Result<i32> {
             }
             Ok(0)
         }
+        // The vault has its own registry: it stores keys the user gave patchbay
+        // on purpose, not state discovered by a probe.
+        Command::Key { command } => keys::run(command, &styles()),
     }
 }
 

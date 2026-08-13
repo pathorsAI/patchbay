@@ -20,7 +20,15 @@
 //! secret and passphrase values are never copied into [`ToolStatus`], never
 //! logged, and never included in error messages — probes parse only the fields
 //! they need (expiry, scopes, account) and drop the rest.
+//!
+//! The one deliberate exception is the **key vault** ([`keys`]): standalone API
+//! keys that no CLI tracks, which the user (or an AI agent) hands to patchbay on
+//! purpose. Even there the split holds — metadata goes to a JSON file, the value
+//! goes straight to the OS keychain ([`keystore`]), and
+//! [`KeyRegistry::get_secret`] is the single, gated way back out.
 
+pub mod keys;
+pub mod keystore;
 pub mod paths;
 pub mod probe;
 pub mod probes;
@@ -28,6 +36,8 @@ pub mod registry;
 pub mod types;
 pub mod util;
 
+pub use keys::{KeyEntry, KeyPatch, KeyRegistry, NewKey};
+pub use keystore::Keystore;
 pub use paths::Paths;
 pub use probe::Probe;
 pub use registry::Registry;

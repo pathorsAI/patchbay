@@ -13,6 +13,7 @@ patchbay is the patch panel:
 - **Permissions view** — see what your current tokens can actually do (`gh` token scopes, cloud IAM roles) and fix missing scopes with one action instead of re-generating tokens blind.
 - **Switch** — change profile/context for any tool from the panel, including the traps (looking at you, `gcloud` ADC).
 - **MCP server** — AI agents are first-class operators: `list_connections`, `switch_profile`, `get_permissions`, `verify`, `plan_setup`. "Switch to the cerana gcloud account and deploy" becomes one sentence.
+- **[Key vault](#key-vault)** — the standalone API keys no CLI tracks, in one registry. Values go to the Keychain, metadata to a file you can read, and an agent that just created a token registers it over MCP instead of leaving it to rot in a chat log.
 - **Migrate** — export a bundle: portable credentials travel encrypted, device-bound ones (Keychain-backed `gh`, `infisical`) become a manifest entry. On the new machine, your AI reads the gap list and walks you through re-auth until the diff is zero.
 
 ## Install
@@ -98,6 +99,81 @@ cd app && bun run build   # typecheck + production bundle into app/dist
 > `bun run tauri dev`, or `bun run tauri build --debug` for a binary with the
 > front end embedded. In debug builds the app prints the URL it loaded and
 > whether the load finished, which is the first thing to check on a blank panel.
+
+## Key vault
+
+The probes cover credentials some CLI already owns. The key vault covers the
+ones nothing owns: the Cloudflare token you pasted into a GitHub Actions secret,
+the provider key wired into a cron job, the service token an AI created for you
+halfway through a task. They exist, they expire, and until now your machine had
+no idea they were there.
+
+```sh
+# The secret is read from stdin, or from a hidden prompt. Never from argv.
+pbpaste | pb key add cf-gh-actions-deploy \
+  --provider cloudflare \
+  --label "CF deploy token" \
+  --purpose "deploy worker from GitHub Actions in pathorsAI/patchbay" \
+  --scopes workers:edit,zone:read \
+  --expires 2027-01-01
+
+pb key list                 # id, provider, label, last4, expiry, purpose
+pb key list --expiring 30   # what dies in the next month
+pb key list --json          # what the MCP server and the panel see
+pb key copy cf-gh-actions-deploy   # to the clipboard, never to your terminal
+pb key rm  cf-gh-actions-deploy    # metadata and Keychain item, both
+```
+
+### The security model
+
+**Two stores, split on purpose.** The secret goes into the macOS Keychain
+(service `patchbay`, account = the key's id) and never touches patchbay's own
+disk. The metadata — provider, label, purpose, scopes, expiry, source, and the
+last 4 characters of the value — goes into `~/.config/patchbay/keys.json`,
+mode `0600`. That file is readable, greppable and diffable, and worthless to
+anyone who steals it. Audit the other half with your own eyes:
+
+```sh
+security find-generic-password -s patchbay -a cf-gh-actions-deploy
+```
+
+**Both or neither.** A write puts the metadata down first and the Keychain item
+second; if the Keychain refuses, the metadata file is restored to exactly what
+it was. The registry never advertises a key whose value was never stored.
+
+**Writing is easy, reading is not.** There is no `pb key show`. `pb key copy`
+pipes the value into `pbcopy` — it never passes through stdout, a log or your
+shell history. Secrets never arrive as arguments either, in either direction.
+
+**AI agents can register keys, not read them.** Over MCP:
+
+| Tool | Gate |
+|---|---|
+| `store_key` | open — this is the point. An agent that creates a key registers it, with purpose and expiry, so your patchbay stays the source of truth |
+| `list_keys` | open — metadata only, plus a derived `expiry_state` |
+| `get_key` | **refused** unless the server process has `PATCHBAY_ALLOW_SECRET_READ=1` |
+| `remove_key` | **refused** unless the same flag is set — it is destructive |
+
+The flag lives on the server process, so only you can set it, and no argument
+an agent sends can talk its way past it. The refusal says so and points the
+human at `pb key copy <id>` instead. If you do want an agent reading values:
+
+```json
+{ "mcpServers": { "patchbay": {
+    "command": "/usr/local/bin/patchbay-mcp",
+    "env": { "PATCHBAY_ALLOW_SECRET_READ": "1" }
+} } }
+```
+
+**Known tradeoff.** The Keychain write shells out to `security
+add-generic-password -w <value>`, which puts the secret in that command's argv
+for the few milliseconds it runs — visible to `ps` for the same user. `security`
+has no way to take a password on stdin. Moving to the Security framework API,
+where the value never becomes a command line, is tracked in
+`crates/patchbay-core/src/keystore.rs`.
+
+**Removing is not revoking.** `pb key rm` makes patchbay forget a key. The
+credential keeps working until you revoke it at the provider.
 
 ## Contributing
 

@@ -84,7 +84,9 @@ pub enum ExpiryLevel {
 }
 
 impl ExpiryLevel {
-    fn style(self) -> Style {
+    /// The color this level paints its cell. Public so the key vault's table
+    /// can color expiry the same way the status board does.
+    pub fn style(self) -> Style {
         match self {
             ExpiryLevel::Critical => red(),
             ExpiryLevel::Warn => yellow(),

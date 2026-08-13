@@ -6,9 +6,16 @@
 #
 #   1. initialize                 -> serverInfo + instructions + capabilities
 #   2. notifications/initialized  -> (no response; completes the handshake)
-#   3. tools/list                 -> the five patchbay tools + their schemas
+#   3. tools/list                 -> the nine patchbay tools + their schemas
 #   4. tools/call list_connections-> tier-1 board for this machine
 #   5. tools/call get_status(nope)-> tool error listing the valid tool names
+#   6. tools/call list_keys       -> the key vault, metadata only
+#   7. tools/call get_key         -> REFUSED, because PATCHBAY_ALLOW_SECRET_READ
+#                                    is not set on the server process
+#
+# Nothing here writes: no key is stored, and the vault is only read. Step 7 is
+# the important one - it is the assertion that the read gate is closed by
+# default, which is the whole security story of the vault.
 #
 # Every line on stdout must be a JSON-RPC message: the test fails if the server
 # prints anything else there (logs belong on stderr).
@@ -43,7 +50,11 @@ trap 'rm -f "$out" "$err"' EXIT
   printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
   printf '%s\n' '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_connections","arguments":{}}}'
   printf '%s\n' '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"get_status","arguments":{"tool":"definitely-not-a-tool"}}}'
-} | "$BIN" >"$out" 2>"$err"
+  printf '%s\n' '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"list_keys","arguments":{}}}'
+  printf '%s\n' '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"get_key","arguments":{"id":"anything"}}}'
+# The gate must be closed because the variable is unset, so make sure it is -
+# a value inherited from the developer's shell would silently void step 7.
+} | env -u PATCHBAY_ALLOW_SECRET_READ "$BIN" >"$out" 2>"$err"
 
 echo "--- stdout (JSON-RPC) ---"
 cat "$out"
@@ -60,10 +71,10 @@ while IFS= read -r line; do
     || fail "non-JSON line on stdout (logs must go to stderr): $line"
 done <"$out"
 
-# Four requests, four responses. Ids may come back out of order — the server
+# Six requests, six responses. Ids may come back out of order — the server
 # handles calls concurrently — so the checks below key off the id, not order.
-[[ "$(grep -c '"jsonrpc"' "$out")" -eq 4 ]] \
-  || fail "expected 4 responses (ids 1-4), got $(grep -c '"jsonrpc"' "$out")"
+[[ "$(grep -c '"jsonrpc"' "$out")" -eq 6 ]] \
+  || fail "expected 6 responses (ids 1-6), got $(grep -c '"jsonrpc"' "$out")"
 
 python3 - "$out" <<'PY' || exit 1
 import json, sys
@@ -87,12 +98,15 @@ r = init["result"]
 need(r["serverInfo"]["name"] == "patchbay-mcp", "unexpected server name")
 need("tools" in r["capabilities"], "server did not advertise tools capability")
 need("tier 1" in r["instructions"], "instructions missing the tier-1/tier-2 guidance")
+need("PATCHBAY_ALLOW_SECRET_READ" in r["instructions"],
+     "instructions never mention the key vault's read gate")
 
 # 2. tools/list
 tl = msgs.get(2)
 need(tl and "result" in tl, "no tools/list result")
 names = {t["name"] for t in tl["result"]["tools"]}
-expected = {"list_connections", "get_status", "switch_profile", "verify", "get_permissions"}
+expected = {"list_connections", "get_status", "switch_profile", "verify", "get_permissions",
+            "store_key", "list_keys", "get_key", "remove_key"}
 need(names == expected, f"tool set mismatch: {sorted(names)}")
 for t in tl["result"]["tools"]:
     need(t.get("description"), f"{t['name']} has no description")
@@ -114,8 +128,32 @@ text = bad["result"]["content"][0]["text"]
 need("unknown tool" in text and "gcloud" in text,
      f"error message lost the valid-tool list: {text!r}")
 
+# 5. list_keys -> metadata only, never a value
+lk = msgs.get(5)
+need(lk and "result" in lk, "no list_keys result")
+need(not lk["result"].get("isError"), f"list_keys returned isError: {lk['result']}")
+vault = json.loads(lk["result"]["content"][0]["text"])
+need(isinstance(vault, list), "list_keys did not return a JSON array")
+for entry in vault:
+    need({"id", "provider", "label", "last4", "expiry_state"} <= set(entry),
+         f"key entry shape mismatch: {sorted(entry)}")
+    need("secret" not in entry, f"list_keys leaked a secret field for {entry['id']!r}")
+
+# 6. get_key without the env flag -> refused, with the flag and the human path
+#    named in the message. This is the gate; if it ever passes silently, the
+#    vault's whole read policy is gone.
+gk = msgs.get(6)
+need(gk and "result" in gk, "no get_key result")
+need(gk["result"].get("isError") is True,
+     "get_key was NOT refused without PATCHBAY_ALLOW_SECRET_READ")
+text = gk["result"]["content"][0]["text"]
+need("PATCHBAY_ALLOW_SECRET_READ" in text, f"refusal does not name the flag: {text!r}")
+need("pb key copy" in text, f"refusal does not offer the human path: {text!r}")
+
 print(f"smoke: OK - {len(board)} tools on the board: "
       + ", ".join(s["tool"] for s in board))
+print(f"smoke: OK - key vault reachable ({len(vault)} registered), "
+      "get_key refused without PATCHBAY_ALLOW_SECRET_READ")
 PY
 
 echo "smoke: PASS"
