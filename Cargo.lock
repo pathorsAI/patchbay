@@ -555,6 +555,7 @@ name = "patchbay-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "patchbay-core",
  "rmcp",
  "schemars",

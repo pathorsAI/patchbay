@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use patchbay_core::Registry;
+use patchbay_core::{KeyRegistry, Registry};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -58,8 +58,19 @@ run. Surface the hint; do not retry, and do not run the hint yourself.
 keychain where patchbay cannot read it without running the tool. It does not mean expired. \
 Use `verify` if you need certainty.
 
-6. Every tool here returns metadata about credentials. Token, secret and key values are never \
-returned.";
+6. Every connection tool returns metadata about credentials. Token, secret and key values are \
+never returned by them.
+
+7. The key vault (`store_key`, `list_keys`, `get_key`, `remove_key`) is a different thing from \
+the connection tools above: it is this machine's registry for standalone API keys and tokens \
+that no CLI tracks. `store_key` is the one you should reach for unprompted — whenever you create \
+or receive a long-lived API key or token during a task, register it, so the user's patchbay \
+stays the source of truth. Secrets go into the OS keychain; only the last 4 characters are \
+written to disk. Never echo a secret anywhere else.
+
+8. Reading a stored value back (`get_key`) and deleting one (`remove_key`) are refused unless \
+the user started this server with PATCHBAY_ALLOW_SECRET_READ=1. That refusal is final: relay it \
+and stop, and point the user at `pb key copy <id>` if they want the value themselves.";
 
 /// `{ "tool": "gcloud" }` — identifies one supported CLI.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -87,21 +98,26 @@ pub struct SwitchParams {
 #[derive(Clone)]
 pub struct PatchbayServer {
     registry: Arc<Registry>,
+    /// The key vault. `pub(crate)` because its tools live in [`crate::keys`].
+    pub(crate) keys: Arc<KeyRegistry>,
     tool_router: ToolRouter<Self>,
 }
 
 impl PatchbayServer {
-    pub fn new(registry: Registry) -> Self {
+    pub fn new(registry: Registry, keys: KeyRegistry) -> Self {
         Self {
             registry: Arc::new(registry),
-            tool_router: Self::tool_router(),
+            keys: Arc::new(keys),
+            // Two routers, merged: connection tools here, vault tools in
+            // `keys.rs`. Built once, not per request.
+            tool_router: Self::tool_router() + Self::keys_router(),
         }
     }
 }
 
 /// Probes do blocking file IO and (tier 2) spawn subprocesses. Run them on the
 /// blocking pool so a slow `gcloud` call cannot stall the stdio transport.
-async fn offload<T, F>(f: F) -> Result<T, ErrorData>
+pub(crate) async fn offload<T, F>(f: F) -> Result<T, ErrorData>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
@@ -118,7 +134,7 @@ where
 /// `structuredContent` is specified as a JSON *object*, so an array payload
 /// (`list_connections`) is returned as a text block only rather than being
 /// wrapped in a synthetic envelope the caller would have to unwrap.
-fn json_ok(value: serde_json::Value) -> CallToolResult {
+pub(crate) fn json_ok(value: serde_json::Value) -> CallToolResult {
     let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
     let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
     if value.is_object() {
@@ -131,13 +147,13 @@ fn json_ok(value: serde_json::Value) -> CallToolResult {
 /// MCP clients render tool errors to the caller, and the message matters here
 /// (an unknown-tool error lists the valid tool names, which is what lets an
 /// agent self-correct without another round trip).
-fn tool_error(err: anyhow::Error) -> CallToolResult {
+pub(crate) fn tool_error(err: anyhow::Error) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(format!("{err:#}"))])
 }
 
 /// Serialization of our own owned data cannot realistically fail; if it
 /// somehow does, that is patchbay itself being broken — a protocol error.
-fn encode<T: serde::Serialize>(value: &T) -> Result<serde_json::Value, ErrorData> {
+pub(crate) fn encode<T: serde::Serialize>(value: &T) -> Result<serde_json::Value, ErrorData> {
     serde_json::to_value(value)
         .map_err(|e| ErrorData::internal_error(format!("failed to serialize result: {e}"), None))
 }
