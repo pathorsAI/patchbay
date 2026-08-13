@@ -6,7 +6,7 @@
 
 use anstyle::{AnsiColor, Effects, Style};
 use chrono::{DateTime, Duration, Utc};
-use patchbay_core::ToolStatus;
+use patchbay_core::{Advisory, CheckReport, ToolStatus};
 
 /// Total budget for the status table. Keeps the board readable in a
 /// 100-column terminal, which is the narrowest window we design for.
@@ -203,6 +203,12 @@ pub struct StatusRow {
     pub keys: usize,
     /// How many of those have expired or are about to.
     pub keys_attention: usize,
+    /// `2.95.0 → 2.97.0`, only when an update is actually available. The
+    /// installed version alone is not shown on the board: 23 rows of version
+    /// numbers nobody asked about is noise, and `pb check-updates` prints them.
+    pub update: Option<String>,
+    /// How many curated advisories apply to this tool.
+    pub advisories: usize,
 }
 
 /// Build the row for one tool. `now` is injected so this stays testable.
@@ -229,6 +235,27 @@ pub fn build_row(status: &ToolStatus, now: DateTime<Utc>) -> StatusRow {
         note: status.notes.first().map(|n| one_line(n)),
         keys: status.registered_keys.len(),
         keys_attention: status.keys_needing_attention().len(),
+        update: status
+            .version
+            .as_ref()
+            .filter(|v| v.update_available())
+            .and_then(|v| v.marker()),
+        advisories: status.advisories.len(),
+    }
+}
+
+/// The `↑ 2.95.0 → 2.97.0` marker, or `None` when the tool is current or has
+/// never been checked. A cold cache leaves the board exactly as it was.
+pub fn update_marker(row: &StatusRow) -> Option<String> {
+    row.update.as_ref().map(|u| format!("↑ {u}"))
+}
+
+/// The `⚠` marker for curated advisories. The detail goes below the table.
+pub fn advisory_marker(row: &StatusRow) -> Option<String> {
+    match row.advisories {
+        0 => None,
+        1 => Some("⚠ advisory".to_string()),
+        n => Some(format!("⚠ {n} advisories")),
     }
 }
 
@@ -304,14 +331,16 @@ pub fn render_status(statuses: &[ToolStatus], now: DateTime<Utc>, styles: &Style
         } else {
             row.note.clone().unwrap_or_default()
         };
-        // The vault marker leads the notes cell, so a tool with registered
-        // keys reads as "+1 key · <the usual caveat>".
-        let note_text = match keys_marker(row) {
-            Some(marker) if note_text.is_empty() => marker,
-            Some(marker) => format!("{marker} · {note_text}"),
-            None => note_text,
-        };
-        let note = truncate(&note_text, notes_w);
+        // Markers lead the notes cell, most urgent first, so a busy row reads
+        // as "⚠ advisory · ↑ 2.95.0 → 2.97.0 · +1 key · <the usual caveat>".
+        let mut cell: Vec<String> = [advisory_marker(row), update_marker(row), keys_marker(row)]
+            .into_iter()
+            .flatten()
+            .collect();
+        if !note_text.is_empty() {
+            cell.push(note_text);
+        }
+        let note = truncate(&cell.join(" · "), notes_w);
 
         let line = if let Some(style) = row_style {
             // Absent tool: one style for the whole line, no per-cell color.
@@ -356,6 +385,151 @@ pub fn render_status(statuses: &[ToolStatus], now: DateTime<Utc>, styles: &Style
         }
     }
 
+    // Advisories get their own section: they are editorial facts about the
+    // software, not observations about this machine's config, and folding them
+    // in with the notes would blur that.
+    let with_advisories: Vec<&ToolStatus> = statuses
+        .iter()
+        .filter(|s| !s.advisories.is_empty())
+        .collect();
+    if !with_advisories.is_empty() {
+        out.push('\n');
+        out.push_str(&styles.paint(bold(), "advisories"));
+        out.push('\n');
+        for status in with_advisories {
+            for advisory in &status.advisories {
+                out.push_str(&render_advisory(&status.tool, advisory, styles));
+            }
+        }
+    }
+
+    out
+}
+
+/// One advisory: a headline naming the tool and the kind, the message, and the
+/// source so nobody has to take patchbay's word for it.
+fn render_advisory(tool: &str, advisory: &Advisory, styles: &Styles) -> String {
+    let head = format!("  {tool}: {}", advisory.kind.label());
+    let style = if advisory.is_blocking() {
+        red()
+    } else {
+        yellow()
+    };
+    let mut out = format!("{}\n", styles.paint(style, &head));
+    out.push_str(&format!("    {}\n", one_line(&advisory.message)));
+    if let Some(url) = &advisory.url {
+        out.push_str(&styles.paint(dim(), &format!("    {url}")));
+        out.push('\n');
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// pb check-updates
+// ---------------------------------------------------------------------------
+
+/// The `pb check-updates` table, plus the advisory section and a one-line
+/// summary of what the run actually cost.
+pub fn render_check_updates(
+    report: &CheckReport,
+    advisories: &[Advisory],
+    styles: &Styles,
+) -> String {
+    const COL_VERSION: usize = 14;
+    const COL_SOURCE: usize = 13;
+
+    let tool_w = report
+        .entries
+        .iter()
+        .map(|e| e.tool.chars().count())
+        .chain(std::iter::once("TOOL".len()))
+        .max()
+        .unwrap_or(4);
+
+    let gap = " ".repeat(GAP);
+    let mut out = String::new();
+
+    let header = format!(
+        "{}{gap}{}{gap}{}{gap}{}{gap}{}",
+        pad("TOOL", tool_w),
+        pad("INSTALLED", COL_VERSION),
+        pad("LATEST", COL_VERSION),
+        pad("SOURCE", COL_SOURCE),
+        "UPDATE WITH",
+    );
+    out.push_str(&styles.paint(bold(), header.trim_end()));
+    out.push('\n');
+
+    for entry in &report.entries {
+        let installed = entry.installed.clone().unwrap_or_else(|| DASH.to_string());
+        let latest = entry.latest.clone().unwrap_or_else(|| DASH.to_string());
+        let command = entry.update_command.clone().unwrap_or_default();
+
+        let tool = pad(&truncate(&entry.tool, tool_w), tool_w);
+        let installed_cell = pad(&truncate(&installed, COL_VERSION), COL_VERSION);
+        let latest_cell = pad(&truncate(&latest, COL_VERSION), COL_VERSION);
+        // A tool that is not here has no install source — printing `unknown`
+        // would read as patchbay being confused rather than the tool being
+        // absent, which is the state the whole row is already showing.
+        let source_text = if entry.installed.is_none() {
+            "not installed"
+        } else {
+            entry.source.label()
+        };
+        let source = pad(&truncate(source_text, COL_SOURCE), COL_SOURCE);
+
+        // Only a row with something to do earns colour; everything else stays
+        // quiet so the handful that matter are findable at a glance.
+        let line = if entry.update_available() {
+            let latest_cell = styles.paint(yellow(), &latest_cell);
+            format!("{tool}{gap}{installed_cell}{gap}{latest_cell}{gap}{source}{gap}{command}")
+        } else if entry.installed.is_none() {
+            styles.paint(
+                dim(),
+                format!("{tool}{gap}{installed_cell}{gap}{latest_cell}{gap}{source}{gap}")
+                    .trim_end(),
+            )
+        } else {
+            format!("{tool}{gap}{installed_cell}{gap}{latest_cell}{gap}{source}{gap}")
+        };
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+
+    if !advisories.is_empty() {
+        out.push('\n');
+        out.push_str(&styles.paint(bold(), "advisories"));
+        out.push('\n');
+        for advisory in advisories {
+            out.push_str(&render_advisory(&advisory.tool, advisory, styles));
+        }
+    }
+
+    if !report.notes.is_empty() {
+        out.push('\n');
+        out.push_str(&styles.paint(bold(), "notes"));
+        out.push('\n');
+        for note in &report.notes {
+            out.push_str(&format!("  {}\n", one_line(note)));
+        }
+    }
+
+    // The cost line makes the batching claim checkable rather than asserted:
+    // however many Homebrew tools there are, `brew` is called at most once.
+    let outdated = report.outdated().len();
+    let summary = format!(
+        "\n{outdated} update{} · {} tool{} from cache · {} brew call{} · {} network call{} · {}ms",
+        if outdated == 1 { "" } else { "s" },
+        report.from_cache,
+        if report.from_cache == 1 { "" } else { "s" },
+        report.brew_calls,
+        if report.brew_calls == 1 { "" } else { "s" },
+        report.network_calls,
+        if report.network_calls == 1 { "" } else { "s" },
+        report.elapsed_ms,
+    );
+    out.push_str(&styles.paint(dim(), &summary));
+    out.push('\n');
     out
 }
 
@@ -623,6 +797,242 @@ mod tests {
 
         let out = render_status(&[status], now(), &Styles::new(false));
         assert!(!out.contains("key"), "{out}");
+    }
+
+    // --- versions and advisories on the board -------------------------------
+
+    fn with_version(tool: &str, installed: &str, latest: Option<&str>) -> ToolStatus {
+        let mut status = ToolStatus::empty(tool, true);
+        status.active = Some("default".into());
+        status.profiles = vec![Profile::new("default")];
+        status.version = Some(patchbay_core::VersionInfo {
+            tool: tool.to_string(),
+            installed: Some(installed.to_string()),
+            latest: latest.map(String::from),
+            source: patchbay_core::Source::Homebrew,
+            update_command: Some(format!("brew upgrade {tool}")),
+            checked_at: now(),
+            note: None,
+        });
+        status
+    }
+
+    #[test]
+    fn test_an_available_update_gets_a_marker_and_a_current_tool_gets_none() {
+        let outdated = with_version("gh", "2.95.0", Some("2.97.0"));
+        let row = build_row(&outdated, now());
+        assert_eq!(row.update.as_deref(), Some("2.95.0 → 2.97.0"));
+        assert_eq!(update_marker(&row).as_deref(), Some("↑ 2.95.0 → 2.97.0"));
+
+        let out = render_status(&[outdated], now(), &Styles::new(false));
+        assert!(out.contains("↑ 2.95.0 → 2.97.0"), "{out}");
+
+        // Up to date: the board says nothing at all. 23 rows of version numbers
+        // nobody asked for is noise.
+        let current = with_version("rclone", "1.75.0", Some("1.75.0"));
+        let row = build_row(&current, now());
+        assert_eq!(row.update, None);
+        assert_eq!(update_marker(&row), None);
+        assert!(!render_status(&[current], now(), &Styles::new(false)).contains('↑'));
+
+        // Unknown latest is not an update either.
+        let unknown = with_version("docker", "28.3.2", None);
+        assert_eq!(build_row(&unknown, now()).update, None);
+    }
+
+    #[test]
+    fn test_a_cold_cache_leaves_the_board_exactly_as_it_was() {
+        let mut status = ToolStatus::empty("gh", true);
+        status.active = Some("octocat".into());
+        status.profiles = vec![Profile::new("octocat")];
+        let row = build_row(&status, now());
+        assert_eq!(row.update, None);
+        assert_eq!(row.advisories, 0);
+
+        let out = render_status(&[status], now(), &Styles::new(false));
+        assert!(!out.contains('↑'), "{out}");
+        assert!(!out.contains('⚠'), "{out}");
+        assert!(!out.contains("advisories"), "{out}");
+    }
+
+    fn advisory(tool: &str, blocking: bool) -> Advisory {
+        Advisory {
+            tool: tool.to_string(),
+            kind: if blocking {
+                patchbay_core::AdvisoryKind::Removed {
+                    in_version: "1.0.0".into(),
+                    replacement: "hf".into(),
+                }
+            } else {
+                patchbay_core::AdvisoryKind::Renamed {
+                    to: "neon".into(),
+                    since: None,
+                }
+            },
+            message: "the old command is going away and here is what replaces it".into(),
+            url: Some("https://example.com/docs".into()),
+        }
+    }
+
+    #[test]
+    fn test_advisories_get_a_marker_and_a_detail_section_of_their_own() {
+        let mut status = with_version("huggingface", "0.35.0", None);
+        status.advisories = vec![advisory("huggingface", true)];
+
+        let row = build_row(&status, now());
+        assert_eq!(row.advisories, 1);
+        assert_eq!(advisory_marker(&row).as_deref(), Some("⚠ advisory"));
+
+        let out = render_status(&[status], now(), &Styles::new(false));
+        assert!(out.contains("⚠ advisory"), "{out}");
+        // The detail lives below the table, with its kind and its source.
+        assert!(out.contains("\nadvisories\n"), "{out}");
+        assert!(out.contains("  huggingface: removed"), "{out}");
+        assert!(out.contains("https://example.com/docs"), "{out}");
+        // …and it is NOT folded in with the probe notes.
+        assert!(!out.contains("\nnotes\n"), "{out}");
+    }
+
+    #[test]
+    fn test_markers_share_the_notes_cell_most_urgent_first() {
+        use patchbay_core::keys::KeyExpiryState;
+        use patchbay_core::KeyRef;
+
+        let mut status = with_version("neon", "2.38.2", Some("3.1.1"));
+        status.advisories = vec![advisory("neon", false)];
+        status.registered_keys = vec![KeyRef {
+            id: "neon-api".into(),
+            label: "neon".into(),
+            last4: "1234".into(),
+            expires_at: None,
+            expiry_state: KeyExpiryState::Valid,
+        }];
+        status.note("two config directories exist");
+
+        let out = render_status(&[status], now(), &Styles::new(false));
+        let row_line = out.lines().find(|l| l.starts_with("neon")).unwrap();
+        let order = ["⚠ advisory", "↑ 2.38.2 → 3.1.1", "+1 key"];
+        let mut last = 0;
+        for marker in order {
+            let at = row_line
+                .find(marker)
+                .unwrap_or_else(|| panic!("{marker} missing from {row_line:?}"));
+            assert!(at >= last, "{marker} is out of order in {row_line:?}");
+            last = at;
+        }
+    }
+
+    #[test]
+    fn test_pluralised_advisory_marker() {
+        let mut status = with_version("aws", "1.29.0", None);
+        status.advisories = vec![advisory("aws", true), advisory("aws", false)];
+        let row = build_row(&status, now());
+        assert_eq!(advisory_marker(&row).as_deref(), Some("⚠ 2 advisories"));
+    }
+
+    // --- pb check-updates ---------------------------------------------------
+
+    fn entry(
+        tool: &str,
+        installed: Option<&str>,
+        latest: Option<&str>,
+        source: patchbay_core::Source,
+    ) -> patchbay_core::VersionInfo {
+        patchbay_core::VersionInfo {
+            tool: tool.to_string(),
+            installed: installed.map(String::from),
+            latest: latest.map(String::from),
+            source,
+            update_command: installed.map(|_| format!("brew upgrade {tool}")),
+            checked_at: now(),
+            note: None,
+        }
+    }
+
+    #[test]
+    fn test_check_updates_table_shows_every_column_and_a_cost_summary() {
+        use patchbay_core::Source;
+        let report = CheckReport {
+            entries: vec![
+                entry("gh", Some("2.95.0"), Some("2.97.0"), Source::Homebrew),
+                entry("rclone", Some("1.75.0"), Some("1.75.0"), Source::Homebrew),
+                entry("stripe", None, None, Source::Unknown),
+            ],
+            brew_calls: 1,
+            network_calls: 2,
+            from_cache: 0,
+            elapsed_ms: 1234,
+            notes: vec![],
+        };
+
+        let out = render_check_updates(&report, &[], &Styles::new(false));
+        assert!(!out.contains('\u{1b}'), "plain mode must emit no ANSI");
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].starts_with("TOOL"));
+        assert!(lines[0].contains("INSTALLED"));
+        assert!(lines[0].contains("LATEST"));
+        assert!(lines[0].contains("SOURCE"));
+        assert!(lines[0].contains("UPDATE WITH"));
+
+        assert!(out.contains("2.95.0"));
+        assert!(out.contains("brew upgrade gh"));
+        // A tool that is not installed shows dashes, not a fake version, and
+        // says so rather than claiming an "unknown" install source.
+        let stripe = out.lines().find(|l| l.starts_with("stripe")).unwrap();
+        assert!(stripe.contains(DASH), "{stripe:?}");
+        assert!(stripe.contains("not installed"), "{stripe:?}");
+        assert!(!stripe.contains("unknown"), "{stripe:?}");
+
+        // The summary is what makes the batching claim checkable.
+        assert!(out.contains("1 update ·"), "{out}");
+        assert!(out.contains("1 brew call"), "{out}");
+        assert!(out.contains("2 network calls"), "{out}");
+        assert!(out.contains("1234ms"), "{out}");
+    }
+
+    #[test]
+    fn test_check_updates_reports_advisories_and_run_notes() {
+        let report = CheckReport {
+            entries: vec![entry(
+                "huggingface",
+                Some("0.35.0"),
+                None,
+                patchbay_core::Source::SelfManaged,
+            )],
+            brew_calls: 0,
+            network_calls: 0,
+            from_cache: 1,
+            elapsed_ms: 3,
+            notes: vec!["Homebrew lookup failed: brew is not installed".into()],
+        };
+        let out = render_check_updates(
+            &report,
+            &[advisory("huggingface", true)],
+            &Styles::new(false),
+        );
+        assert!(out.contains("\nadvisories\n"), "{out}");
+        assert!(out.contains("huggingface: removed"), "{out}");
+        assert!(out.contains("\nnotes\n"), "{out}");
+        assert!(out.contains("brew is not installed"), "{out}");
+        assert!(out.contains("1 tool from cache"), "{out}");
+    }
+
+    #[test]
+    fn test_check_updates_colours_only_the_rows_with_something_to_do() {
+        use patchbay_core::Source;
+        let report = CheckReport {
+            entries: vec![entry(
+                "gh",
+                Some("2.95.0"),
+                Some("2.97.0"),
+                Source::Homebrew,
+            )],
+            brew_calls: 1,
+            ..CheckReport::default()
+        };
+        let out = render_check_updates(&report, &[], &Styles::new(true));
+        assert!(out.contains('\u{1b}'));
+        assert!(out.contains("2.97.0"));
     }
 
     #[test]

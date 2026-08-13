@@ -11,7 +11,9 @@ mod render;
 use anyhow::Result;
 use chrono::Utc;
 use clap::{Parser, Subcommand};
-use patchbay_core::{PermissionsReport, Registry, SwitchOutcome, VerifyOutcome};
+use patchbay_core::{
+    Advisory, CheckOptions, PermissionsReport, Registry, SwitchOutcome, VerifyOutcome,
+};
 
 use render::Styles;
 
@@ -52,6 +54,18 @@ enum Command {
     /// Show what the active credential of a tool is allowed to do.
     Perms {
         tool: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Check every tool's installed version against its install source.
+    ///
+    /// Unlike `pb status`, this executes each tool's version command and asks
+    /// Homebrew, the npm registry and GitHub what the current release is, then
+    /// caches the answers for `pb status` to show. Seconds, not milliseconds.
+    CheckUpdates {
+        /// Re-check everything, ignoring cache entries that are still current.
+        #[arg(long)]
+        refresh: bool,
         #[arg(long)]
         json: bool,
     },
@@ -130,6 +144,37 @@ fn run() -> Result<i32> {
                 print_perms(&report);
             }
             Ok(0)
+        }
+        Command::CheckUpdates { refresh, json } => {
+            let report = registry.check_updates(CheckOptions {
+                refresh,
+                ..CheckOptions::default()
+            });
+            // Advisories are static data, so they are reported whether or not
+            // the version lookups succeeded.
+            let advisories: Vec<Advisory> = registry
+                .status_all()
+                .iter()
+                .flat_map(|s| s.advisories.clone())
+                .collect();
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "report": report,
+                        "advisories": advisories,
+                    }))?
+                );
+            } else {
+                print!(
+                    "{}",
+                    render::render_check_updates(&report, &advisories, &styles())
+                );
+            }
+            // Something removed or unmaintained is worth failing a script over;
+            // a rename that still works is not.
+            Ok(i32::from(advisories.iter().any(Advisory::is_blocking)))
         }
         // The vault has its own registry: it stores keys the user gave patchbay
         // on purpose, not state discovered by a probe.

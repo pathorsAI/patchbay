@@ -219,6 +219,17 @@ impl Paths {
         }
     }
 
+    /// Where the binary is, not just whether it exists. Version checking needs
+    /// the path itself: it is what says whether Homebrew, npm, bun or the
+    /// vendor's own installer put it there. `None` in tests, like
+    /// [`Paths::has_binary`].
+    pub fn binary_path(&self, name: &str) -> Option<PathBuf> {
+        match self.lookup {
+            BinaryLookup::System => which::which(name).ok(),
+            BinaryLookup::Disabled => None,
+        }
+    }
+
     /// Whether probes are allowed to execute the tool's own CLI. Tier-2
     /// operations short-circuit to `Unsupported` when this is false.
     pub fn may_exec(&self) -> bool {
@@ -537,6 +548,12 @@ impl Paths {
     /// they live in the OS keychain (see [`crate::keystore`]).
     pub fn keys_file(&self) -> PathBuf {
         self.patchbay_dir().join("keys.json")
+    }
+
+    /// The version-check cache (see [`crate::versions`]). Public information
+    /// about public software — no secrets, so no 0600 handling.
+    pub fn versions_file(&self) -> PathBuf {
+        self.patchbay_dir().join("versions.json")
     }
 }
 
