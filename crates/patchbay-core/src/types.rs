@@ -19,6 +19,10 @@ pub enum ToolCategory {
     Cluster,
     Edge,
     Storage,
+    Containers,
+    Network,
+    Payments,
+    Ai,
     /// A tool patchbay knows about but has not classified yet.
     Other,
 }
@@ -28,12 +32,18 @@ impl ToolCategory {
     /// a newly added probe still appears on the board.
     pub fn for_tool(tool: &str) -> Self {
         match tool {
-            "gcloud" | "aws" | "az" => Self::Cloud,
-            "gh" => Self::Code,
-            "infisical" => Self::Secrets,
+            "gcloud" | "aws" | "az" | "firebase" | "neon" | "supabase" | "flyctl" | "doctl" => {
+                Self::Cloud
+            }
+            "gh" | "npm" => Self::Code,
+            "infisical" | "op" => Self::Secrets,
             "kubectl" => Self::Cluster,
-            "wrangler" => Self::Edge,
+            "wrangler" | "vercel" => Self::Edge,
             "rclone" => Self::Storage,
+            "docker" => Self::Containers,
+            "tailscale" | "ssh" => Self::Network,
+            "stripe" => Self::Payments,
+            "ollama" | "huggingface" | "claude" => Self::Ai,
             _ => Self::Other,
         }
     }
@@ -47,6 +57,10 @@ impl ToolCategory {
             Self::Cluster => "Cluster",
             Self::Edge => "Edge",
             Self::Storage => "Storage",
+            Self::Containers => "Containers",
+            Self::Network => "Network",
+            Self::Payments => "Payments",
+            Self::Ai => "AI",
             Self::Other => "Other",
         }
     }
@@ -340,6 +354,21 @@ mod tests {
             ("kubectl", ToolCategory::Cluster),
             ("wrangler", ToolCategory::Edge),
             ("rclone", ToolCategory::Storage),
+            ("vercel", ToolCategory::Edge),
+            ("firebase", ToolCategory::Cloud),
+            ("neon", ToolCategory::Cloud),
+            ("supabase", ToolCategory::Cloud),
+            ("flyctl", ToolCategory::Cloud),
+            ("doctl", ToolCategory::Cloud),
+            ("docker", ToolCategory::Containers),
+            ("tailscale", ToolCategory::Network),
+            ("ssh", ToolCategory::Network),
+            ("stripe", ToolCategory::Payments),
+            ("npm", ToolCategory::Code),
+            ("op", ToolCategory::Secrets),
+            ("ollama", ToolCategory::Ai),
+            ("huggingface", ToolCategory::Ai),
+            ("claude", ToolCategory::Ai),
         ];
         for (tool, category) in expected {
             assert_eq!(ToolCategory::for_tool(tool), category, "{tool}");
@@ -417,8 +446,25 @@ mod tests {
     }
 
     #[test]
+    fn test_category_wire_names_are_snake_case() {
+        // The panel and the MCP schema both key off these strings.
+        for (category, wire) in [
+            (ToolCategory::Containers, "containers"),
+            (ToolCategory::Network, "network"),
+            (ToolCategory::Payments, "payments"),
+            (ToolCategory::Ai, "ai"),
+        ] {
+            assert_eq!(serde_json::to_value(category).unwrap(), wire);
+        }
+    }
+
+    #[test]
     fn test_labels_are_human_readable() {
         assert_eq!(ToolCategory::Cloud.label(), "Cloud");
+        assert_eq!(ToolCategory::Containers.label(), "Containers");
+        assert_eq!(ToolCategory::Network.label(), "Network");
+        assert_eq!(ToolCategory::Payments.label(), "Payments");
+        assert_eq!(ToolCategory::Ai.label(), "AI");
         assert_eq!(ToolCategory::Other.label(), "Other");
         assert_eq!(ConnectionState::NotInstalled.label(), "Not installed");
     }

@@ -5,7 +5,7 @@
 
 **One panel for every CLI login on your machine — built for humans *and* AI agents.**
 
-Your dev machine is a tangle of authenticated CLIs: `gcloud` with five accounts, `gh`, `aws`, `az`, `infisical` across two orgs, `kubectl`, `wrangler`, `rclone`… Each one stores its auth state somewhere different, expires on its own schedule, and has its own switching incantation. Nothing shows you the whole board.
+Your dev machine is a tangle of authenticated CLIs: `gcloud` with five accounts, `gh`, `aws`, `az`, `infisical` across two orgs, `kubectl`, `wrangler`, `rclone`, `docker`, `vercel`, `neon`, `stripe`, `tailscale`… Each one stores its auth state somewhere different, expires on its own schedule, and has its own switching incantation. Nothing shows you the whole board.
 
 patchbay is the patch panel:
 
@@ -64,6 +64,62 @@ codesign -dv --verbose=4 /usr/local/bin/pb 2>&1 | grep Authority
 ```
 
 Each release also carries `SHA256SUMS-*.txt`; verify with `shasum -a 256 -c`.
+
+## Supported tools
+
+23 probes, grouped the way the sidebar groups them. Every one is a plain-file
+reader: it reports *metadata about* a credential (which account, which profile,
+when it expires) and never the credential itself.
+
+| Category | Tools | What patchbay reads |
+|---|---|---|
+| Cloud | `gcloud`, `aws`, `az`, `firebase`, `neon`, `supabase`, `flyctl`, `doctl` | accounts/subscriptions/contexts and their expiries. `neon`'s CLI is now `neon` but still writes `~/.config/neonctl`; `doctl`'s `default` context lives at the top level of its YAML, not in `auth-contexts`; `supabase` normally keeps its token in the keyring, so "nothing on disk" is healthy |
+| Code | `gh`, `npm` | gh hosts + accounts; every npm registry you hold a token for (and whether that token is really a `${VAR}` reference) |
+| Secrets | `infisical`, `op` | org/project logins; 1Password accounts from its config dir (searched in the CLI's own order, `~/.op` before `~/.config/op`) |
+| Cluster | `kubectl` | contexts across every file in `KUBECONFIG` |
+| Edge | `wrangler`, `vercel` | the Cloudflare OAuth grant with real scopes and expiry; the Vercel token and its team scope |
+| Storage | `rclone` | remotes, with OAuth expiry pulled out of the token blob and config keys allow-listed |
+| Containers | `docker` | logged-in registries and where each credential is held (helper, store, or plaintext) |
+| Network | `tailscale`, `ssh` | tailnet profiles (`verify` reports backend state, tailnet and node-key expiry); `Host` aliases, with `verify` asking the ssh agent what it holds |
+| Payments | `stripe` | projects, live/test key presence and the 90-day key expiry |
+| AI | `ollama`, `huggingface`, `claude` | the local model daemon and its model count; Hub tokens and their OAuth expiry; Claude Code's signed-in account and MCP server count |
+
+Tools with **no active profile by design** — `docker`, `rclone`, `ssh`, `npm` —
+report `active: null` and say why: every credential is live at once and the
+command picks one.
+
+## Custom paths
+
+Probes read the same files the tools themselves read, so they honour the same
+environment variables: `CLOUDSDK_CONFIG`, `AWS_CONFIG_FILE`,
+`AWS_SHARED_CREDENTIALS_FILE`, `GH_CONFIG_DIR`, `KUBECONFIG`, `RCLONE_CONFIG`,
+`DOCKER_CONFIG`, `AZURE_CONFIG_DIR`, `SUPABASE_HOME`, `FLY_CONFIG_DIR`,
+`NPM_CONFIG_USERCONFIG`, `OP_CONFIG_DIR`, `HF_HOME`, `CLAUDE_CONFIG_DIR`, and
+`XDG_CONFIG_HOME` for the tools that actually respect it (gcloud, for one, does
+not).
+
+The panel launched from Finder inherits none of your shell's environment, so
+those variables are simply not there. For that case — and for state on an
+external disk — patchbay has its own optional config,
+`~/.config/patchbay/config.toml`:
+
+```toml
+[paths]
+gcloud = "/Volumes/work/gcloud"       # a directory
+aws_config = "/Volumes/work/aws/config"   # a file
+kubeconfig = "/a.yaml:/b.yaml"        # kubectl's list, same syntax as KUBECONFIG
+```
+
+Precedence is **tool environment variable → `[paths]` → platform default**. The
+variable wins because it is what the CLI itself obeys; disagreeing with it would
+make the board lie. An override in effect is never silent — the tool's `notes`
+name it. An unknown key is a note, not an error, and the rest of the table still
+applies.
+
+Keys: `gcloud`, `aws_config`, `aws_credentials`, `gh`, `infisical`,
+`kubeconfig`, `wrangler`, `rclone`, `azure`, `vercel`, `firebase`, `neon`,
+`docker`, `tailscale`, `ssh`, `stripe`, `supabase`, `fly`, `doctl`, `npm`, `op`,
+`ollama`, `huggingface`, `claude`.
 
 ## Layout
 

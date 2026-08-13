@@ -8,22 +8,52 @@ use crate::types::{PermissionsReport, SwitchOutcome, ToolStatus, VerifyOutcome};
 
 pub struct Registry {
     probes: Vec<Box<dyn Probe>>,
+    /// Kept so [`Registry::status_all`] can surface problems with patchbay's
+    /// own config (see [`Paths::config_warnings`]).
+    paths: Paths,
 }
 
 impl Registry {
-    /// Every probe, bound to the given paths.
+    /// Every probe, bound to the given paths. Grouped by category, matching
+    /// the order the panel's sidebar lists them in.
     pub fn all(paths: Paths) -> Self {
         Self {
             probes: vec![
+                // cloud
                 Box::new(probes::gcloud::GcloudProbe::new(paths.clone())),
                 Box::new(probes::aws::AwsProbe::new(paths.clone())),
+                Box::new(probes::az::AzProbe::new(paths.clone())),
+                Box::new(probes::firebase::FirebaseProbe::new(paths.clone())),
+                Box::new(probes::neon::NeonProbe::new(paths.clone())),
+                Box::new(probes::supabase::SupabaseProbe::new(paths.clone())),
+                Box::new(probes::flyctl::FlyctlProbe::new(paths.clone())),
+                Box::new(probes::doctl::DoctlProbe::new(paths.clone())),
+                // code
                 Box::new(probes::gh::GhProbe::new(paths.clone())),
+                Box::new(probes::npm::NpmProbe::new(paths.clone())),
+                // secrets
                 Box::new(probes::infisical::InfisicalProbe::new(paths.clone())),
+                Box::new(probes::op::OpProbe::new(paths.clone())),
+                // cluster
                 Box::new(probes::kubectl::KubectlProbe::new(paths.clone())),
+                // edge
                 Box::new(probes::wrangler::WranglerProbe::new(paths.clone())),
+                Box::new(probes::vercel::VercelProbe::new(paths.clone())),
+                // storage
                 Box::new(probes::rclone::RcloneProbe::new(paths.clone())),
-                Box::new(probes::az::AzProbe::new(paths)),
+                // containers
+                Box::new(probes::docker::DockerProbe::new(paths.clone())),
+                // network
+                Box::new(probes::tailscale::TailscaleProbe::new(paths.clone())),
+                Box::new(probes::ssh::SshProbe::new(paths.clone())),
+                // payments
+                Box::new(probes::stripe::StripeProbe::new(paths.clone())),
+                // ai
+                Box::new(probes::ollama::OllamaProbe::new(paths.clone())),
+                Box::new(probes::huggingface::HuggingfaceProbe::new(paths.clone())),
+                Box::new(probes::claude::ClaudeProbe::new(paths.clone())),
             ],
+            paths,
         }
     }
 
@@ -57,14 +87,21 @@ impl Registry {
     /// becomes a status carrying the error as a note, so one broken tool never
     /// blanks the board.
     pub fn status_all(&self) -> Vec<ToolStatus> {
+        // A broken patchbay config affects where *every* probe looks, so the
+        // warning belongs on every tool rather than on an arbitrary one.
+        let warnings = self.paths.config_warnings();
         self.probes
             .iter()
             .map(|p| {
-                p.status().unwrap_or_else(|e| {
+                let mut status = p.status().unwrap_or_else(|e| {
                     let mut status = ToolStatus::empty(p.tool(), false);
                     status.note(format!("probe failed: {e}"));
                     status
-                })
+                });
+                for warning in warnings {
+                    status.note(warning.clone());
+                }
+                status
             })
             .collect()
     }
@@ -95,12 +132,62 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let registry = Registry::all(Paths::for_test(dir.path()));
         let all = registry.status_all();
-        assert_eq!(all.len(), 8);
+        assert_eq!(all.len(), 23);
         for status in &all {
             assert!(!status.installed, "{} should look absent", status.tool);
             assert!(
                 status.profiles.is_empty(),
                 "{} leaked profiles",
+                status.tool
+            );
+            assert!(
+                status.notes.is_empty(),
+                "{} is noisy on a machine that has nothing: {:?}",
+                status.tool,
+                status.notes
+            );
+        }
+    }
+
+    #[test]
+    fn test_tool_keys_are_unique() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::all(Paths::for_test(dir.path()));
+        let mut names = registry.tool_names();
+        names.sort_unstable();
+        let count = names.len();
+        names.dedup();
+        assert_eq!(names.len(), count, "duplicate tool key in the registry");
+    }
+
+    #[test]
+    fn test_every_tool_is_categorised() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::all(Paths::for_test(dir.path()));
+        for status in registry.status_all() {
+            assert_ne!(
+                status.category,
+                crate::types::ToolCategory::Other,
+                "{} has no category",
+                status.tool
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_broken_patchbay_config_is_reported_on_the_board() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".config/patchbay")).unwrap();
+        std::fs::write(
+            dir.path().join(".config/patchbay/config.toml"),
+            "[paths]\nnot_a_tool = \"/x\"\n",
+        )
+        .unwrap();
+        let registry = Registry::all(Paths::for_test(dir.path()).load_config());
+        for status in registry.status_all() {
+            assert!(
+                status.notes.iter().any(|n| n.contains("unknown key")),
+                "{} did not carry the config warning",
                 status.tool
             );
         }
