@@ -288,11 +288,10 @@ mod tests {
         let store = Arc::new(MemoryKeystore::new());
         let registry = EnvRegistry::new(
             dir.path().join("projects.json"),
+            dir.path().join("attachments.json"),
             Box::new(Shared(store.clone())),
         );
-        registry
-            .register("pathors", "/repos/pathors", "dev")
-            .unwrap();
+        registry.register("pathors", "dev").unwrap();
 
         Rig {
             _home: home,
@@ -483,11 +482,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let registry = EnvRegistry::new(
             dir.path().join("projects.json"),
+            dir.path().join("attachments.json"),
             Box::new(MemoryKeystore::new()),
         );
-        registry
-            .register("pathors", "/repos/pathors", "dev")
-            .unwrap();
+        registry.register("pathors", "dev").unwrap();
         let project = registry
             .set_sync("pathors", sync_for("contact@pathors.com"))
             .unwrap();

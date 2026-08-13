@@ -1,10 +1,37 @@
-//! The project env vault: the environment variables a *directory* needs.
+//! The project env vault: the environment variables a *project* needs.
 //!
 //! [`crate::keys`] holds standalone credentials that belong to a person or a
 //! machine. This module holds the other half of the same problem: the twenty
 //! variables a repo needs before it will boot — `DATABASE_URL`, the provider
 //! keys, the feature flags — which today live in a `.env` file that is
 //! gitignored, undocumented, and different on every laptop.
+//!
+//! **A project is a name, not a path.** `~/.config/patchbay/projects.json`
+//! holds ids, environments and sync config and *no absolute path at all*, so it
+//! is the same file on every machine you work from. Which directories on *this*
+//! machine belong to a project is a separate, machine-local list —
+//! [`Attachment`], in `~/.config/patchbay/attachments.json` — because the same
+//! repo lives somewhere else on the next laptop, and a manifest that hard-codes
+//! `/Users/you/repos/x` is a manifest that cannot travel.
+//!
+//! One project may have several attached roots. Git worktrees are the case that
+//! forces it: `repo/`, `repo/.worktrees/feature-a` and a second clone are the
+//! same project and want the same environment, and asking the user to register
+//! three projects would give them three vaults to keep in sync by hand.
+//!
+//! **A repo may also name its own project**, in a [`MARKER_FILE`] committed at
+//! its root — one line, `project = "pathors"`. A checkout then resolves with no
+//! attach step at all, which is what makes a fresh `git clone` on a new laptop
+//! work. See [`EnvRegistry::find_by_dir`] for the precedence rule and the
+//! tradeoff that buys.
+//!
+//! **Taking your environment to a new machine** is therefore: copy
+//! `projects.json` over and `pb env pull` to rebuild every synced layer from the
+//! remote. Checkouts carrying a marker resolve on their own; anything else takes
+//! one `pb env attach <id>`. The local layer deliberately does *not* travel.
+//! `.env.local` semantics are per-machine overrides, and a `DATABASE_URL`
+//! pointing at a container on the old laptop is exactly the thing that must not
+//! follow you.
 //!
 //! **Two layers per environment**, and the split is the whole point:
 //!
@@ -21,7 +48,7 @@
 //! nobody should run.
 //!
 //! **The storage split** mirrors the key vault. Variable *names* and where they
-//! came from live in `~/.config/patchbay/projects.json` — readable, greppable,
+//! came from live in `projects.json` — readable, greppable,
 //! worthless to an attacker. *Values* live in the OS keychain behind
 //! [`Keystore`], one item per (project, environment, layer), holding a compact
 //! JSON object of the whole layer. One keychain round trip per export rather
@@ -45,8 +72,19 @@ use crate::paths::Paths;
 /// Schema version of `projects.json`. Bump on an incompatible change.
 pub const PROJECTS_FILE_VERSION: u32 = 1;
 
+/// Schema version of `attachments.json`. Bump on an incompatible change.
+///
+/// Versioned separately from [`PROJECTS_FILE_VERSION`] on purpose: the two
+/// files have different lifetimes. One is copied between machines, the other is
+/// rebuilt on each.
+pub const ATTACHMENTS_FILE_VERSION: u32 = 1;
+
 /// The environment a project uses when nobody says which.
 pub const DEFAULT_ENV: &str = "dev";
+
+/// The file a repo commits to name its own project: `project = "<id>"` at a
+/// directory root. See [`read_marker`] and [`EnvRegistry::find_by_dir`].
+pub const MARKER_FILE: &str = ".patchbay.toml";
 
 // ---------------------------------------------------------------------------
 // validation
@@ -173,13 +211,15 @@ impl SyncConfig {
     }
 }
 
-/// One registered project directory.
+/// One registered project.
+///
+/// **Portable by construction**: not one field here is a path, which is what
+/// makes `projects.json` a file you can copy to another machine. Where the
+/// project lives *here* is an [`Attachment`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectEntry {
     /// Slug, unique across the registry, e.g. `"pathors"`.
     pub id: String,
-    /// The directory this project *is*: a repo root, usually.
-    pub root: PathBuf,
     /// Which environment `pb env` uses when the command does not say.
     pub default_env: String,
     pub created_at: DateTime<Utc>,
@@ -247,6 +287,29 @@ pub struct MergedEnv {
     pub overridden: Vec<String>,
 }
 
+/// One directory on **this machine** that belongs to a project.
+///
+/// The mental model is a symlink: the directory is pointed at a project that is
+/// managed centrally, and the project itself knows nothing about it. Several
+/// roots may point at one project (worktrees, a second clone); one root points
+/// at exactly one project.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Attachment {
+    /// The directory, as the caller gave it — absolute, in practice.
+    pub root: PathBuf,
+    /// The project id it resolves to. May name a project that no longer
+    /// exists; see [`EnvRegistry::find_by_dir`].
+    pub project: String,
+}
+
+/// On-disk shape of [`MARKER_FILE`]. Deliberately not `deny_unknown_fields`:
+/// keys patchbay does not know yet are room for a later version to use without
+/// making today's builds reject a repo they could otherwise resolve.
+#[derive(Debug, Deserialize)]
+struct MarkerToml {
+    project: String,
+}
+
 /// On-disk shape of `projects.json`.
 #[derive(Debug, Serialize, Deserialize)]
 struct ProjectsFile {
@@ -254,37 +317,124 @@ struct ProjectsFile {
     projects: Vec<ProjectEntry>,
 }
 
+/// On-disk shape of `attachments.json`. Machine-local, and never part of any
+/// migration or export story — see [`crate::paths::Paths::attachments_file`].
+#[derive(Debug, Serialize, Deserialize)]
+struct AttachmentsFile {
+    version: u32,
+    attachments: Vec<Attachment>,
+}
+
+// ---------------------------------------------------------------------------
+// the marker file
+// ---------------------------------------------------------------------------
+
+/// The project a directory's own [`MARKER_FILE`] names, if it has one.
+///
+/// The file is TOML with exactly one key that means anything —
+/// `project = "pathors"` — validated as a project id, because a marker that
+/// names something no registry could ever hold is a typo, not a claim.
+///
+/// A **missing** file is `Ok(None)`: most directories have none, and that is
+/// the normal case, not a failure. A file that is *present* and unreadable —
+/// broken TOML, no `project` key, an id that is not a slug — is an error naming
+/// the file. Somebody committed that marker on purpose and every checkout of
+/// that repo will hit it; failing loudly once is cheaper than every clone
+/// silently resolving to nothing.
+pub fn read_marker(dir: &Path) -> anyhow::Result<Option<String>> {
+    let path = dir.join(MARKER_FILE);
+    let Some(text) = read_text(&path)? else {
+        return Ok(None);
+    };
+    let marker: MarkerToml = toml::from_str(&text).map_err(|e| {
+        anyhow::anyhow!(
+            "{} is not a readable patchbay marker: {e}; it holds one key, `project = \"<id>\"`",
+            path.display()
+        )
+    })?;
+    validate_project_id(&marker.project)
+        .map_err(|e| anyhow::anyhow!("{} names an unusable project: {e}", path.display()))?;
+    Ok(Some(marker.project))
+}
+
+/// Write the [`MARKER_FILE`] that makes `dir` resolve to `project_id` in any
+/// checkout, and return the path written.
+///
+/// A plain write with default permissions, unlike everything else this module
+/// touches: the file holds a project *name*, it is meant to be committed, and a
+/// `0600` file in a repo would only confuse the next person to `ls -l` it.
+///
+/// Idempotent when the marker already names this project — the file is left
+/// exactly as it is, so a comment or a future key somebody added survives.
+/// Re-pointing an existing marker at a **different** project is refused: that is
+/// a change to what every checkout of the repo resolves to, and it should be a
+/// deliberate edit rather than the side effect of running a command in the wrong
+/// directory.
+pub fn write_marker(dir: &Path, project_id: &str) -> anyhow::Result<PathBuf> {
+    validate_project_id(project_id)?;
+    let path = dir.join(MARKER_FILE);
+
+    if let Some(existing) = read_marker(dir)? {
+        if existing == project_id {
+            return Ok(path);
+        }
+        anyhow::bail!(
+            "{} already names project `{existing}`, not `{project_id}`; delete it first if the \
+             repo should change hands, or bind this directory alone with `pb env attach \
+             {project_id}` (an attachment beats the marker and stays on this machine)",
+            path.display()
+        );
+    }
+
+    let body = format!(
+        "# patchbay project marker — commit this file.\n\
+         # Every checkout of this repo resolves to this project's environments on a\n\
+         # machine whose registry holds it (`pb env projects`).\n\
+         project = \"{project_id}\"\n"
+    );
+    std::fs::write(&path, body)
+        .map_err(|e| anyhow::anyhow!("could not write {}: {e}", path.display()))?;
+    Ok(path)
+}
+
 // ---------------------------------------------------------------------------
 // registry
 // ---------------------------------------------------------------------------
 
-/// The env vault: a metadata file plus a [`Keystore`] for the values.
+/// The env vault: a portable metadata file, a machine-local attachment file,
+/// and a [`Keystore`] for the values.
 ///
-/// Stateless between calls, like [`crate::keys::KeyRegistry`]: the file is
+/// Stateless between calls, like [`crate::keys::KeyRegistry`]: the files are
 /// re-read on every operation, so a pull from the CLI is immediately visible to
 /// a running MCP server.
 pub struct EnvRegistry {
     path: PathBuf,
+    attachments_path: PathBuf,
     store: Box<dyn Keystore>,
 }
 
 impl EnvRegistry {
-    /// Bind to an explicit metadata path and keystore. Tests use this with a
+    /// Bind to explicit file locations and a keystore. Tests use this with a
     /// tempdir and [`crate::keystore::MemoryKeystore`].
-    pub fn new(path: impl Into<PathBuf>, store: Box<dyn Keystore>) -> Self {
+    pub fn new(
+        path: impl Into<PathBuf>,
+        attachments_path: impl Into<PathBuf>,
+        store: Box<dyn Keystore>,
+    ) -> Self {
         Self {
             path: path.into(),
+            attachments_path: attachments_path.into(),
             store,
         }
     }
 
-    /// Bind to the location [`Paths`] reports, with the given keystore.
+    /// Bind to the locations [`Paths`] reports, with the given keystore.
     pub fn with_paths(paths: &Paths, store: Box<dyn Keystore>) -> Self {
-        Self::new(paths.projects_file(), store)
+        Self::new(paths.projects_file(), paths.attachments_file(), store)
     }
 
-    /// The real vault on this machine: `~/.config/patchbay/projects.json` plus
-    /// the macOS Keychain.
+    /// The real vault on this machine: `~/.config/patchbay/projects.json`,
+    /// `~/.config/patchbay/attachments.json` and the macOS Keychain.
     pub fn detect() -> anyhow::Result<Self> {
         let paths = Paths::detect()?;
         Ok(Self::with_paths(
@@ -293,8 +443,14 @@ impl EnvRegistry {
         ))
     }
 
+    /// The portable project manifest.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The machine-local attachment list.
+    pub fn attachments_path(&self) -> &Path {
+        &self.attachments_path
     }
 
     pub fn store_name(&self) -> &'static str {
@@ -314,32 +470,105 @@ impl EnvRegistry {
         Ok(self.projects()?.into_iter().find(|p| p.id == id))
     }
 
-    /// The project `dir` belongs to: the registered project whose root is `dir`
-    /// or an ancestor of it. When several match — a repo registered inside a
-    /// monorepo — the deepest root wins, because that is the more specific
-    /// answer.
+    /// Every attachment on this machine, sorted by root.
+    pub fn attachments(&self) -> anyhow::Result<Vec<Attachment>> {
+        Ok(self.load_attachments()?.attachments)
+    }
+
+    /// The directories on this machine attached to one project, sorted.
     ///
-    /// A pure path-prefix comparison, with no canonicalization: resolving
-    /// symlinks here would mean the answer depends on the filesystem's mood,
-    /// and `/tmp` on macOS is itself a symlink. A checkout reached through a
-    /// symlinked path therefore will not match — pass `--project` there.
+    /// Empty is a normal answer: a project copied over with `projects.json` has
+    /// no attachment here until somebody makes one.
+    pub fn attachments_of(&self, project_id: &str) -> anyhow::Result<Vec<PathBuf>> {
+        Ok(self
+            .attachments()?
+            .into_iter()
+            .filter(|a| a.project == project_id)
+            .map(|a| a.root)
+            .collect())
+    }
+
+    /// The project `dir` belongs to, by two routes in a fixed order.
+    ///
+    /// 1. **An attachment.** The project whose attached root is `dir` or an
+    ///    ancestor of it. When several match — a repo attached inside an
+    ///    attached monorepo — the deepest root wins, because that is the more
+    ///    specific answer. A match here ends the search.
+    /// 2. **A committed [`MARKER_FILE`]**, looked for in `dir` and then up
+    ///    through its ancestors; the nearest one wins, for the same
+    ///    specific-beats-general reason.
+    ///
+    /// Both comparisons are pure path prefixes, with no canonicalization:
+    /// resolving symlinks here would mean the answer depends on the
+    /// filesystem's mood, and `/tmp` on macOS is itself a symlink. A checkout
+    /// reached through a symlinked path therefore will not match an
+    /// attachment — pass `--project` there, or commit a marker, which is found
+    /// by walking up from whatever path the caller actually used.
+    ///
+    /// # Why an attachment beats a marker
+    ///
+    /// An attachment is a deliberate, local act: somebody stood in that
+    /// directory and said which project it belongs to. A marker is whatever the
+    /// repo happens to ship. When the two disagree the person at the keyboard
+    /// wins, so `pb env attach` is always the way to override a marker — and
+    /// nothing a repo can contain takes that override away.
+    ///
+    /// # The tradeoff the marker buys, stated plainly
+    ///
+    /// Resolving by repo content means **repo content selects the project**:
+    /// cloning a repository whose marker names `pathors` is enough to make
+    /// `pb env run` inject that project's variables there. This is accepted
+    /// deliberately, on the assumption that the repos on this machine are
+    /// internal ones. Two things bound it: a marker can only *name* a project
+    /// that already exists in this machine's own `projects.json` — it cannot
+    /// define sync config, an account, or anything else — and an explicit
+    /// attachment always wins. Somebody who works from untrusted checkouts
+    /// should not commit markers and should attach instead.
+    ///
+    /// A **dangling** attachment — one whose project has since been forgotten —
+    /// is skipped rather than fatal, and the next-deepest match is considered.
+    /// [`EnvRegistry::forget`] is what stops them accumulating; this is only the
+    /// belt to that pair of braces, because `projects.json` can also be
+    /// hand-edited or replaced wholesale by a copy from another machine.
+    ///
+    /// A marker naming an unknown project is **not** treated the same way. It
+    /// is an error, because it is an explicit claim rather than leftover state:
+    /// the fix is to bring the registry over from the machine that has that
+    /// project, and "the clone worked but `pb env` sees nothing here" hides
+    /// exactly that.
     pub fn find_by_dir(&self, dir: &Path) -> anyhow::Result<Option<ProjectEntry>> {
-        let mut best: Option<ProjectEntry> = None;
-        for project in self.projects()? {
-            if !dir.starts_with(&project.root) {
-                continue;
-            }
-            let deeper = match &best {
-                None => true,
-                Some(current) => {
-                    project.root.components().count() > current.root.components().count()
-                }
-            };
-            if deeper {
-                best = Some(project);
-            }
+        let projects = self.projects()?;
+
+        let mut matches: Vec<Attachment> = self
+            .attachments()?
+            .into_iter()
+            .filter(|a| dir.starts_with(&a.root))
+            .collect();
+        // Deepest first, so the first attachment with a live project wins.
+        matches.sort_by_key(|a| std::cmp::Reverse(a.root.components().count()));
+        if let Some(attached) = matches
+            .into_iter()
+            .find_map(|a| projects.iter().find(|p| p.id == a.project).cloned())
+        {
+            return Ok(Some(attached));
         }
-        Ok(best)
+
+        // Nothing on this machine claims the directory. What does the repo say?
+        for ancestor in dir.ancestors() {
+            let Some(claimed) = read_marker(ancestor)? else {
+                continue;
+            };
+            return match projects.iter().find(|p| p.id == claimed) {
+                Some(project) => Ok(Some(project.clone())),
+                None => Err(anyhow::anyhow!(
+                    "{} names project `{claimed}`, but this machine's registry has no project \
+                     `{claimed}`; copy your projects.json from the machine that has it, or \
+                     register it here with `pb env init --id {claimed}`",
+                    ancestor.join(MARKER_FILE).display()
+                )),
+            };
+        }
+        Ok(None)
     }
 
     /// Every variable name in one environment and where it comes from.
@@ -413,39 +642,26 @@ impl EnvRegistry {
 
     // --- writes -------------------------------------------------------------
 
-    /// Register a directory as a project. No keychain item is created: an
-    /// environment appears on the first write to it.
-    pub fn register(
-        &self,
-        id: &str,
-        root: impl Into<PathBuf>,
-        default_env: &str,
-    ) -> anyhow::Result<ProjectEntry> {
+    /// Register a project — a name and a default environment, nothing more.
+    ///
+    /// No directory is involved: point one at it with [`EnvRegistry::attach`].
+    /// No keychain item is created either — an environment appears on the first
+    /// write to it.
+    pub fn register(&self, id: &str, default_env: &str) -> anyhow::Result<ProjectEntry> {
         validate_project_id(id)?;
         validate_env_name(default_env)?;
-        let root = root.into();
 
         let mut file = self.load()?;
-        if let Some(existing) = file.projects.iter().find(|p| p.id == id) {
+        if file.projects.iter().any(|p| p.id == id) {
             anyhow::bail!(
-                "a project is already registered as `{id}` ({}); pick another id, or remove that \
-                 one with `pb env forget --project {id}`",
-                existing.root.display()
-            );
-        }
-        if let Some(existing) = file.projects.iter().find(|p| p.root == root) {
-            anyhow::bail!(
-                "{} is already registered as project `{}`; use that project, or remove it with \
-                 `pb env forget --project {}`",
-                root.display(),
-                existing.id,
-                existing.id
+                "a project is already registered as `{id}`; pick another id, attach this \
+                 directory to it with `pb env attach {id}`, or remove it with `pb env forget \
+                 --project {id}`"
             );
         }
 
         let entry = ProjectEntry {
             id: id.to_string(),
-            root,
             default_env: default_env.to_string(),
             created_at: Utc::now(),
             environments: BTreeMap::new(),
@@ -454,6 +670,81 @@ impl EnvRegistry {
         file.projects.push(entry.clone());
         self.save(&file)?;
         Ok(entry)
+    }
+
+    /// Attach a directory on this machine to a project.
+    ///
+    /// `root` is stored exactly as given — callers pass an absolute path, and
+    /// nothing here canonicalizes or resolves symlinks, for the reason
+    /// [`EnvRegistry::find_by_dir`] gives.
+    ///
+    /// Re-attaching a root to the project it already has is a no-op that
+    /// succeeds, so `pb env attach` is safe to put in a setup script.
+    /// Re-pointing it at a *different* project is refused: silently moving a
+    /// directory between vaults would change what `pb env run` injects there,
+    /// which is not something a stray command should be able to do.
+    ///
+    /// # Why this is an explicit, machine-local act
+    ///
+    /// The other route to the same answer is a [`MARKER_FILE`] committed in the
+    /// repo, and it is the one that makes a fresh clone work. An attachment is
+    /// the heavier instrument on purpose: it lives outside every repository, in
+    /// the user's own registry, and it **beats the marker** — so a directory
+    /// whose repo claims the wrong project, or none, can always be pointed
+    /// somewhere by hand, and no repo can take that back. See
+    /// [`EnvRegistry::find_by_dir`] for the full precedence rule.
+    pub fn attach(&self, root: impl Into<PathBuf>, project_id: &str) -> anyhow::Result<Attachment> {
+        let root = root.into();
+        if self.get(project_id)?.is_none() {
+            anyhow::bail!(
+                "no project registered as `{project_id}`; register one with `pb env init --id \
+                 {project_id}`, or see what exists with `pb env projects`"
+            );
+        }
+
+        let mut file = self.load_attachments()?;
+        if let Some(existing) = file.attachments.iter().find(|a| a.root == root) {
+            if existing.project == project_id {
+                // Idempotent: nothing is written, so the file's mtime does not
+                // move either.
+                return Ok(existing.clone());
+            }
+            anyhow::bail!(
+                "{} is already attached to project `{}`, not `{project_id}`; detach it first \
+                 (`pb env detach --dir {}`) if you meant to move it",
+                root.display(),
+                existing.project,
+                root.display()
+            );
+        }
+
+        let attachment = Attachment {
+            root,
+            project: project_id.to_string(),
+        };
+        file.attachments.push(attachment.clone());
+        self.save_attachments(&mut file)?;
+        Ok(attachment)
+    }
+
+    /// Detach a directory. The project, its environments and its values are
+    /// untouched — this only forgets that *this machine* maps that path.
+    pub fn detach(&self, root: &Path) -> anyhow::Result<Attachment> {
+        let mut file = self.load_attachments()?;
+        let at = file
+            .attachments
+            .iter()
+            .position(|a| a.root == root)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "nothing is attached at {}; `pb env projects` shows this machine's \
+                     attachments",
+                    root.display()
+                )
+            })?;
+        let removed = file.attachments.remove(at);
+        self.save_attachments(&mut file)?;
+        Ok(removed)
     }
 
     /// Point a project at a remote, replacing whatever it was linked to.
@@ -476,12 +767,20 @@ impl EnvRegistry {
         Ok(updated)
     }
 
-    /// Unregister a project: the metadata entry and every stored value for
-    /// every environment, both layers.
+    /// Unregister a project: this machine's attachments to it, the metadata
+    /// entry, and every stored value for every environment, both layers.
     ///
-    /// Metadata first, keychain second, with the same both-or-neither rule as
-    /// the key vault. A value that is already absent is not an error — that is
-    /// what [`Keystore::delete`] returning `Ok(false)` is for.
+    /// **Attachments go first.** They are machine-local convenience state, so
+    /// losing them costs an `attach`; what must not survive is an attachment
+    /// pointing at a project that no longer exists. Taking them first also
+    /// keeps every failure path re-runnable: if a keychain delete then fails,
+    /// the project entry is restored and `pb env forget` can simply be run
+    /// again, whereas removing them last would leave a dangling attachment that
+    /// no `forget` could ever reach.
+    ///
+    /// Metadata then keychain, with the same both-or-neither rule as the key
+    /// vault. A value that is already absent is not an error — that is what
+    /// [`Keystore::delete`] returning `Ok(false)` is for.
     pub fn forget(&self, id: &str) -> anyhow::Result<ProjectEntry> {
         let mut file = self.load()?;
         let at = file
@@ -490,6 +789,12 @@ impl EnvRegistry {
             .position(|p| p.id == id)
             .ok_or_else(|| unknown_project(id))?;
         let entry = file.projects.remove(at);
+
+        let mut attachments = self.load_attachments()?;
+        if attachments.attachments.iter().any(|a| a.project == id) {
+            attachments.attachments.retain(|a| a.project != id);
+            self.save_attachments(&mut attachments)?;
+        }
 
         let previous = self.read_raw()?;
         self.save(&file)?;
@@ -742,14 +1047,7 @@ impl EnvRegistry {
     // --- file plumbing ------------------------------------------------------
 
     fn read_raw(&self) -> anyhow::Result<Option<String>> {
-        match std::fs::read_to_string(&self.path) {
-            Ok(text) => Ok(Some(text)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(anyhow::anyhow!(
-                "could not read {}: {e}",
-                self.path.display()
-            )),
-        }
+        read_text(&self.path)
     }
 
     fn load(&self) -> anyhow::Result<ProjectsFile> {
@@ -791,12 +1089,12 @@ impl EnvRegistry {
             version: PROJECTS_FILE_VERSION,
             projects: file.projects.clone(),
         })?;
-        self.write_atomic(&body)
+        write_atomic(&self.path, &body)
     }
 
     fn restore(&self, previous: Option<&str>) -> anyhow::Result<()> {
         match previous {
-            Some(text) => self.write_atomic(text),
+            Some(text) => write_atomic(&self.path, text),
             // There was no file before; removing it is the true rollback.
             None => match std::fs::remove_file(&self.path) {
                 Ok(()) => Ok(()),
@@ -809,35 +1107,90 @@ impl EnvRegistry {
         }
     }
 
-    fn write_atomic(&self, body: &str) -> anyhow::Result<()> {
-        let dir = self
-            .path
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", self.path.display()))?;
-        std::fs::create_dir_all(dir)
-            .map_err(|e| anyhow::anyhow!("could not create {}: {e}", dir.display()))?;
+    // --- the attachment file ------------------------------------------------
+    // Same discipline as the project file: missing is empty, malformed is a
+    // hard error naming the file, a newer version is refused rather than
+    // rewritten.
 
-        let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, body)
-            .map_err(|e| anyhow::anyhow!("could not write {}: {e}", tmp.display()))?;
-        // Variable names are not secret, but which of them a machine holds is
-        // nobody else's business.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| anyhow::anyhow!("could not chmod {}: {e}", tmp.display()))?;
+    fn load_attachments(&self) -> anyhow::Result<AttachmentsFile> {
+        let empty = || AttachmentsFile {
+            version: ATTACHMENTS_FILE_VERSION,
+            attachments: Vec::new(),
+        };
+        let Some(text) = read_text(&self.attachments_path)? else {
+            return Ok(empty());
+        };
+        if text.trim().is_empty() {
+            return Ok(empty());
         }
-        std::fs::rename(&tmp, &self.path).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            anyhow::anyhow!("could not replace {}: {e}", self.path.display())
-        })
+        let file: AttachmentsFile = serde_json::from_str(&text).map_err(|e| {
+            anyhow::anyhow!(
+                "{} is not a readable patchbay attachment list: {e}",
+                self.attachments_path.display()
+            )
+        })?;
+        if file.version > ATTACHMENTS_FILE_VERSION {
+            anyhow::bail!(
+                "{} was written by a newer patchbay (file version {}, this build understands {}); \
+                 upgrade rather than risk rewriting it",
+                self.attachments_path.display(),
+                file.version,
+                ATTACHMENTS_FILE_VERSION
+            );
+        }
+        Ok(file)
+    }
+
+    /// Sorted by root, so a diff of this file between two moments shows what
+    /// actually changed rather than what got appended.
+    fn save_attachments(&self, file: &mut AttachmentsFile) -> anyhow::Result<()> {
+        file.attachments.sort_by(|a, b| a.root.cmp(&b.root));
+        let body = serde_json::to_string_pretty(&AttachmentsFile {
+            version: ATTACHMENTS_FILE_VERSION,
+            attachments: file.attachments.clone(),
+        })?;
+        write_atomic(&self.attachments_path, &body)
     }
 }
 
 // ---------------------------------------------------------------------------
 // free functions
 // ---------------------------------------------------------------------------
+
+/// A file's text, or `None` when it does not exist yet.
+fn read_text(path: &Path) -> anyhow::Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow::anyhow!("could not read {}: {e}", path.display())),
+    }
+}
+
+/// Write one of the vault's files atomically: temp file in the same directory,
+/// `0600`, then rename over the target.
+fn write_atomic(path: &Path, body: &str) -> anyhow::Result<()> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", path.display()))?;
+    std::fs::create_dir_all(dir)
+        .map_err(|e| anyhow::anyhow!("could not create {}: {e}", dir.display()))?;
+
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, body)
+        .map_err(|e| anyhow::anyhow!("could not write {}: {e}", tmp.display()))?;
+    // Variable names are not secret, and neither is a directory path — but
+    // which of them a machine holds is nobody else's business.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| anyhow::anyhow!("could not chmod {}: {e}", tmp.display()))?;
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        anyhow::anyhow!("could not replace {}: {e}", path.display())
+    })
+}
 
 fn project_mut<'a>(file: &'a mut ProjectsFile, id: &str) -> anyhow::Result<&'a mut ProjectEntry> {
     file.projects
@@ -1036,7 +1389,7 @@ mod tests {
     /// A registry over a tempdir with a fake keystore. Nothing here touches the
     /// real `$HOME` or the real keychain.
     struct Vault {
-        _dir: tempfile::TempDir,
+        dir: tempfile::TempDir,
         registry: EnvRegistry,
         store: Arc<MemoryKeystore>,
     }
@@ -1068,7 +1421,7 @@ mod tests {
         let store = Arc::new(store);
         let registry = EnvRegistry::with_paths(&paths, Box::new(Shared(store.clone())));
         Vault {
-            _dir: dir,
+            dir,
             registry,
             store,
         }
@@ -1078,11 +1431,22 @@ mod tests {
         vault_with(MemoryKeystore::new())
     }
 
+    /// A registry over one tempdir, for the tests that need two handles onto
+    /// the same pair of files.
+    fn registry_at(dir: &Path, store: Box<dyn Keystore>) -> EnvRegistry {
+        EnvRegistry::new(
+            dir.join("projects.json"),
+            dir.join("attachments.json"),
+            store,
+        )
+    }
+
     /// A registered project with one environment holding both layers.
     fn seeded() -> Vault {
         let v = vault();
+        v.registry.register("pathors", DEFAULT_ENV).unwrap();
         v.registry
-            .register("pathors", "/Users/x/repos/pathors", DEFAULT_ENV)
+            .attach("/Users/x/repos/pathors", "pathors")
             .unwrap();
         v.registry
             .replace_synced(
@@ -1120,20 +1484,19 @@ mod tests {
     #[test]
     fn test_register_writes_metadata_and_no_keychain_items() {
         let v = vault();
-        let entry = v
-            .registry
-            .register("pathors", "/repos/pathors", "dev")
-            .unwrap();
+        let entry = v.registry.register("pathors", "dev").unwrap();
 
         assert_eq!(entry.id, "pathors");
-        assert_eq!(entry.root, PathBuf::from("/repos/pathors"));
         assert_eq!(entry.default_env, "dev");
         assert!(entry.environments.is_empty());
         assert!(entry.sync.is_none());
 
         assert_eq!(v.registry.projects().unwrap(), vec![entry]);
-        // An environment appears on the first write, not on registration.
+        // An environment appears on the first write, not on registration; and a
+        // project is a name, so registering one attaches nothing.
         assert!(v.store.is_empty());
+        assert!(v.registry.attachments().unwrap().is_empty());
+        assert!(!v.registry.attachments_path().exists());
     }
 
     #[test]
@@ -1141,39 +1504,30 @@ mod tests {
         let v = vault();
         assert!(v.registry.projects().unwrap().is_empty());
         assert!(v.registry.get("nope").unwrap().is_none());
+        assert!(v.registry.attachments().unwrap().is_empty());
+        assert!(v.registry.attachments_of("nope").unwrap().is_empty());
         assert!(v
             .registry
             .find_by_dir(Path::new("/anywhere"))
             .unwrap()
             .is_none());
         assert!(!v.registry.path().exists());
+        assert!(!v.registry.attachments_path().exists());
     }
 
     #[test]
-    fn test_a_duplicate_id_or_root_names_the_conflict() {
+    fn test_a_duplicate_id_names_the_conflict() {
         let v = vault();
-        v.registry
-            .register("pathors", "/repos/pathors", "dev")
-            .unwrap();
+        v.registry.register("pathors", "dev").unwrap();
 
         let err = v
             .registry
-            .register("pathors", "/repos/elsewhere", "dev")
+            .register("pathors", "dev")
             .unwrap_err()
             .to_string();
         assert!(err.contains("already registered as `pathors`"), "{err}");
-        assert!(err.contains("/repos/pathors"), "{err}");
-
-        let err = v
-            .registry
-            .register("other", "/repos/pathors", "dev")
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("/repos/pathors is already registered"),
-            "{err}"
-        );
-        assert!(err.contains("`pathors`"), "{err}");
+        // The way out of a collision is now attach, so it is offered.
+        assert!(err.contains("pb env attach pathors"), "{err}");
 
         assert_eq!(v.registry.projects().unwrap().len(), 1);
     }
@@ -1183,27 +1537,177 @@ mod tests {
         let v = vault();
         let err = v
             .registry
-            .register("Pathors", "/repos/p", "dev")
+            .register("Pathors", "dev")
             .unwrap_err()
             .to_string();
         assert!(err.contains("project id"), "{err}");
 
         let err = v
             .registry
-            .register("pathors", "/repos/p", "Prod")
+            .register("pathors", "Prod")
             .unwrap_err()
             .to_string();
         assert!(err.contains("environment name"), "{err}");
         assert!(!v.registry.path().exists());
     }
 
+    // --- attachments --------------------------------------------------------
+
     #[test]
-    fn test_find_by_dir_prefers_the_deepest_root() {
+    fn test_attach_and_detach_round_trip() {
         let v = vault();
-        v.registry.register("mono", "/repos/mono", "dev").unwrap();
+        v.registry.register("pathors", "dev").unwrap();
+
+        let made = v.registry.attach("/repos/pathors", "pathors").unwrap();
+        assert_eq!(made.root, PathBuf::from("/repos/pathors"));
+        assert_eq!(made.project, "pathors");
+        assert_eq!(v.registry.attachments().unwrap(), vec![made.clone()]);
+        assert_eq!(
+            v.registry.attachments_of("pathors").unwrap(),
+            vec![PathBuf::from("/repos/pathors")]
+        );
+        assert_eq!(
+            v.registry
+                .find_by_dir(Path::new("/repos/pathors/src"))
+                .unwrap()
+                .map(|p| p.id),
+            Some("pathors".to_string())
+        );
+
+        let gone = v.registry.detach(Path::new("/repos/pathors")).unwrap();
+        assert_eq!(gone, made);
+        assert!(v.registry.attachments().unwrap().is_empty());
+        // Detaching is not forgetting: the project is untouched.
+        assert!(v.registry.get("pathors").unwrap().is_some());
+        assert!(v
+            .registry
+            .find_by_dir(Path::new("/repos/pathors"))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn test_re_attaching_the_same_pair_is_a_no_op() {
+        let v = vault();
+        v.registry.register("pathors", "dev").unwrap();
+        v.registry.attach("/repos/pathors", "pathors").unwrap();
+        let before = std::fs::read_to_string(v.registry.attachments_path()).unwrap();
+
+        let again = v.registry.attach("/repos/pathors", "pathors").unwrap();
+        assert_eq!(again.project, "pathors");
+        assert_eq!(v.registry.attachments().unwrap().len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(v.registry.attachments_path()).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn test_attaching_a_root_to_a_second_project_is_refused() {
+        let v = vault();
+        v.registry.register("pathors", "dev").unwrap();
+        v.registry.register("other", "dev").unwrap();
+        v.registry.attach("/repos/pathors", "pathors").unwrap();
+        let before = std::fs::read_to_string(v.registry.attachments_path()).unwrap();
+
+        let err = v
+            .registry
+            .attach("/repos/pathors", "other")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("already attached to project `pathors`"),
+            "{err}"
+        );
+        assert!(err.contains("`other`"), "{err}");
+        assert!(err.contains("pb env detach"), "{err}");
+
+        // A refusal changes nothing on disk.
+        assert_eq!(
+            std::fs::read_to_string(v.registry.attachments_path()).unwrap(),
+            before
+        );
+        assert_eq!(
+            v.registry.attachments().unwrap()[0].project,
+            "pathors",
+            "the refusal moved the attachment anyway"
+        );
+    }
+
+    #[test]
+    fn test_attaching_to_an_unknown_project_points_at_init() {
+        let v = vault();
+        let err = v
+            .registry
+            .attach("/repos/ghost", "ghost")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no project registered as `ghost`"), "{err}");
+        assert!(err.contains("pb env init"), "{err}");
+        assert!(err.contains("pb env projects"), "{err}");
+        assert!(!v.registry.attachments_path().exists());
+    }
+
+    #[test]
+    fn test_detaching_an_unattached_path_says_where_to_look() {
+        let v = vault();
+        let err = v
+            .registry
+            .detach(Path::new("/repos/nowhere"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("nothing is attached at /repos/nowhere"),
+            "{err}"
+        );
+        assert!(err.contains("pb env projects"), "{err}");
+    }
+
+    #[test]
+    fn test_every_worktree_of_a_repo_shares_one_project() {
+        let v = vault();
+        v.registry.register("pathors", "dev").unwrap();
+        v.registry.attach("/repos/pathors", "pathors").unwrap();
         v.registry
-            .register("inner", "/repos/mono/apps/web", "dev")
+            .attach("/repos/pathors-worktrees/feature-a", "pathors")
             .unwrap();
+        // A second clone somewhere else entirely is the same project too.
+        v.registry
+            .attach("/tmp/scratch/pathors", "pathors")
+            .unwrap();
+
+        assert_eq!(
+            v.registry.attachments_of("pathors").unwrap(),
+            vec![
+                PathBuf::from("/repos/pathors"),
+                PathBuf::from("/repos/pathors-worktrees/feature-a"),
+                PathBuf::from("/tmp/scratch/pathors"),
+            ],
+            "attachments are stored sorted by root"
+        );
+        for dir in [
+            "/repos/pathors/src",
+            "/repos/pathors-worktrees/feature-a/src",
+            "/tmp/scratch/pathors",
+        ] {
+            assert_eq!(
+                v.registry
+                    .find_by_dir(Path::new(dir))
+                    .unwrap()
+                    .map(|p| p.id),
+                Some("pathors".to_string()),
+                "{dir} did not resolve to the shared project"
+            );
+        }
+    }
+
+    #[test]
+    fn test_find_by_dir_prefers_the_deepest_attached_root() {
+        let v = vault();
+        v.registry.register("mono", "dev").unwrap();
+        v.registry.register("inner", "dev").unwrap();
+        v.registry.attach("/repos/mono", "mono").unwrap();
+        v.registry.attach("/repos/mono/apps/web", "inner").unwrap();
 
         let hit = |dir: &str| {
             v.registry
@@ -1218,7 +1722,261 @@ mod tests {
         assert_eq!(hit("/repos/mono/apps/web/src"), Some("inner".into()));
         // A sibling with the same prefix as a *string* is not a child path.
         assert_eq!(hit("/repos/monolith"), None);
+        // A directory under no attachment belongs to nothing, even though both
+        // projects exist.
         assert_eq!(hit("/elsewhere"), None);
+    }
+
+    #[test]
+    fn test_a_dangling_attachment_is_skipped_not_fatal() {
+        let v = vault();
+        v.registry.register("mono", "dev").unwrap();
+        v.registry.register("inner", "dev").unwrap();
+        v.registry.attach("/repos/mono", "mono").unwrap();
+        v.registry.attach("/repos/mono/apps/web", "inner").unwrap();
+
+        // File surgery: drop `inner` from the manifest without going through
+        // `forget`, exactly as copying another machine's projects.json would.
+        let text = std::fs::read_to_string(v.registry.path()).unwrap();
+        let mut file: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let projects = file["projects"].as_array_mut().unwrap();
+        projects.retain(|p| p["id"] != "inner");
+        std::fs::write(
+            v.registry.path(),
+            serde_json::to_string_pretty(&file).unwrap(),
+        )
+        .unwrap();
+
+        // The dangling attachment is still on disk, and is simply not an answer.
+        assert_eq!(v.registry.attachments().unwrap().len(), 2);
+        assert_eq!(
+            v.registry
+                .find_by_dir(Path::new("/repos/mono/apps/web/src"))
+                .unwrap()
+                .map(|p| p.id),
+            Some("mono".to_string()),
+            "the deepest match was dead; the next one up should answer"
+        );
+    }
+
+    // --- the marker file ----------------------------------------------------
+
+    /// A directory under the vault's tempdir, optionally carrying a marker.
+    /// Real directories, because the marker walk reads the filesystem.
+    fn dir_with_marker(v: &Vault, relative: &str, marker: Option<&str>) -> PathBuf {
+        let dir = v.dir.path().join(relative);
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some(body) = marker {
+            std::fs::write(dir.join(MARKER_FILE), body).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn test_a_marker_resolves_a_directory_nobody_attached() {
+        let v = vault();
+        v.registry.register("pathors", "dev").unwrap();
+        let root = dir_with_marker(&v, "clone", Some("project = \"pathors\"\n"));
+        let deep = dir_with_marker(&v, "clone/apps/web/src", None);
+
+        // Nothing on this machine points at either directory.
+        assert!(v.registry.attachments().unwrap().is_empty());
+        for dir in [&root, &deep] {
+            assert_eq!(
+                v.registry.find_by_dir(dir).unwrap().map(|p| p.id),
+                Some("pathors".to_string()),
+                "{} did not resolve through the marker",
+                dir.display()
+            );
+        }
+        // Unknown keys are room for later versions, not a reason to refuse.
+        let extra = dir_with_marker(
+            &v,
+            "clone2",
+            Some("project = \"pathors\"\nsomething_new = 42\n"),
+        );
+        assert_eq!(read_marker(&extra).unwrap().as_deref(), Some("pathors"));
+        // A directory with no marker anywhere above it still belongs to nothing.
+        assert!(v.registry.find_by_dir(v.dir.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_the_nearest_marker_wins() {
+        let v = vault();
+        v.registry.register("mono", "dev").unwrap();
+        v.registry.register("inner", "dev").unwrap();
+        dir_with_marker(&v, "mono", Some("project = \"mono\"\n"));
+        let inner = dir_with_marker(&v, "mono/apps/web", Some("project = \"inner\"\n"));
+
+        assert_eq!(
+            v.registry.find_by_dir(&inner).unwrap().map(|p| p.id),
+            Some("inner".to_string())
+        );
+        assert_eq!(
+            v.registry
+                .find_by_dir(&inner.join("src/components"))
+                .unwrap()
+                .map(|p| p.id),
+            Some("inner".to_string())
+        );
+        assert_eq!(
+            v.registry
+                .find_by_dir(&v.dir.path().join("mono/services/api"))
+                .unwrap()
+                .map(|p| p.id),
+            Some("mono".to_string())
+        );
+    }
+
+    #[test]
+    fn test_an_attachment_beats_the_marker() {
+        let v = vault();
+        v.registry.register("pathors", "dev").unwrap();
+        v.registry.register("fork", "dev").unwrap();
+        let root = dir_with_marker(&v, "clone", Some("project = \"pathors\"\n"));
+        v.registry.attach(&root, "fork").unwrap();
+
+        // The local, deliberate act wins over what the repo ships — and it wins
+        // for the whole subtree.
+        assert_eq!(
+            v.registry.find_by_dir(&root).unwrap().map(|p| p.id),
+            Some("fork".to_string())
+        );
+        assert_eq!(
+            v.registry
+                .find_by_dir(&root.join("src"))
+                .unwrap()
+                .map(|p| p.id),
+            Some("fork".to_string())
+        );
+
+        // Detaching hands the directory back to the marker rather than to
+        // nothing: the repo's claim was never removed.
+        v.registry.detach(&root).unwrap();
+        assert_eq!(
+            v.registry.find_by_dir(&root).unwrap().map(|p| p.id),
+            Some("pathors".to_string())
+        );
+    }
+
+    #[test]
+    fn test_a_marker_for_an_unknown_project_says_to_bring_the_registry() {
+        let v = vault();
+        v.registry.register("other", "dev").unwrap();
+        let root = dir_with_marker(&v, "clone", Some("project = \"pathors\"\n"));
+
+        // Silence would be the wrong answer here: the checkout is fine, the
+        // registry is what did not travel.
+        let err = v
+            .registry
+            .find_by_dir(&root.join("src"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(MARKER_FILE), "{err}");
+        assert!(err.contains("no project `pathors`"), "{err}");
+        assert!(err.contains("projects.json"), "{err}");
+        assert!(err.contains("pb env init --id pathors"), "{err}");
+    }
+
+    #[test]
+    fn test_a_broken_marker_is_loud_rather_than_ignored() {
+        let v = vault();
+        v.registry.register("pathors", "dev").unwrap();
+
+        let bad = dir_with_marker(&v, "a", Some("project = pathors\n"));
+        let err = read_marker(&bad).unwrap_err().to_string();
+        assert!(err.contains("is not a readable patchbay marker"), "{err}");
+        assert!(err.contains(MARKER_FILE), "{err}");
+        assert!(err.contains("`project = \"<id>\"`"), "{err}");
+
+        let empty = dir_with_marker(&v, "b", Some("# nothing here\n"));
+        let err = read_marker(&empty).unwrap_err().to_string();
+        assert!(err.contains("project"), "{err}");
+
+        // An id no registry could hold is a typo, and it is caught at the file.
+        let shouty = dir_with_marker(&v, "c", Some("project = \"Pathors\"\n"));
+        let err = read_marker(&shouty).unwrap_err().to_string();
+        assert!(err.contains("names an unusable project"), "{err}");
+        assert!(err.contains("project id"), "{err}");
+
+        // And the resolution path surfaces it rather than falling through to a
+        // marker further up.
+        dir_with_marker(&v, "", Some("project = \"pathors\"\n"));
+        assert!(v.registry.find_by_dir(&bad).is_err());
+    }
+
+    #[test]
+    fn test_write_marker_round_trips_and_refuses_to_change_hands() {
+        let v = vault();
+        let root = dir_with_marker(&v, "clone", None);
+
+        let path = write_marker(&root, "pathors").unwrap();
+        assert_eq!(path, root.join(MARKER_FILE));
+        assert_eq!(read_marker(&root).unwrap().as_deref(), Some("pathors"));
+
+        // Idempotent, and byte-for-byte: a comment or a hand-added key survives
+        // a second `pb env init`.
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("commit this file"), "{written}");
+        std::fs::write(&path, format!("{written}extra = true\n")).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(write_marker(&root, "pathors").unwrap(), path);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        let err = write_marker(&root, "other").unwrap_err().to_string();
+        assert!(err.contains("already names project `pathors`"), "{err}");
+        assert!(err.contains("`other`"), "{err}");
+        assert!(err.contains("pb env attach other"), "{err}");
+        // A refusal changes nothing on disk.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        let err = write_marker(&root, "Nope").unwrap_err().to_string();
+        assert!(err.contains("project id"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_the_marker_is_a_normal_committable_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let v = vault();
+        let root = dir_with_marker(&v, "clone", None);
+        let path = write_marker(&root, "pathors").unwrap();
+
+        // Unlike the registry files, this one is meant to be committed and read
+        // by everyone who checks the repo out — so it gets whatever an ordinary
+        // write gets, not the vault's `0600`.
+        let control = root.join("control.txt");
+        std::fs::write(&control, "x").unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode(&path),
+            mode(&control),
+            "the marker was written with special permissions"
+        );
+    }
+
+    #[test]
+    fn test_the_projects_file_holds_no_path_from_this_machine() {
+        let v = vault();
+        let root = v.dir.path().join("repos/pathors");
+        v.registry.register("pathors", "dev").unwrap();
+        v.registry.attach(&root, "pathors").unwrap();
+        v.registry.set_local("pathors", "dev", "A", "1").unwrap();
+
+        // The whole portability promise, as one assertion: a manifest with an
+        // absolute path in it is a manifest that cannot be copied to another
+        // machine.
+        let manifest = std::fs::read_to_string(v.registry.path()).unwrap();
+        let here = v.dir.path().to_string_lossy().to_string();
+        assert!(
+            !manifest.contains(&here),
+            "{here} leaked into the portable manifest:\n{manifest}"
+        );
+        assert!(!manifest.contains("root"), "{manifest}");
+
+        // And the machine-local file is where it went.
+        let attachments = std::fs::read_to_string(v.registry.attachments_path()).unwrap();
+        assert!(attachments.contains(&here), "{attachments}");
     }
 
     #[test]
@@ -1232,6 +1990,7 @@ mod tests {
         let entry = v.registry.forget("pathors").unwrap();
         assert_eq!(entry.id, "pathors");
         assert!(v.registry.projects().unwrap().is_empty());
+        assert!(v.registry.attachments().unwrap().is_empty());
         assert!(
             v.store.is_empty(),
             "keychain items survived the project: {}",
@@ -1243,25 +2002,56 @@ mod tests {
     }
 
     #[test]
+    fn test_forget_takes_this_machines_attachments_and_leaves_the_rest() {
+        let v = vault();
+        v.registry.register("pathors", "dev").unwrap();
+        v.registry.register("side", "dev").unwrap();
+        v.registry.attach("/repos/pathors", "pathors").unwrap();
+        v.registry
+            .attach("/repos/pathors-worktrees/a", "pathors")
+            .unwrap();
+        v.registry.attach("/repos/side", "side").unwrap();
+
+        v.registry.forget("pathors").unwrap();
+
+        // Both of the forgotten project's roots went; the other project's did
+        // not. A dangling attachment is what this prevents.
+        assert_eq!(
+            v.registry.attachments().unwrap(),
+            vec![Attachment {
+                root: PathBuf::from("/repos/side"),
+                project: "side".to_string(),
+            }]
+        );
+        assert!(v.registry.attachments_of("pathors").unwrap().is_empty());
+        assert!(v
+            .registry
+            .find_by_dir(Path::new("/repos/pathors/src"))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn test_forget_keeps_the_project_when_a_delete_fails() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("projects.json");
-        let ok = EnvRegistry::new(&path, Box::new(MemoryKeystore::new()));
-        ok.register("pathors", "/repos/pathors", "dev").unwrap();
+        let ok = registry_at(dir.path(), Box::new(MemoryKeystore::new()));
+        ok.register("pathors", "dev").unwrap();
+        ok.attach("/repos/pathors", "pathors").unwrap();
         ok.set_local("pathors", "dev", "A", "1").unwrap();
 
-        let broken = EnvRegistry::new(&path, Box::new(MemoryKeystore::failing_delete()));
+        let broken = registry_at(dir.path(), Box::new(MemoryKeystore::failing_delete()));
         let err = format!("{:#}", broken.forget("pathors").unwrap_err());
         assert!(err.contains("the project was kept"), "{err}");
         assert_eq!(broken.projects().unwrap().len(), 1);
+        // The attachment went first, so re-running `forget` is the fix — and
+        // nothing dangles in the meantime.
+        assert!(broken.attachments().unwrap().is_empty());
     }
 
     #[test]
     fn test_set_sync_replaces_and_only_knows_one_provider() {
         let v = vault();
-        v.registry
-            .register("pathors", "/repos/pathors", "dev")
-            .unwrap();
+        v.registry.register("pathors", "dev").unwrap();
 
         let entry = v
             .registry
@@ -1364,9 +2154,7 @@ mod tests {
     #[test]
     fn test_set_local_creates_the_environment_and_survives_a_reopen() {
         let v = vault();
-        v.registry
-            .register("pathors", "/repos/pathors", "dev")
-            .unwrap();
+        v.registry.register("pathors", "dev").unwrap();
         v.registry
             .set_local("pathors", "staging", "MY_FLAG", "true")
             .unwrap();
@@ -1375,7 +2163,11 @@ mod tests {
         assert_eq!(project.env_names(), vec!["staging"]);
 
         // A second registry over the same file and store sees the same thing.
-        let reopened = EnvRegistry::new(v.registry.path(), Box::new(Shared(v.store.clone())));
+        let reopened = EnvRegistry::new(
+            v.registry.path(),
+            v.registry.attachments_path(),
+            Box::new(Shared(v.store.clone())),
+        );
         let merged = reopened.merged("pathors", "staging").unwrap();
         assert_eq!(merged.vars["MY_FLAG"], "true");
     }
@@ -1383,9 +2175,7 @@ mod tests {
     #[test]
     fn test_set_local_validates_before_touching_anything() {
         let v = vault();
-        v.registry
-            .register("pathors", "/repos/pathors", "dev")
-            .unwrap();
+        v.registry.register("pathors", "dev").unwrap();
 
         let err = v
             .registry
@@ -1481,9 +2271,7 @@ mod tests {
     #[test]
     fn test_import_local_is_all_or_nothing() {
         let v = vault();
-        v.registry
-            .register("pathors", "/repos/pathors", "dev")
-            .unwrap();
+        v.registry.register("pathors", "dev").unwrap();
 
         let good: Vec<(String, String)> = vec![
             ("A".into(), "1".into()),
@@ -1582,7 +2370,11 @@ mod tests {
             }
         }
 
-        let quiet = EnvRegistry::new(v.registry.path(), Box::new(NoReads));
+        let quiet = EnvRegistry::new(
+            v.registry.path(),
+            v.registry.attachments_path(),
+            Box::new(NoReads),
+        );
         let listed = quiet.list("pathors", "dev").unwrap();
         let seen: Vec<(&str, EnvVarSource)> =
             listed.iter().map(|v| (v.name.as_str(), v.source)).collect();
@@ -1615,7 +2407,7 @@ mod tests {
         assert!(err.contains("has no environment `prod`"), "{err}");
 
         let v = vault();
-        v.registry.register("fresh", "/repos/fresh", "dev").unwrap();
+        v.registry.register("fresh", "dev").unwrap();
         let err = v.registry.list("fresh", "dev").unwrap_err().to_string();
         assert!(err.contains("it has none yet"), "{err}");
     }
@@ -1625,9 +2417,7 @@ mod tests {
     #[test]
     fn test_a_keystore_failure_rolls_the_metadata_back() {
         let v = vault_with(MemoryKeystore::failing_put());
-        v.registry
-            .register("pathors", "/repos/pathors", "dev")
-            .unwrap();
+        v.registry.register("pathors", "dev").unwrap();
         let before = std::fs::read_to_string(v.registry.path()).unwrap();
 
         let err = format!(
@@ -1655,8 +2445,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("projects.json");
         let store = Arc::new(MemoryKeystore::new());
-        let ok = EnvRegistry::new(&path, Box::new(Shared(store.clone())));
-        ok.register("pathors", "/repos/pathors", "dev").unwrap();
+        let ok = registry_at(dir.path(), Box::new(Shared(store.clone())));
+        ok.register("pathors", "dev").unwrap();
         ok.replace_synced(
             "pathors",
             "dev",
@@ -1668,7 +2458,7 @@ mod tests {
         .unwrap();
         let before = std::fs::read_to_string(&path).unwrap();
 
-        let broken = EnvRegistry::new(&path, Box::new(MemoryKeystore::failing_put()));
+        let broken = registry_at(dir.path(), Box::new(MemoryKeystore::failing_put()));
         assert!(broken
             .replace_synced(
                 "pathors",
@@ -1689,7 +2479,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("projects.json");
         std::fs::write(&path, "{ this is not json").unwrap();
-        let registry = EnvRegistry::new(&path, Box::new(MemoryKeystore::new()));
+        let registry = registry_at(dir.path(), Box::new(MemoryKeystore::new()));
         let err = registry.projects().unwrap_err().to_string();
         assert!(
             err.contains("not a readable patchbay project registry"),
@@ -1702,14 +2492,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("projects.json");
         std::fs::write(&path, r#"{"version":99,"projects":[]}"#).unwrap();
-        let registry = EnvRegistry::new(&path, Box::new(MemoryKeystore::new()));
+        let registry = registry_at(dir.path(), Box::new(MemoryKeystore::new()));
         let err = registry.projects().unwrap_err().to_string();
         assert!(err.contains("newer patchbay"), "{err}");
     }
 
     #[test]
     fn test_a_hand_trimmed_file_still_parses() {
-        // Only the fields a human would keep: no `environments`, no `sync`.
+        // Only the fields a human would keep: no `environments`, no `sync` —
+        // plus a stray `root`, which is what a file written before projects
+        // became portable looks like. Unknown fields are ignored, so no
+        // migration code is needed for it.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("projects.json");
         std::fs::write(
@@ -1728,17 +2521,82 @@ mod tests {
         )
         .unwrap();
 
-        let registry = EnvRegistry::new(&path, Box::new(MemoryKeystore::new()));
+        let registry = registry_at(dir.path(), Box::new(MemoryKeystore::new()));
         let projects = registry.projects().unwrap();
         assert_eq!(projects.len(), 1);
         assert!(projects[0].environments.is_empty());
         assert!(projects[0].sync.is_none());
 
-        // And a project with no sync does not grow one on rewrite.
+        // And a project with no sync does not grow one on rewrite — while the
+        // stale `root` is dropped rather than carried forward.
         registry.set_local("pathors", "dev", "A", "1").unwrap();
         let rewritten = std::fs::read_to_string(&path).unwrap();
         assert!(!rewritten.contains("\"sync\""), "{rewritten}");
+        assert!(!rewritten.contains("\"root\""), "{rewritten}");
         assert!(rewritten.contains("\"synced_at\": null"), "{rewritten}");
+    }
+
+    // --- the attachment file ------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn test_the_attachment_file_is_owner_only_too() {
+        use std::os::unix::fs::PermissionsExt;
+        let v = seeded();
+        let mode = std::fs::metadata(v.registry.attachments_path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "mode was {:o}", mode & 0o777);
+    }
+
+    #[test]
+    fn test_a_malformed_attachment_file_is_an_error_naming_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("attachments.json"), "{ nope").unwrap();
+        let registry = registry_at(dir.path(), Box::new(MemoryKeystore::new()));
+
+        let err = registry.attachments().unwrap_err().to_string();
+        assert!(
+            err.contains("not a readable patchbay attachment list"),
+            "{err}"
+        );
+        assert!(err.contains("attachments.json"), "{err}");
+        // The projects file is a separate story and still reads fine.
+        assert!(registry.projects().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_a_newer_attachment_file_version_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("attachments.json"),
+            r#"{"version":99,"attachments":[]}"#,
+        )
+        .unwrap();
+        let registry = registry_at(dir.path(), Box::new(MemoryKeystore::new()));
+        let err = registry.attachments().unwrap_err().to_string();
+        assert!(err.contains("newer patchbay"), "{err}");
+    }
+
+    #[test]
+    fn test_the_attachment_file_is_the_shape_it_documents() {
+        let v = vault();
+        v.registry.register("pathors", "dev").unwrap();
+        v.registry.attach("/repos/b", "pathors").unwrap();
+        v.registry.attach("/repos/a", "pathors").unwrap();
+
+        let raw = std::fs::read_to_string(v.registry.attachments_path()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["version"], 1);
+        // Sorted by root, whatever order they were attached in.
+        assert_eq!(value["attachments"][0]["root"], "/repos/a");
+        assert_eq!(value["attachments"][0]["project"], "pathors");
+        assert_eq!(value["attachments"][1]["root"], "/repos/b");
+
+        // An empty file is an empty list, not a parse error.
+        std::fs::write(v.registry.attachments_path(), "").unwrap();
+        assert!(v.registry.attachments().unwrap().is_empty());
     }
 
     #[test]

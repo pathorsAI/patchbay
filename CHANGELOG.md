@@ -101,11 +101,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (a server that cannot authenticate is useless) and names what travelled.
 
 - **The project env vault** ([`pb env`](docs/env-vault.md)) — the variables a
-  *directory* needs, held the way the key vault holds credentials: names and
+  *project* needs, held the way the key vault holds credentials: names and
   provenance in `~/.config/patchbay/projects.json` (`0600`), values in the macOS
-  Keychain, and no plaintext `.env` anywhere. A project is a registered
-  directory, resolved from the cwd by walking up to the nearest root (deepest
-  wins in a monorepo), and each of its environments has two layers: `synced`,
+  Keychain, and no plaintext `.env` anywhere. A project is a portable **name**,
+  not a path: the manifest holds ids, environments and sync config and no
+  absolute path at all, so copying it to another machine is the supported way to
+  take your projects with you. Each of its environments has two layers: `synced`,
   which `pb env pull` replaces wholesale from Infisical, and `local`, which you
   set by hand and which wins on merge. Those are `.env.local` semantics, and
   they only hold because **patchbay never pushes** — there is no code path that
@@ -122,19 +123,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not belong to your selected organization", which reads like a problem with the
   project rather than with the login; patchbay refuses first and names
   `pb use infisical <email>` instead.
-- **`pb env`** — `init` (registers a directory, picking up `.infisical.json`),
+- **Two ways a directory resolves to a project**, in that order. An
+  **attachment** (`pb env attach <id>` / `pb env detach`) binds a directory on
+  this machine, in `~/.config/patchbay/attachments.json` — deepest attached
+  ancestor wins, several roots per project, so every worktree and second clone
+  shares one vault. A **marker** — a committed `.patchbay.toml` holding
+  `project = "<id>"`, written by `pb env init` unless `--no-marker` — resolves
+  a checkout by its content, so a fresh `git clone` works on any machine whose
+  registry holds that project, with no attach step. An attachment always beats a
+  marker: a deliberate local act outranks whatever the repo ships, and nothing
+  in a repo can take that override back. A marker can only *name* a project the
+  machine already has, and one that names an unknown project is a loud error
+  pointing at the machine's `projects.json` rather than a silent miss. The
+  tradeoff, taken deliberately: repo content selects which registered project's
+  variables the tooling hands out, which assumes you run repos you trust.
+- **Moving to a new machine** is therefore: copy `projects.json`, clone the repo
+  (the marker travels with it), `pb env pull`. Attachments deliberately do not
+  travel — they are paths from a machine that is not this one — and neither does
+  the local layer, since a `DATABASE_URL` pointing at a container on the old
+  laptop is exactly what must not follow you.
+- **`pb env`** — `init` (registers the project, attaches this directory, leaves
+  a marker to commit, picking up `.infisical.json`), `attach`, `detach`,
   `link`, `projects`, `list`, `pull`, `set`, `unset`, `import`, `diff`, `run`,
-  `export`, `forget`. `list` and `diff` answer from the name lists alone and
-  never touch the Keychain; `set` takes its value from stdin or a hidden prompt,
-  never argv; `run -- <cmd>` injects the merged environment into one child
-  process and is the blessed read path, with `export` (dotenv or JSON, TTY
-  warning) there for the cases where a file is genuinely what you need.
+  `export`, `forget`. `init` in a worktree of a project this machine already
+  knows attaches it instead of failing on the duplicate id; `forget` takes the
+  project, its Keychain blobs and this machine's attachments, and leaves
+  committed markers alone (`rm .patchbay.toml`). `list` and `diff` answer from
+  the name lists alone and never touch the Keychain; `set` takes its value from
+  stdin or a hidden prompt, never argv; `run -- <cmd>` injects the merged
+  environment into one child process and is the blessed read path, with
+  `export` (dotenv or JSON, TTY warning) there for the cases where a file is
+  genuinely what you need.
   `import <file>` bulk-loads an existing `.env` into the local layer,
   all-or-nothing, reporting a bad line by number and never by content.
 - **MCP tools** — `list_env_projects`, `list_env_vars`, `pull_env` and
-  `set_env_var`. The first two are metadata only; `pull_env` executes the
-  Infisical CLI but its outcome carries counts and names, not values, so it is
-  ungated; `set_env_var` is open like `store_key`, so an agent that creates a
+  `set_env_var`. `list_env_projects` reports each project's machine-local
+  `roots` alongside its environments, and says what an empty list means, so an
+  agent does not read a path there as where the user is working. The first two
+  are metadata only; `pull_env` executes the Infisical CLI but its outcome
+  carries counts and names, not values, so it is ungated;
+  `set_env_var` is open like `store_key`, so an agent that creates a
   project credential registers it. Nothing reads a value back — not even behind
   `PATCHBAY_ALLOW_SECRET_READ`. An environment is dozens of secrets at once,
   and `pb env run` in your own terminal is the answer instead.

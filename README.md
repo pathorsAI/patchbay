@@ -28,7 +28,7 @@
 - **Permissions** — see what your tokens can actually do (`gh` scopes today) and fix missing scopes with one hint.
 - **[MCP client management](docs/mcp-clients.md)** — every MCP server registered in Claude Code, Claude Desktop, Cursor, Codex, Windsurf and VS Code in one matrix; copy a server between clients without hand-editing four files in two formats.
 - **[Key vault](docs/key-vault.md)** — standalone API keys no CLI tracks: values in the macOS Keychain, metadata on disk, provider-aware `pb key verify`, and AI registration over MCP.
-- **[Project env vault](docs/env-vault.md)** — a directory's environment variables without a plaintext `.env`: pull from Infisical, keep hand-set local overrides that never sync back, run a command with the merged result.
+- **[Project env vault](docs/env-vault.md)** — a project's environment variables without a plaintext `.env`: pull from Infisical, keep hand-set local overrides that never sync back, run a command with the merged result. A project is a portable name, not a path — copy one file to a new machine, clone the repo, pull.
 - **[Keeping CLIs current](#keeping-clis-current)** — which tools are outdated, which were renamed out from under you, and the exact command to update each one.
 - **Migrate** — export to a new machine; whatever can't travel, your AI walks you through re-authing.
 - **[Migrate](docs/migration.md)** — export to a new machine; whatever can't travel, your AI walks you through re-authing.

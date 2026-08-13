@@ -102,10 +102,17 @@ fn require(envs: &EnvRegistry, id: &str) -> anyhow::Result<ProjectEntry> {
     envs.get(id)?.ok_or_else(|| unknown_project(id))
 }
 
-/// One project as the tools report it: registration, environments with counts,
-/// and the sync config. **Metadata only** — this cannot carry a value, because
-/// [`ProjectEntry`] does not hold one.
-fn describe_project(project: &ProjectEntry) -> Result<serde_json::Value, ErrorData> {
+/// One project as the tools report it: registration, this machine's attached
+/// roots, environments with counts, and the sync config. **Metadata only** —
+/// this cannot carry a value, because [`ProjectEntry`] does not hold one.
+///
+/// `roots` is passed in rather than looked up: a project holds no path of its
+/// own (that is what makes `projects.json` portable), and the attachments are a
+/// separate, machine-local list.
+fn describe_project(
+    project: &ProjectEntry,
+    roots: &[std::path::PathBuf],
+) -> Result<serde_json::Value, ErrorData> {
     let mut environments = Vec::with_capacity(project.environments.len());
     for (name, meta) in &project.environments {
         // The merged view is a union, not a sum: a local override shares its
@@ -126,10 +133,10 @@ fn describe_project(project: &ProjectEntry) -> Result<serde_json::Value, ErrorDa
 
     Ok(serde_json::json!({
         "id": project.id,
-        // `display()` rather than serializing the PathBuf: a path that is not
-        // valid UTF-8 would fail to serialize, and a lossy path is a far better
-        // answer here than a failed tool call.
-        "root": project.root.display().to_string(),
+        "roots": roots
+            .iter()
+            .map(|root| root.display().to_string())
+            .collect::<Vec<String>>(),
         "default_env": project.default_env,
         "created_at": encode(&project.created_at)?,
         "environments": environments,
@@ -182,10 +189,18 @@ Call this first when the user mentions their project's env, when you are about t
 and need the project id and the environment names, or when you want to know whether a directory \
 is registered at all.
 
-Returns a JSON array of projects: { id, root, default_env, created_at, environments[], sync }.
+Returns a JSON array of projects: { id, roots, default_env, created_at, environments[], sync }.
 
-- `id` is patchbay's slug for the directory and the value every other env tool takes as \
-`project`. `root` is the directory it means.
+- `id` is patchbay's slug for the project and the value every other env tool takes as `project`. \
+A project is a NAME, not a directory: the registry holds no path at all, which is what lets the \
+user copy it between machines.
+- `roots[]` are the directories on THIS machine bound to the project — machine-local attachments, \
+several when the user keeps worktrees or a second clone, and an empty list when nobody has bound \
+one here (normal for a project whose registry was copied from another laptop). A repo may also \
+carry a committed `.patchbay.toml` marker naming its project, which resolves a checkout by its \
+CONTENT with no attachment at all — so an empty `roots` does not mean `pb env` fails in that \
+repo, and a path is never proof of where the user is working. If you need the project for a \
+particular directory, ask the user rather than pattern-matching these paths.
 - `default_env` is the environment used when a call omits `env`. Do not assume it is 'dev'.
 - `environments[]` is { name, var_count, synced_count, local_count, synced_at }. `var_count` is \
 the distinct names a consumer would see (a local override shares its name with the synced \
@@ -200,10 +215,28 @@ run as; `env_map` is patchbay's environment name -> the remote's own slug, for r
 not returned by this or any other tool.")]
     async fn list_env_projects(&self) -> Result<CallToolResult, ErrorData> {
         let envs = self.envs.clone();
-        match offload(move || envs.projects()).await? {
-            Ok(projects) => {
-                let described: Result<Vec<_>, ErrorData> =
-                    projects.iter().map(describe_project).collect();
+        // Both files in one offload, so the roots reported cannot come from a
+        // different moment than the projects they hang off.
+        let listed = offload(move || {
+            let projects = envs.projects()?;
+            let attachments = envs.attachments()?;
+            Ok::<_, anyhow::Error>((projects, attachments))
+        })
+        .await?;
+
+        match listed {
+            Ok((projects, attachments)) => {
+                let described: Result<Vec<_>, ErrorData> = projects
+                    .iter()
+                    .map(|project| {
+                        let roots: Vec<std::path::PathBuf> = attachments
+                            .iter()
+                            .filter(|a| a.project == project.id)
+                            .map(|a| a.root.clone())
+                            .collect();
+                        describe_project(project, &roots)
+                    })
+                    .collect();
                 Ok(json_ok(serde_json::Value::Array(described?)))
             }
             Err(err) => Ok(tool_error(err)),
@@ -403,7 +436,6 @@ mod tests {
     use chrono::{DateTime, TimeZone, Utc};
     use patchbay_core::envs::{EnvMeta, SyncConfig};
     use std::collections::BTreeMap;
-    use std::path::PathBuf;
 
     fn at(rfc: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(rfc)
@@ -414,7 +446,6 @@ mod tests {
     fn project() -> ProjectEntry {
         ProjectEntry {
             id: "pathors".into(),
-            root: PathBuf::from("/repos/pathors"),
             default_env: "dev".into(),
             created_at: Utc.timestamp_opt(0, 0).unwrap(),
             environments: BTreeMap::new(),
@@ -423,7 +454,7 @@ mod tests {
     }
 
     fn described(project: &ProjectEntry) -> serde_json::Value {
-        describe_project(project).unwrap()
+        describe_project(project, &[]).unwrap()
     }
 
     // --- environment resolution ---------------------------------------------
@@ -448,10 +479,29 @@ mod tests {
     fn test_a_project_reports_its_registration_and_no_environments() {
         let value = described(&project());
         assert_eq!(value["id"], "pathors");
-        assert_eq!(value["root"], "/repos/pathors");
+        // A project is a name. The singular `root` a project used to claim is
+        // gone for good; a project with no attachment here reports an empty
+        // list, which is not the same as being unusable.
+        assert!(value["root"].is_null(), "{value}");
+        assert_eq!(value["roots"].as_array().unwrap().len(), 0);
         assert_eq!(value["default_env"], "dev");
         assert!(value["sync"].is_null());
         assert_eq!(value["environments"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_this_machines_attached_roots_travel_with_the_project() {
+        let roots = [
+            std::path::PathBuf::from("/repos/pathors"),
+            std::path::PathBuf::from("/repos/pathors-worktrees/feature-a"),
+        ];
+        let value = describe_project(&project(), &roots).unwrap();
+
+        assert_eq!(
+            value["roots"],
+            serde_json::json!(["/repos/pathors", "/repos/pathors-worktrees/feature-a"]),
+            "worktrees are several roots on one project, not several projects"
+        );
     }
 
     #[test]
@@ -620,6 +670,20 @@ mod tests {
             assert!(text.contains("pb env run"), "{name}: {text}");
             assert!(text.contains("pb env export"), "{name}: {text}");
         }
+    }
+
+    #[test]
+    fn test_list_env_projects_explains_what_a_root_is_and_is_not() {
+        let text = description("list_env_projects");
+        // An agent that reads `roots` as "where the project is" would get both
+        // the empty case and the marker case wrong.
+        assert!(text.contains("machine-local attachments"), "{text}");
+        assert!(text.contains(".patchbay.toml"), "{text}");
+        assert!(text.contains("empty list"), "{text}");
+        assert!(
+            text.contains("A project is a NAME, not a directory"),
+            "{text}"
+        );
     }
 
     #[test]

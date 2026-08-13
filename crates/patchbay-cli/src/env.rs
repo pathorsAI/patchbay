@@ -20,8 +20,8 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use clap::{Args, Subcommand, ValueEnum};
 use patchbay_core::envs::{
-    parse_dotenv, render_dotenv, validate_project_id, EnvRegistry, EnvVarInfo, EnvVarSource,
-    ProjectEntry, SyncConfig, DEFAULT_ENV,
+    parse_dotenv, read_marker, render_dotenv, validate_project_id, write_marker, Attachment,
+    EnvRegistry, EnvVarInfo, EnvVarSource, ProjectEntry, SyncConfig, DEFAULT_ENV, MARKER_FILE,
 };
 use patchbay_core::paths::Paths;
 use patchbay_core::probes::infisical;
@@ -46,10 +46,18 @@ const INFISICAL_FILE: &str = ".infisical.json";
 pub enum Command {
     /// Register a directory as a project.
     ///
+    /// Writes a `.patchbay.toml` marker in the directory naming the project:
+    /// commit it, and every checkout of the repo resolves to this project
+    /// without an attach step. Re-running this in another worktree of a project
+    /// that already exists attaches that directory instead of failing, and
+    /// running it in a fresh clone that carries a marker registers the project
+    /// the repo names.
+    ///
     /// Reads `.infisical.json` if the directory has one, and records the sync
     /// automatically when this machine is logged in to infisical.
     Init {
-        /// Project id. Defaults to the directory's own name as a slug.
+        /// Project id. Defaults to what the directory's `.patchbay.toml` names,
+        /// and to the directory's own name as a slug when there is none.
         #[arg(long, value_name = "SLUG")]
         id: Option<String>,
         /// The directory to register. Defaults to the current one.
@@ -58,6 +66,32 @@ pub enum Command {
         /// Environment `pb env` uses when a command does not say.
         #[arg(long, value_name = "ENV", default_value = DEFAULT_ENV)]
         default_env: String,
+        /// Do not write the `.patchbay.toml` marker. This machine's attachment
+        /// still resolves the directory; other checkouts will not.
+        #[arg(long)]
+        no_marker: bool,
+    },
+    /// Bind a directory on this machine to a project that already exists.
+    ///
+    /// This is the machine-local, deliberate binding, and it OVERRIDES any
+    /// `.patchbay.toml` marker committed in the repo: what the person at the
+    /// keyboard says beats what the repo ships, and nothing in a repo can take
+    /// that back. Use it for a worktree, a second clone, or a checkout whose
+    /// marker names the wrong project.
+    Attach {
+        /// Project id, as `pb env projects` lists it.
+        #[arg(value_name = "ID")]
+        project: String,
+        /// The directory to bind. Defaults to the current one.
+        #[arg(long, value_name = "PATH")]
+        dir: Option<PathBuf>,
+    },
+    /// Unbind a directory. The project, its environments and its values stay,
+    /// and a committed `.patchbay.toml` keeps resolving the directory.
+    Detach {
+        /// The directory to unbind. Defaults to the current one.
+        #[arg(long, value_name = "PATH")]
+        dir: Option<PathBuf>,
     },
     /// Point a project at an Infisical project, replacing any earlier link.
     Link {
@@ -183,19 +217,98 @@ pub fn run(command: Command, styles: &Styles) -> Result<i32> {
             id,
             dir,
             default_env,
+            no_marker,
         } => {
             let root = absolute_dir(dir)?;
-            let id = match id {
-                Some(id) => id,
-                None => default_project_id(&root)?,
-            };
-            let entry = registry.register(&id, &root, &default_env)?;
+            let done = init(&registry, &root, id.as_deref(), &default_env, !no_marker)?;
 
-            println!("registered {}", entry.id);
-            println!("  root:        {}", render::tilde(&entry.root));
-            println!("  default env: {}", entry.default_env);
+            if done.shared {
+                println!(
+                    "attached {} to {}",
+                    render::tilde(&done.attachment.root),
+                    done.entry.id
+                );
+                println!(
+                    "  this checkout now shares project `{}`'s environments",
+                    done.entry.id
+                );
+            } else {
+                println!("registered {}", done.entry.id);
+                println!("  attached:    {}", render::tilde(&done.attachment.root));
+            }
+            println!("  default env: {}", done.entry.default_env);
+            if let Some(marker) = &done.marker {
+                if done.marker_was_there {
+                    println!(
+                        "  marker:      {} (already names this project)",
+                        render::tilde(marker)
+                    );
+                } else {
+                    println!("  marker:      {}", render::tilde(marker));
+                    println!(
+                        "  commit it and every checkout of this repo — any machine, any \
+                         worktree — resolves to this project"
+                    );
+                }
+            }
             println!("  metadata:    {}", registry.path().display());
-            print_adopted_sync(&registry, &entry)?;
+
+            if done.shared {
+                // The project already exists, so its link is already decided.
+                // Re-reading this checkout's `.infisical.json` here could
+                // silently replace an env map somebody set by hand.
+                print_sync(&done.entry);
+            } else {
+                print_adopted_sync(&registry, &done.entry, &root)?;
+            }
+            Ok(0)
+        }
+
+        Command::Attach { project, dir } => {
+            let entry = resolve_project(&registry, Some(&project))?;
+            let root = absolute_dir(dir)?;
+            let attachment = registry.attach(&root, &entry.id)?;
+
+            println!(
+                "attached {} to {}",
+                render::tilde(&attachment.root),
+                entry.id
+            );
+            println!("  default env: {}", entry.default_env);
+            // A marker patchbay cannot read is not worth failing an attachment
+            // that already succeeded over — `pb env list` will say so loudly
+            // enough, and this line is only ever a note.
+            if let Some(claimed) = read_marker(&root).ok().flatten() {
+                if claimed != entry.id {
+                    println!(
+                        "  note: {MARKER_FILE} here names `{claimed}`; this attachment overrides \
+                         it on this machine"
+                    );
+                }
+            }
+            println!(
+                "  an attachment is machine-local: it beats any {MARKER_FILE} the repo commits, \
+                 and it does not travel"
+            );
+            Ok(0)
+        }
+
+        Command::Detach { dir } => {
+            let root = absolute_dir(dir)?;
+            let gone = registry.detach(&root)?;
+
+            println!(
+                "detached {} from {}",
+                render::tilde(&gone.root),
+                gone.project
+            );
+            println!("  the project, its environments and its values are untouched");
+            if let Some(claimed) = read_marker(&root).ok().flatten() {
+                println!(
+                    "  {MARKER_FILE} here still names `{claimed}`, so this directory resolves to \
+                     it again; `rm {MARKER_FILE}` if the repo should stop claiming it"
+                );
+            }
             Ok(0)
         }
 
@@ -234,8 +347,24 @@ pub fn run(command: Command, styles: &Styles) -> Result<i32> {
 
         Command::Projects { json } => {
             let projects = registry.projects()?;
+            // Attachments are folded into a ROOTS column rather than given a
+            // table of their own: a root is only ever interesting as *which
+            // project this directory is*, and a second table would make the
+            // reader join them by hand. The one thing a column cannot show is
+            // an attachment whose project is not registered here, so
+            // `render_projects` names those in a footer instead.
+            let mut roots: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+            for attachment in registry.attachments()? {
+                roots
+                    .entry(attachment.project)
+                    .or_default()
+                    .push(attachment.root);
+            }
             if json {
-                // Machine-readable: JSON only, no ANSI, no extras.
+                // Machine-readable: the portable manifest's own shape, and
+                // nothing else. This machine's attachments live in another file
+                // for a reason, and folding them in here would produce JSON
+                // that cannot be copied to the next laptop.
                 println!("{}", serde_json::to_string_pretty(&projects)?);
                 return Ok(0);
             }
@@ -244,7 +373,7 @@ pub fn run(command: Command, styles: &Styles) -> Result<i32> {
                 println!("  pb env init   (in the directory you want to register)");
                 return Ok(0);
             }
-            print!("{}", render_projects(&projects, styles));
+            print!("{}", render_projects(&projects, &roots, styles));
             Ok(0)
         }
 
@@ -415,14 +544,33 @@ pub fn run(command: Command, styles: &Styles) -> Result<i32> {
                 println!("left {} alone", entry.id);
                 return Ok(0);
             }
+            // Counted before, because `forget` takes them with it.
+            let detached = registry.attachments_of(&entry.id)?;
             let removed = registry.forget(&entry.id)?;
 
-            println!("forgot {} ({})", removed.id, render::tilde(&removed.root));
+            println!("forgot {}", removed.id);
+            if !detached.is_empty() {
+                println!(
+                    "  detached {} director{} on this machine:",
+                    detached.len(),
+                    if detached.len() == 1 { "y" } else { "ies" }
+                );
+                for root in &detached {
+                    println!("    {}", render::tilde(root));
+                }
+            }
             println!(
                 "  its stored values are gone from the {}",
                 registry.store_name()
             );
             println!("  nothing was revoked — whatever the remote holds is untouched");
+            // patchbay does not go editing repositories, and it cannot see the
+            // checkouts it was never attached to.
+            println!(
+                "  a committed {MARKER_FILE} is untouched: run `rm {MARKER_FILE}` in the repo if \
+                 it should stop claiming `{}`",
+                removed.id
+            );
             Ok(0)
         }
     }
@@ -452,9 +600,95 @@ fn resolve_project(registry: &EnvRegistry, id: Option<&str>) -> Result<ProjectEn
     let dir = std::env::current_dir().context("could not read the current directory")?;
     registry.find_by_dir(&dir)?.ok_or_else(|| {
         anyhow::anyhow!(
-            "no project registered for this directory; run `pb env init` here, or pass \
-             --project <id> (pb env projects lists them)"
+            "no project registered for this directory. Three ways in: `pb env init` here to \
+             register a new project, `pb env attach <id>` to bind this directory to one that \
+             already exists, or work in a checkout carrying a committed {MARKER_FILE}, which \
+             resolves on its own. `pb env projects` lists what exists, and --project <id> \
+             overrides all of it for one command"
         )
+    })
+}
+
+/// What [`Command::Init`] did, separated from the printing so the decision this
+/// makes — register a new project, or join one this directory already resolves
+/// to — is testable without a terminal.
+#[derive(Debug)]
+struct Init {
+    entry: ProjectEntry,
+    attachment: Attachment,
+    /// The directory joined a project that already existed, rather than
+    /// registering a new one.
+    shared: bool,
+    /// The marker written, or already in place. `None` with `--no-marker`.
+    marker: Option<PathBuf>,
+    /// The marker was already there, naming this project. Nothing was written,
+    /// and telling the user to go and commit it would be noise.
+    marker_was_there: bool,
+}
+
+/// Register `root` as a project, or attach it to the one it already resolves
+/// to, and (unless told not to) leave a marker naming the result.
+fn init(
+    registry: &EnvRegistry,
+    root: &Path,
+    id: Option<&str>,
+    default_env: &str,
+    marker: bool,
+) -> Result<Init> {
+    // What the repo itself claims, read first and read even under
+    // `--no-marker`: a committed marker is the best name this project has —
+    // it is already in the history — and `init` choosing a different one would
+    // leave the directory contradicting its own file. This is what makes the
+    // fresh-clone case work: `git clone && pb env init` registers the project
+    // the repo names, whatever the checkout directory happens to be called.
+    let claimed = read_marker(root)?;
+    let want = match (id, &claimed) {
+        (Some(id), _) => id.to_string(),
+        (None, Some(claimed)) => claimed.clone(),
+        (None, None) => default_project_id(root)?,
+    };
+
+    // Fatal, and before anything is registered: an explicit `--id` that
+    // disagrees with the marker is a directory being pulled in two directions,
+    // and half a registration is the worst place to find that out.
+    // `--no-marker` is the way through — it writes no marker to refuse, and the
+    // attachment it makes beats the marker anyway.
+    if marker {
+        if let Some(claimed) = &claimed {
+            if claimed != &want {
+                anyhow::bail!(
+                    "{} already claims project `{claimed}`, so `{want}` was not registered; drop \
+                     --id to register it as `{claimed}` the way the repo names it, use `pb env \
+                     attach <id>` to bind this directory to a different project (an attachment \
+                     beats the marker), or pass --no-marker to register `{want}` and leave the \
+                     file alone",
+                    root.join(MARKER_FILE).display()
+                );
+            }
+        }
+    }
+
+    // A second worktree of a project this machine already knows should join it
+    // rather than die on the duplicate id. A resolution *failure* is not fatal
+    // here: a marker naming a project the registry lacks is precisely what
+    // running `pb env init` is meant to fix.
+    let resolved = registry.find_by_dir(root).unwrap_or_default();
+    let shared = resolved.as_ref().is_some_and(|p| p.id == want);
+    let entry = match resolved {
+        // A genuinely different id still registers its own project: `--id` is
+        // the user saying they meant a new one.
+        Some(existing) if shared => existing,
+        _ => registry.register(&want, default_env)?,
+    };
+    let attachment = registry.attach(root, &entry.id)?;
+    let marker = marker.then(|| write_marker(root, &entry.id)).transpose()?;
+
+    Ok(Init {
+        entry,
+        attachment,
+        shared,
+        marker,
+        marker_was_there: claimed.is_some(),
     })
 }
 
@@ -572,8 +806,11 @@ fn parse_infisical_json(text: &str) -> Result<InfisicalProject> {
 ///
 /// A malformed file is a note, not a failure: the project is registered, and
 /// `pb env link` can do by hand what this could not do automatically.
-fn print_adopted_sync(registry: &EnvRegistry, entry: &ProjectEntry) -> Result<()> {
-    let path = entry.root.join(INFISICAL_FILE);
+fn print_adopted_sync(registry: &EnvRegistry, entry: &ProjectEntry, root: &Path) -> Result<()> {
+    // The directory is passed in rather than read back off the project: a
+    // project has no directory of its own, only the attachments this machine
+    // made — and `init` knows which one it just created.
+    let path = root.join(INFISICAL_FILE);
     let Ok(text) = std::fs::read_to_string(&path) else {
         println!("  hint: link it with `pb env link --project-id <infisical project id>`");
         return Ok(());
@@ -842,9 +1079,42 @@ fn column_width(values: impl Iterator<Item = usize>, header: &str, max: usize) -
         .max(header.len())
 }
 
-/// The project table. Roots are long, so ROOT takes whatever the other columns
+/// The project table. Roots are long, so ROOTS takes whatever the other columns
 /// leave and gets truncated into it.
-pub fn render_projects(projects: &[ProjectEntry], styles: &Styles) -> String {
+///
+/// `roots` is this machine's attachments, by project id — a project may have
+/// several (worktrees), and one copied from another machine may have none here
+/// at all.
+///
+/// Several roots are comma-joined while they fit, and collapse to the first
+/// plus `+N more` when they do not. An ellipsis in the middle of the second
+/// path would say less than the count does: what a reader wants from a wide
+/// list is *how many*, and one full path to recognise the project by.
+pub fn render_projects(
+    projects: &[ProjectEntry],
+    roots: &BTreeMap<String, Vec<PathBuf>>,
+    styles: &Styles,
+) -> String {
+    let unattached = projects.iter().any(|p| !roots.contains_key(&p.id));
+    let roots_cell = |p: &ProjectEntry, width: usize| {
+        let paths = match roots.get(&p.id) {
+            Some(paths) if !paths.is_empty() => paths,
+            // Not attached *here*. Normal for a project that arrived with a
+            // copied projects.json, and for a repo resolved by its marker.
+            _ => return DASH.to_string(),
+        };
+        let shown: Vec<String> = paths.iter().map(|path| render::tilde(path)).collect();
+        let joined = shown.join(", ");
+        if joined.chars().count() <= width || shown.len() == 1 {
+            return joined;
+        }
+        // The count is reserved out of the width rather than left to the row's
+        // own truncation, which would eat it and leave a bare `…` claiming
+        // nothing in particular.
+        let suffix = format!(" +{} more", shown.len() - 1);
+        let room = width.saturating_sub(suffix.chars().count());
+        format!("{}{suffix}", render::truncate(&shown[0], room))
+    };
     let sync_cell = |p: &ProjectEntry| match &p.sync {
         Some(sync) => format!("{}:{}", sync.provider, sync.account),
         None => DASH.to_string(),
@@ -882,7 +1152,7 @@ pub fn render_projects(projects: &[ProjectEntry], styles: &Styles) -> String {
     let header = format!(
         "{}{gap}{}{gap}{}{gap}{}",
         pad("ID", id_w),
-        pad("ROOT", root_w),
+        pad("ROOTS", root_w),
         pad("ENVS", envs_w),
         "SYNC",
     );
@@ -892,7 +1162,7 @@ pub fn render_projects(projects: &[ProjectEntry], styles: &Styles) -> String {
     for project in projects {
         let id = pad(&render::truncate(&project.id, id_w), id_w);
         let root = pad(
-            &render::truncate(&render::tilde(&project.root), root_w),
+            &render::truncate(&roots_cell(project, root_w), root_w),
             root_w,
         );
         let envs = pad(&render::truncate(&envs_cell(project), envs_w), envs_w);
@@ -906,6 +1176,37 @@ pub fn render_projects(projects: &[ProjectEntry], styles: &Styles) -> String {
 
         let line = format!("{id}{gap}{root}{gap}{envs}{gap}{sync}");
         out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    // An attachment whose project is not registered here has no row to appear
+    // in, and `find_by_dir` skips it in silence. This footer is the only place
+    // it is ever visible, which is the whole reason it exists.
+    let dangling: Vec<&str> = roots
+        .keys()
+        .filter(|id| !projects.iter().any(|p| &p.id == *id))
+        .map(String::as_str)
+        .collect();
+    if !dangling.is_empty() {
+        out.push_str(&styles.paint(
+            dim(),
+            &format!(
+                "attached to project{} no longer registered here: {} — `pb env detach --dir \
+                 <path>` clears them",
+                plural(dangling.len()),
+                dangling.join(", ")
+            ),
+        ));
+        out.push('\n');
+    }
+    // A dash under ROOTS reads as "broken" unless it is explained once.
+    if unattached {
+        out.push_str(&styles.paint(
+            dim(),
+            &format!(
+                "{DASH} no directory on this machine is attached; a checkout with a committed \
+                 {MARKER_FILE} resolves without one, or `pb env attach <id>`"
+            ),
+        ));
         out.push('\n');
     }
     out
@@ -1034,16 +1335,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let registry = EnvRegistry::new(
             dir.path().join("projects.json"),
+            dir.path().join("attachments.json"),
             Box::new(MemoryKeystore::new()),
         );
         (dir, registry)
     }
 
-    /// One project, one environment, both layers, one override.
+    /// One project attached to one directory, one environment, both layers,
+    /// one override.
     fn seeded(registry: &EnvRegistry) {
-        registry
-            .register("pathors", "/repos/pathors", "dev")
-            .unwrap();
+        registry.register("pathors", "dev").unwrap();
+        registry.attach("/repos/pathors", "pathors").unwrap();
         registry
             .replace_synced(
                 "pathors",
@@ -1065,6 +1367,18 @@ mod tests {
             .unwrap();
     }
 
+    /// This machine's attachments, in the shape `render_projects` wants.
+    fn roots_of(registry: &EnvRegistry) -> BTreeMap<String, Vec<PathBuf>> {
+        let mut roots: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+        for attachment in registry.attachments().unwrap() {
+            roots
+                .entry(attachment.project)
+                .or_default()
+                .push(attachment.root);
+        }
+        roots
+    }
+
     fn var(name: &str, source: EnvVarSource) -> EnvVarInfo {
         EnvVarInfo {
             name: name.to_string(),
@@ -1078,9 +1392,8 @@ mod tests {
     fn test_projects_table_is_plain_and_aligned_without_color() {
         let (_dir, registry) = vault();
         seeded(&registry);
-        registry
-            .register("side", "/repos/side-project", "dev")
-            .unwrap();
+        registry.register("side", "dev").unwrap();
+        registry.attach("/repos/side-project", "side").unwrap();
         registry
             .set_sync(
                 "pathors",
@@ -1095,7 +1408,7 @@ mod tests {
             .unwrap();
 
         let projects = registry.projects().unwrap();
-        let out = render_projects(&projects, &Styles::new(false));
+        let out = render_projects(&projects, &roots_of(&registry), &Styles::new(false));
         assert!(!out.contains('\u{1b}'), "plain mode must emit no ANSI");
 
         let lines: Vec<&str> = out.lines().collect();
@@ -1108,9 +1421,79 @@ mod tests {
         assert!(lines[2].contains(DASH), "{out}");
 
         // Every column starts at the same offset on every row.
-        let col = lines[0].find("ROOT").unwrap();
+        let col = lines[0].find("ROOTS").unwrap();
         assert!(lines[1][col..].starts_with("/repos/pathors"), "{out}");
         assert!(lines[2][col..].starts_with("/repos/side-project"), "{out}");
+    }
+
+    #[test]
+    fn test_the_roots_column_counts_worktrees_and_explains_a_dash() {
+        let (_dir, registry) = vault();
+        registry.register("pathors", "dev").unwrap();
+        registry.attach("/repos/pathors", "pathors").unwrap();
+        registry
+            .attach("/repos/pathors-worktrees/feature-a", "pathors")
+            .unwrap();
+        registry
+            .attach("/repos/pathors-worktrees/feature-b", "pathors")
+            .unwrap();
+        // Registered, and attached nowhere on this machine — what a copied
+        // projects.json looks like before anybody checks the repo out.
+        registry.register("elsewhere", "dev").unwrap();
+
+        let projects = registry.projects().unwrap();
+        let out = render_projects(&projects, &roots_of(&registry), &Styles::new(false));
+        let lines: Vec<&str> = out.lines().collect();
+
+        // Three roots do not fit the column, so the first one stays whole and
+        // the rest become a count rather than an ellipsis.
+        assert!(lines[1].contains("/repos/pathors "), "{out}");
+        assert!(lines[1].contains("+2 more"), "{out}");
+        assert!(!lines[1].contains("feature-a"), "{out}");
+
+        assert!(lines[2].starts_with("elsewhere"), "{out}");
+        assert!(lines[2].contains(DASH), "{out}");
+        // And the dash is explained once, at the bottom, rather than read as a
+        // project that is somehow broken.
+        assert!(lines[3].starts_with(DASH), "{out}");
+        assert!(lines[3].contains(MARKER_FILE), "{out}");
+        assert!(lines[3].contains("pb env attach"), "{out}");
+        assert_eq!(lines.len(), 4, "{out}");
+
+        // Two short roots still fit, and are simply both shown.
+        let (_dir, registry) = vault();
+        registry.register("pathors", "dev").unwrap();
+        registry.attach("/a", "pathors").unwrap();
+        registry.attach("/b", "pathors").unwrap();
+        let out = render_projects(
+            &registry.projects().unwrap(),
+            &roots_of(&registry),
+            &Styles::new(false),
+        );
+        assert!(out.contains("/a, /b"), "{out}");
+        assert!(!out.contains("more"), "{out}");
+        // Every project has a root here, so nothing is explained that does not
+        // need explaining.
+        assert_eq!(out.lines().count(), 2, "{out}");
+    }
+
+    #[test]
+    fn test_an_attachment_to_a_forgotten_project_is_named_not_hidden() {
+        let (_dir, registry) = vault();
+        registry.register("pathors", "dev").unwrap();
+        registry.attach("/repos/pathors", "pathors").unwrap();
+
+        // What a projects.json copied from another machine leaves behind: a
+        // root pointing at a project this registry does not have. `find_by_dir`
+        // skips it silently, so the table is where it has to surface.
+        let mut roots = roots_of(&registry);
+        roots.insert("ghost".to_string(), vec![PathBuf::from("/repos/ghost")]);
+
+        let out = render_projects(&registry.projects().unwrap(), &roots, &Styles::new(false));
+        let last = out.lines().last().unwrap();
+        assert!(last.contains("no longer registered here"), "{out}");
+        assert!(last.contains("ghost"), "{out}");
+        assert!(last.contains("pb env detach"), "{out}");
     }
 
     #[test]
@@ -1390,6 +1773,179 @@ mod tests {
         assert!(err.contains("not valid JSON"), "{err}");
         let err = parse_infisical_json("[]").unwrap_err().to_string();
         assert!(err.contains("not a JSON object"), "{err}");
+    }
+
+    // --- init, markers and the second worktree ------------------------------
+
+    /// A real directory under a tempdir, because `init` reads and writes a
+    /// marker file in it.
+    fn workdir(dir: &tempfile::TempDir, relative: &str) -> PathBuf {
+        let path = dir.path().join(relative);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn marker_text(root: &Path) -> String {
+        std::fs::read_to_string(root.join(MARKER_FILE)).unwrap()
+    }
+
+    #[test]
+    fn test_init_registers_attaches_and_leaves_a_marker_to_commit() {
+        let (dir, registry) = vault();
+        let root = workdir(&dir, "repos/pathors");
+
+        let done = init(&registry, &root, None, "dev", true).unwrap();
+        assert_eq!(done.entry.id, "pathors");
+        assert!(!done.shared);
+        assert_eq!(done.attachment.root, root);
+        assert_eq!(done.marker, Some(root.join(MARKER_FILE)));
+        assert!(!done.marker_was_there, "there was nothing here to find");
+        assert!(marker_text(&root).contains("project = \"pathors\""));
+
+        // Both routes now answer for this directory, and the marker alone would
+        // answer on a machine that never attached it.
+        assert_eq!(registry.attachments_of("pathors").unwrap(), vec![root]);
+        assert_eq!(
+            read_marker(&done.attachment.root).unwrap().as_deref(),
+            Some("pathors")
+        );
+    }
+
+    #[test]
+    fn test_no_marker_leaves_the_repo_alone() {
+        let (dir, registry) = vault();
+        let root = workdir(&dir, "repos/pathors");
+
+        let done = init(&registry, &root, None, "dev", false).unwrap();
+        assert!(done.marker.is_none());
+        assert!(!root.join(MARKER_FILE).exists());
+        // The machine still resolves it; nobody else's checkout will.
+        assert_eq!(
+            registry.find_by_dir(&root).unwrap().map(|p| p.id),
+            Some("pathors".to_string())
+        );
+    }
+
+    #[test]
+    fn test_a_second_worktree_joins_the_project_instead_of_colliding() {
+        let (dir, registry) = vault();
+        let first = workdir(&dir, "repos/pathors");
+        init(&registry, &first, None, "dev", true).unwrap();
+
+        // A second checkout of the same repo — a worktree named after its
+        // branch, so the directory name says nothing. The marker is what makes
+        // this the same project.
+        let second = workdir(&dir, "repos/pathors-worktrees/feature-a");
+        std::fs::copy(first.join(MARKER_FILE), second.join(MARKER_FILE)).unwrap();
+
+        let done = init(&registry, &second, None, "dev", true).unwrap();
+        assert!(
+            done.shared,
+            "the duplicate id should have joined, not failed"
+        );
+        assert_eq!(done.entry.id, "pathors");
+        assert_eq!(registry.projects().unwrap().len(), 1);
+        assert_eq!(
+            registry.attachments_of("pathors").unwrap(),
+            vec![first, second.clone()]
+        );
+        // Idempotent: the marker it already carries is the one it wanted, so
+        // nothing was written and nothing is asked of the user.
+        assert_eq!(done.marker, Some(second.join(MARKER_FILE)));
+        assert!(done.marker_was_there);
+    }
+
+    #[test]
+    fn test_init_refuses_to_take_a_directory_another_project_claims() {
+        let (dir, registry) = vault();
+        let root = workdir(&dir, "repos/pathors");
+        std::fs::write(root.join(MARKER_FILE), "project = \"upstream\"\n").unwrap();
+
+        let err = init(&registry, &root, Some("fork"), "dev", true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already claims project `upstream`"), "{err}");
+        assert!(err.contains("drop --id"), "{err}");
+        assert!(err.contains("pb env attach"), "{err}");
+        assert!(err.contains("--no-marker"), "{err}");
+
+        // Nothing was registered, nothing was attached, and the repo's file is
+        // exactly as it was.
+        assert!(registry.projects().unwrap().is_empty());
+        assert!(registry.attachments().unwrap().is_empty());
+        assert_eq!(marker_text(&root), "project = \"upstream\"\n");
+
+        // --no-marker is the way through: no marker is written, so there is
+        // nothing to refuse — and the attachment beats the marker anyway.
+        let done = init(&registry, &root, Some("fork"), "dev", false).unwrap();
+        assert!(!done.shared);
+        assert_eq!(done.entry.id, "fork");
+        assert_eq!(
+            registry.find_by_dir(&root).unwrap().map(|p| p.id),
+            Some("fork".to_string())
+        );
+    }
+
+    #[test]
+    fn test_a_fresh_clone_registers_under_the_name_the_repo_committed() {
+        let (dir, registry) = vault();
+        // The checkout directory is called something else entirely, which is
+        // the normal case: `git clone <url> ./work`, or a worktree named after
+        // a branch.
+        let root = workdir(&dir, "checkouts/work");
+        std::fs::write(root.join(MARKER_FILE), "project = \"pathors\"\n").unwrap();
+        // Resolution fails here — the registry never travelled — and that is
+        // precisely the state `pb env init` is run to leave.
+        assert!(registry.find_by_dir(&root).is_err());
+
+        let done = init(&registry, &root, None, "dev", true).unwrap();
+        assert!(!done.shared);
+        assert_eq!(
+            done.entry.id, "pathors",
+            "the committed name should win over the directory's"
+        );
+        assert_eq!(
+            registry.find_by_dir(&root).unwrap().map(|p| p.id),
+            Some("pathors".to_string())
+        );
+        // And it did not rewrite the file it took the name from.
+        assert_eq!(marker_text(&root), "project = \"pathors\"\n");
+    }
+
+    #[test]
+    fn test_an_explicit_different_id_still_registers_its_own_project() {
+        let (dir, registry) = vault();
+        let root = workdir(&dir, "repos/pathors");
+        init(&registry, &root, None, "dev", true).unwrap();
+
+        // Inside the same tree, but told to be something else: the marker above
+        // resolves, and is deliberately not what the user asked for.
+        let nested = workdir(&dir, "repos/pathors/tools/scraper");
+        let done = init(&registry, &nested, Some("scraper"), "dev", false).unwrap();
+        assert!(!done.shared);
+        assert_eq!(done.entry.id, "scraper");
+        assert_eq!(registry.projects().unwrap().len(), 2);
+        // The attachment is deeper than the marker's directory, so it wins.
+        assert_eq!(
+            registry.find_by_dir(&nested).unwrap().map(|p| p.id),
+            Some("scraper".to_string())
+        );
+    }
+
+    #[test]
+    fn test_attach_help_says_it_overrides_the_marker() {
+        let command = <Command as clap::Subcommand>::augment_subcommands(clap::Command::new("env"));
+        let attach = command
+            .get_subcommands()
+            .find(|c| c.get_name() == "attach")
+            .expect("`pb env attach` is missing");
+        let help = attach
+            .get_long_about()
+            .or_else(|| attach.get_about())
+            .unwrap()
+            .to_string();
+        assert!(help.contains("OVERRIDES"), "{help}");
+        assert!(help.contains(MARKER_FILE), "{help}");
     }
 
     #[test]

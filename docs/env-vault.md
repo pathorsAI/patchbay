@@ -2,7 +2,7 @@
 
 
 The key vault holds credentials that belong to a person or a machine. This
-holds the other half of the same problem: the twenty variables a *directory*
+holds the other half of the same problem: the twenty variables a *repo*
 needs before it will boot — `DATABASE_URL`, the provider keys, the feature
 flags. Today they live in a `.env` file that is plaintext on disk, gitignored,
 undocumented, and different on every laptop. The variables you deliberately
@@ -11,29 +11,104 @@ whole job is to never reach anyone else.
 
 ```sh
 cd ~/repos/pathors
-pb env init                          # register this directory as a project
+pb env init                          # register it, and leave a marker to commit
 pb env pull                          # fill the synced layer from Infisical
 pbpaste | pb env set DATABASE_URL    # a local override; the value never touches argv
 pb env diff                          # what this machine changes about `dev`
 pb env run -- bun dev                # the merged environment, into one child process
 ```
 
-Nothing there writes a file. The variable *names* go to
-`~/.config/patchbay/projects.json`; the values go to the macOS Keychain.
+The only file any of that writes into the repo is the `.patchbay.toml` marker
+`init` leaves for you to commit, and it holds a project name and nothing else.
+The variable *names* go to `~/.config/patchbay/projects.json`; the values go to
+the macOS Keychain.
 
-### A project is a directory
+### A project is a name, not a path
 
-`pb env init` registers the current directory under a slug — the directory's
-own name unless `--id` says otherwise. Every later command resolves the project
-from the cwd by walking up to the nearest registered root, so `pb env run`
-inside `src/api/` finds the repo it belongs to. When two registered roots both
-contain you — a service registered inside a monorepo that is also registered —
-the deeper one wins, because it is the more specific answer.
+`~/.config/patchbay/projects.json` holds project ids, their environments and
+where each one pulls from. It holds **no absolute path at all** — there is a
+test that asserts exactly that — so it is the same file on every machine you
+work from, and copying it is the supported way to take your projects with you.
+Which directories on *this* machine belong to which project is a separate list,
+`~/.config/patchbay/attachments.json`, because the same repo lives somewhere
+else on the next laptop and a manifest that hard-codes `/Users/you/repos/x` is a
+manifest that cannot travel.
 
-The match is a plain path-prefix comparison with no symlink resolution. Making
-it canonical would make the answer depend on the filesystem's mood, and `/tmp`
-on macOS is itself a symlink. A checkout reached through a symlinked path
-therefore will not match; pass `--project <id>` there.
+A directory resolves to a project two ways, in this order:
+
+1. **An attachment.** `pb env attach <id>` binds this directory to a project
+   that already exists, on this machine only. The project whose attached root is
+   the directory or an ancestor of it wins; when several match — a service
+   attached inside an attached monorepo — the deepest root wins, because it is
+   the more specific answer. `pb env detach` undoes it.
+2. **A marker.** A `.patchbay.toml` committed at the repo root, holding one
+   line that means anything: `project = "pathors"`. patchbay looks for it in the
+   directory and then up through its ancestors, nearest first. `pb env init`
+   writes it for you unless you pass `--no-marker`.
+
+When neither answers, the command says so and names every way in rather than
+guessing:
+
+```
+no project registered for this directory. Three ways in: `pb env init` here to
+register a new project, `pb env attach <id>` to bind this directory to one that
+already exists, or work in a checkout carrying a committed .patchbay.toml, which
+resolves on its own. `pb env projects` lists what exists, and --project <id>
+overrides all of it for one command
+```
+
+**An attachment always beats a marker.** An attachment is a deliberate, local
+act: somebody stood in that directory and said which project it belongs to. A
+marker is whatever the repo happens to ship. When the two disagree the person at
+the keyboard wins, and nothing a repo can contain takes that override away.
+
+A marker can only *name*. It points at a project the machine's own registry
+already holds; it cannot define a sync config, an account, an environment or
+anything else. One that names a project this machine does not have is a loud
+error rather than a silent miss, because it is an explicit claim rather than
+leftover state:
+
+```
+/repos/pathors/.patchbay.toml names project `pathors`, but this machine's
+registry has no project `pathors`; copy your projects.json from the machine that
+has it, or register it here with `pb env init --id pathors`
+```
+
+Git worktrees fall out of this for free: every worktree of a repo carries the
+same committed marker, so all of them — and a second clone, and a colleague's
+checkout — resolve to one project's environments with no setup at all.
+
+The tradeoff is real and was taken deliberately: **repo content selects the
+project**. Cloning a repository whose marker names `pathors` is enough to make
+`pb env run` inject that project's variables in it. That is accepted on the
+assumption that you run the repos you trust. Two things bound it — a marker can
+only name a project you already registered, and an explicit attachment always
+wins — so somebody who works from untrusted checkouts should pass `--no-marker`
+and attach by hand instead.
+
+### Taking it to a new machine
+
+This is the whole point of the split. A new laptop is three steps:
+
+```sh
+cp projects.json ~/.config/patchbay/   # from the old machine
+git clone git@github.com:you/pathors   # the marker comes with the checkout
+cd pathors && pb env pull              # rebuild the synced layer from Infisical
+```
+
+A checkout carrying a marker resolves on its own; anything else takes one
+`pb env attach <id>`. Attachments deliberately do not travel — they are paths
+from a machine that is not this one — so `attachments.json` is excluded from
+every migration, copy and export story patchbay has. A project that arrived in a
+copied `projects.json` and has no attachment here shows `—` under ROOTS in
+`pb env projects`, which is normal, not broken.
+
+The **local layer deliberately does not travel either**. `.env.local` semantics
+are per-machine overrides, and a `DATABASE_URL` pointing at a container on the
+old laptop is exactly the thing that must not follow you. What the remote holds
+comes back with `pb env pull`; what you set by hand you set again, on purpose.
+
+### Environments and names
 
 Each project has named environments — `dev`, `staging`, `production`, whatever
 you like — and a `default_env` used when a command does not say (`dev` unless
@@ -116,13 +191,16 @@ Nothing runs and nothing is stored. If the guard is somehow satisfied and the
 real 403 arrives anyway, patchbay recognises the phrase and appends the same
 advice to Infisical's own message.
 
-`pb env init` picks the pin up for you: it reads `.infisical.json` in the
-directory for the `workspaceId` and records the currently active account
-alongside it. `pb env link` sets or replaces the same thing by hand, and
-`--map dev=development,production=prod` handles the projects whose remote spells
-an environment differently — patchbay's name is what the vault records, the
-remote's name is what goes on the command line. `--domain` is for self-hosted
-and EU instances.
+`pb env init` picks the pin up for you when it registers a *new* project: it
+reads `.infisical.json` in the directory for the `workspaceId` and records the
+currently active account alongside it. An `init` that only attaches a second
+worktree to a project that already exists reads nothing — that project's link is
+already decided, and re-reading this checkout's file could silently replace an
+env map somebody set by hand. `pb env link` sets or replaces the same thing
+deliberately, and `--map dev=development,production=prod` handles the projects
+whose remote spells an environment differently — patchbay's name is what the
+vault records, the remote's name is what goes on the command line. `--domain` is
+for self-hosted and EU instances.
 
 Two failure modes get their own answers rather than a stack trace: no login at
 all points at `infisical login`, and a missing CLI points at `pb env import`,
@@ -193,7 +271,9 @@ Once the values are in, delete the file. That is the point of the exercise.
 ### The commands
 
 ```
-pb env init [--id <slug>] [--dir <path>] [--default-env <env>]
+pb env init   [--id <slug>] [--dir <path>] [--default-env <env>] [--no-marker]
+pb env attach <id> [--dir <path>]
+pb env detach [--dir <path>]
 pb env link --project-id <uuid> [--project <slug>] [--account <email>]
             [--domain <url>] [--map dev=development,...]
 pb env projects [--json]
@@ -208,20 +288,51 @@ pb env export [-e <env>] [--project <id>] [--format dotenv|json]
 pb env forget [--project <id>] [--yes]
 ```
 
+`pb env init` does three things: register the project (under `--id`, else the
+name the directory's own marker claims, else the directory name as a slug),
+attach this directory to it, and write the marker. Run in a worktree or a second
+clone of a project this machine already knows, it attaches that directory
+instead of failing on the duplicate id. Run in a fresh clone whose marker names
+a project the registry lacks, it registers the project the repo names — which is
+the case that makes `git clone && pb env init` work on a machine you have not
+copied `projects.json` to yet. An `--id` that disagrees with a marker already in
+the directory is refused before anything is registered, since that is a
+directory being pulled in two directions; `--no-marker` is the way through, and
+the attachment it makes beats the marker anyway.
+
+`pb env projects --json` prints the portable manifest's own shape and nothing
+else: this machine's attachments live in another file for a reason, and folding
+them in would produce JSON that cannot be copied to the next laptop. The plain
+table folds them into a ROOTS column, and names any attachment whose project is
+not registered here in a footer, since that is the one thing a column cannot
+show.
+
 `pb env set` takes the value from stdin or a hidden prompt, never from argv —
 the same rule as `pb key add`, for the same reason. `pb env forget` removes the
-project from the registry and deletes every Keychain blob behind it, both
-layers of every environment. It revokes nothing: a credential that was in there
-keeps working until you rotate it at its provider.
+project from the registry, drops this machine's attachments to it, and deletes
+every Keychain blob behind it, both layers of every environment. It revokes
+nothing: a credential that was in there keeps working until you rotate it at its
+provider. It also touches no repository — a committed marker is left exactly
+where it is, and the command says so:
+
+```
+  a committed .patchbay.toml is untouched: run `rm .patchbay.toml` in the repo
+  if it should stop claiming `pathors`
+```
 
 ### AI agents
 
 | Tool | What it does | Gate |
 |---|---|---|
-| `list_env_projects` | registered projects, their roots, environments, sync config | open — metadata only |
+| `list_env_projects` | registered projects, their environments and sync config, plus this machine's attached `roots` | open — metadata only |
 | `list_env_vars` | names and provenance for one environment | open — metadata only |
 | `pull_env` | refreshes the synced layer | open — it executes the Infisical CLI and hits the network, but the outcome it returns carries counts and names, no values |
 | `set_env_var` | writes one variable into the local layer | open, like `store_key` — an agent that creates a project credential should register it, so the machine keeps knowing |
+
+`roots` there is this machine's attachments and not the project's home, which
+the tool's own description spells out: an empty list is the normal state for a
+project resolved by its marker, or one that arrived in a copied `projects.json`,
+so a path in that field is never proof of where you are working.
 
 **No tool reads a value back.** Not gated behind `PATCHBAY_ALLOW_SECRET_READ`,
 like the key vault's `get_key` — absent. An environment is dozens of values at
@@ -244,8 +355,18 @@ security find-generic-password -s patchbay -a env:pathors/dev/local
 ```
 
 Variable names, provenance and the last-pull timestamp go to
-`~/.config/patchbay/projects.json`, mode `0600`, written atomically. Names are
-not secret, but which of them a machine holds is nobody else's business.
+`~/.config/patchbay/projects.json`, mode `0600`, written atomically. Which
+directories on this machine map to which project go to `attachments.json`, the
+same way. Names are not secret and neither is a directory path, but which of
+them a machine holds is nobody else's business.
+
+The `.patchbay.toml` marker is the one file that gets none of that treatment: it
+is written with ordinary permissions, because it holds a project *name*, it is
+meant to be committed, and a `0600` file in a repo would only confuse the next
+person to `ls -l` it. Re-pointing an existing marker at a different project is
+refused — that changes what every checkout of the repo resolves to, so it should
+be a deliberate edit, not the side effect of running a command in the wrong
+directory.
 
 **No last4.** The key vault records the last four characters of a value as a
 recognition aid. Env vars get none, because half of these values are `true`,
@@ -263,7 +384,11 @@ found by hand.
 **A malformed registry is a hard error**, never an empty one. Starting over
 silently would let the next write drop every project on the machine and orphan
 every Keychain item behind them. So is a `projects.json` written by a newer
-patchbay than the one you are running.
+patchbay than the one you are running. `attachments.json` follows the same
+discipline — missing is empty, malformed names the file, a newer version is
+refused rather than rewritten — and carries its own schema version, because the
+two files have different lifetimes: one is copied between machines, the other is
+rebuilt on each.
 
 **Failures say nothing.** A failed `infisical export` is reported from its
 stderr only — on a partial export or a broken pipe, stdout can already hold
@@ -285,9 +410,22 @@ picked, into a destination you named — but the vault's guarantee ends at the
 redirect. `pb env run` gives up nothing, and is the reason `export` does not
 have to be convenient.
 
-**Symlinked checkouts need `--project`.** Directory resolution does not
-canonicalize, deliberately (see above), so a path that reaches the repo through
-a symlink is not recognised as inside it.
+**A committed marker means repo content selects the project.** Stated in full
+above: cloning a repo whose `.patchbay.toml` names `pathors` makes that
+project's variables available in it. The bounds are that a marker can only name
+a project you already registered, and that an attachment always overrides it.
+`pb env init --no-marker` plus `pb env attach` is the way to work from checkouts
+you do not trust.
+
+**Symlinked paths do not match an attachment.** Roots are compared by plain path
+prefix with no canonicalization, deliberately: resolving symlinks would make the
+answer depend on the filesystem's mood, and `/tmp` on macOS is itself a symlink.
+A checkout reached through a symlinked path is therefore not recognised as
+inside its attached root — commit a marker, which is found by walking up
+whatever path you actually used, or pass `--project <id>`. The same exactness
+applies to `pb env detach`: it matches the root as it was recorded, so
+`/tmp/work` and `/private/tmp/work` are two different roots, and detaching needs
+the spelling that attached.
 
 **One provider.** `infisical` is the only thing `pull` knows, and `pb env link`
 refuses anything else by name rather than failing later. Everything else on the
