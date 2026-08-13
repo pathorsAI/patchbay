@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **ngrok** (`network`) — the agent's authentication, read from `ngrok.yml` at
+  the v3 platform location, the legacy `~/.ngrok2` one, or `$NGROK_CONFIG`.
+  One profile: the authenticated agent. Named `tunnels:` are forwarding rules on
+  that one account, not identities, so they are reported as a count and a list
+  in `meta`. `pb verify ngrok` runs `ngrok config check` and, when an `api_key`
+  is configured, asks the ngrok API whether it is live — through the key vault's
+  own HTTP seam, so the check is testable without the network. Neither the
+  authtoken nor the api_key is ever reported, not even as a last4.
+
+- **cloudflared** (`network`) — Cloudflare Tunnel origin certificates, and which
+  one is in force. Profiles are the certificates, because that is the identity
+  dimension: with two `*.pem` files on disk, every command uses `cert.pem`
+  unless `TUNNEL_ORIGIN_CERT` or `--origincert` names the other, and nothing on
+  the machine tells you which. That silent-wrong-account trap gets its own note.
+  Tunnel credentials are read for their ids and account tags only —
+  `TunnelSecret` has no field to deserialize into — and `cert.pem` is never
+  parsed at all, since it carries a private key. `config.yml` (or
+  `$TUNNEL_CONFIG`) contributes the tunnel name and ingress-rule count.
+
+- A registered Cloudflare API token now puts a caveat on the `wrangler` row:
+  it is a different credential from wrangler's OAuth login, with different
+  reach, which `wrangler logout` does not revoke and `wrangler whoami` cannot
+  see.
+
 - **Grafana key verification** — `pb key verify` and the MCP `verify_key` now
   understand `--provider grafana`, asking `{endpoint}/api/org` and reporting the
   org the token belongs to. Grafana tokens are only meaningful against the

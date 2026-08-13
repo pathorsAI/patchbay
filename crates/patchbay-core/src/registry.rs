@@ -56,6 +56,8 @@ impl Registry {
                 // network
                 Box::new(probes::tailscale::TailscaleProbe::new(paths.clone())),
                 Box::new(probes::ssh::SshProbe::new(paths.clone())),
+                Box::new(probes::ngrok::NgrokProbe::new(paths.clone())),
+                Box::new(probes::cloudflared::CloudflaredProbe::new(paths.clone())),
                 // payments
                 Box::new(probes::stripe::StripeProbe::new(paths.clone())),
                 // ai
@@ -210,6 +212,11 @@ impl LinkedKeys {
     fn attach(&self, status: &mut ToolStatus) {
         if let Some(refs) = self.by_tool.get(status.tool.as_str()) {
             status.registered_keys = refs.clone();
+            // What the link does not mean. The probe cannot say this: it never
+            // sees the vault.
+            if let Some(note) = crate::keys::key_link_note(&status.tool, refs.len()) {
+                status.note(note);
+            }
         }
         if let Some(note) = &self.note {
             status.note(note.clone());
@@ -226,7 +233,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let registry = Registry::all(Paths::for_test(dir.path()));
         let all = registry.status_all();
-        assert_eq!(all.len(), 23);
+        assert_eq!(all.len(), 25);
         for status in &all {
             assert!(!status.installed, "{} should look absent", status.tool);
             assert!(
@@ -249,6 +256,11 @@ mod tests {
             dir.join("keys.json"),
             Box::new(crate::keystore::MemoryKeystore::new()),
         )
+    }
+
+    /// A second handle on the same vault file, for a test that reopens it.
+    fn vault_at(dir: &std::path::Path) -> KeyRegistry {
+        vault(dir)
     }
 
     fn register(vault: &KeyRegistry, id: &str, provider: &str, expires_in_days: Option<i64>) {
@@ -304,6 +316,47 @@ mod tests {
             registry.status("wrangler").unwrap().registered_keys.len(),
             1
         );
+    }
+
+    #[test]
+    fn test_a_registered_cloudflare_token_warns_that_wrangler_oauth_is_not_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = vault(dir.path());
+        register(&vault, "cf-api", "cloudflare", None);
+
+        let registry = Registry::all(Paths::for_test(dir.path())).with_keys(vault);
+        let board = registry.status_all();
+        let wrangler = board.iter().find(|s| s.tool == "wrangler").unwrap();
+
+        let note = wrangler
+            .notes
+            .iter()
+            .find(|n| n.contains("different credential"))
+            .unwrap_or_else(|| panic!("no caveat on the wrangler row: {:?}", wrangler.notes));
+        assert!(note.contains("wrangler logout"), "{note}");
+        assert!(note.contains("pb key verify"), "{note}");
+        assert!(
+            note.starts_with("1 standalone Cloudflare API token is"),
+            "{note}"
+        );
+
+        // Singular and plural both read correctly.
+        register(&vault_at(dir.path()), "cf-api-2", "cf", None);
+        let registry = Registry::all(Paths::for_test(dir.path())).with_keys(vault_at(dir.path()));
+        let board = registry.status_all();
+        let wrangler = board.iter().find(|s| s.tool == "wrangler").unwrap();
+        assert!(
+            wrangler
+                .notes
+                .iter()
+                .any(|n| n.starts_with("2 standalone Cloudflare API tokens are")),
+            "{:?}",
+            wrangler.notes
+        );
+
+        // A tool with no registered keys gains no note.
+        let gh = board.iter().find(|s| s.tool == "gh").unwrap();
+        assert!(!gh.notes.iter().any(|n| n.contains("different credential")));
     }
 
     #[test]

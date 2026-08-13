@@ -3,6 +3,7 @@
 pub mod aws;
 pub mod az;
 pub mod claude;
+pub mod cloudflared;
 pub mod docker;
 pub mod doctl;
 pub mod firebase;
@@ -13,6 +14,7 @@ pub mod huggingface;
 pub mod infisical;
 pub mod kubectl;
 pub mod neon;
+pub mod ngrok;
 pub mod npm;
 pub mod ollama;
 pub mod op;

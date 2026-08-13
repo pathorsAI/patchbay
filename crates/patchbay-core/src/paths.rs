@@ -73,6 +73,9 @@ const LOCATIONS: &[(&str, Option<&str>)] = &[
     ("ollama", None),
     ("huggingface", Some("HF_HOME")),
     ("claude", Some("CLAUDE_CONFIG_DIR")),
+    ("ngrok", Some("NGROK_CONFIG")),
+    ("cloudflared", None),
+    ("cloudflared_config", Some("TUNNEL_CONFIG")),
 ];
 
 fn env_var_for(key: &str) -> Option<&'static str> {
@@ -326,6 +329,57 @@ impl Paths {
     }
 
     /// Wrangler's global config, newest location first.
+    /// ngrok's config, newest location first. `NGROK_CONFIG` wins outright;
+    /// otherwise the v3 platform directory is preferred over the v2 location,
+    /// which upgrading ngrok leaves behind rather than migrating.
+    pub fn ngrok_candidates(&self) -> Vec<PathBuf> {
+        if let Some(path) = self.env("NGROK_CONFIG") {
+            return vec![PathBuf::from(path)];
+        }
+        if let Some(path) = self.overrides.get("ngrok") {
+            return vec![path.clone()];
+        }
+        vec![
+            self.join("Library/Application Support/ngrok/ngrok.yml"),
+            self.join(".ngrok2/ngrok.yml"),
+        ]
+    }
+
+    /// cloudflared's credential directory: the origin certificates plus one
+    /// JSON per tunnel.
+    ///
+    /// `TUNNEL_ORIGIN_CERT` is deliberately *not* consulted here. It selects
+    /// which certificate is in force, which is an identity question, not a
+    /// location one — see [`Paths::cloudflared_origin_cert`].
+    pub fn cloudflared_dir(&self) -> PathBuf {
+        self.resolve("cloudflared", || self.join(".cloudflared"))
+    }
+
+    /// The origin certificate in force: `TUNNEL_ORIGIN_CERT` when set, else the
+    /// default `cert.pem` inside [`Paths::cloudflared_dir`]. `None` from the
+    /// env var means "the default", not "no certificate".
+    pub fn cloudflared_origin_cert(&self) -> PathBuf {
+        match self.env("TUNNEL_ORIGIN_CERT") {
+            Some(path) => PathBuf::from(path),
+            None => self.cloudflared_dir().join("cert.pem"),
+        }
+    }
+
+    /// Whether the origin certificate was chosen by the environment rather
+    /// than by the default. The difference is a silent-wrong-account trap, so
+    /// the probe reports it.
+    pub fn cloudflared_origin_cert_is_explicit(&self) -> bool {
+        self.env("TUNNEL_ORIGIN_CERT").is_some()
+    }
+
+    /// cloudflared's tunnel config, which names the tunnel and its ingress
+    /// rules. `TUNNEL_CONFIG` wins, else `config.yml` in the credential dir.
+    pub fn cloudflared_config(&self) -> PathBuf {
+        self.resolve("cloudflared_config", || {
+            self.cloudflared_dir().join("config.yml")
+        })
+    }
+
     pub fn wrangler_candidates(&self) -> Vec<PathBuf> {
         if let Some(path) = self.overrides.get("wrangler") {
             return vec![path.clone()];
@@ -799,6 +853,9 @@ mod tests {
                 "ollama" => with.ollama_dir() != paths.ollama_dir(),
                 "huggingface" => with.huggingface_dir() != paths.huggingface_dir(),
                 "claude" => with.claude_json() != paths.claude_json(),
+                "ngrok" => with.ngrok_candidates() != paths.ngrok_candidates(),
+                "cloudflared" => with.cloudflared_dir() != paths.cloudflared_dir(),
+                "cloudflared_config" => with.cloudflared_config() != paths.cloudflared_config(),
                 other => panic!("`{other}` is in LOCATIONS but no accessor uses it"),
             };
             assert!(moved, "the [paths] key `{key}` changes nothing");

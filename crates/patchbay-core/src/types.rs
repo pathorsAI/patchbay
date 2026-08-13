@@ -41,7 +41,7 @@ impl ToolCategory {
             "wrangler" | "vercel" => Self::Edge,
             "rclone" => Self::Storage,
             "docker" => Self::Containers,
-            "tailscale" | "ssh" => Self::Network,
+            "tailscale" | "ssh" | "ngrok" | "cloudflared" => Self::Network,
             "stripe" => Self::Payments,
             "ollama" | "huggingface" | "claude" => Self::Ai,
             _ => Self::Other,
