@@ -4,6 +4,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 
@@ -129,6 +130,7 @@ pub fn parse_epoch_millis(millis: i64) -> Option<DateTime<Utc>> {
 }
 
 /// Outcome of shelling out to a tool's own CLI.
+#[derive(Debug, Clone)]
 pub struct CmdOutput {
     pub ok: bool,
     pub stdout: String,
@@ -155,10 +157,21 @@ impl CmdOutput {
 /// `Err` only when the binary could not be spawned at all. Non-zero exit is a
 /// normal result and comes back as `ok: false`.
 pub fn run(bin: &str, args: &[&str]) -> anyhow::Result<CmdOutput> {
-    let output = Command::new(bin)
-        .args(args)
-        .env("NO_COLOR", "1")
-        .env("CLICOLOR", "0")
+    run_env(bin, args, &[])
+}
+
+/// [`run`], with extra environment for the child process only.
+///
+/// This is how patchbay answers "verify *that* profile" for tools that select
+/// an identity through the environment: it cannot change the parent shell, but
+/// it can absolutely set the variable on the command it runs itself.
+pub fn run_env(bin: &str, args: &[&str], env: &[(&str, &str)]) -> anyhow::Result<CmdOutput> {
+    let mut command = Command::new(bin);
+    command.args(args).env("NO_COLOR", "1").env("CLICOLOR", "0");
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let output = command
         .output()
         .map_err(|e| anyhow::anyhow!("could not run `{} {}`: {}", bin, args.join(" "), e))?;
     Ok(CmdOutput {
@@ -167,6 +180,119 @@ pub fn run(bin: &str, args: &[&str]) -> anyhow::Result<CmdOutput> {
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     })
 }
+
+// ---------------------------------------------------------------------------
+// the exec seam
+// ---------------------------------------------------------------------------
+
+/// How a probe runs another tool's CLI.
+///
+/// Tier-2 work — `verify`, `permissions` — means executing somebody else's
+/// binary, which a unit test must never do. Probes therefore never call
+/// [`run`] directly; they go through the [`Exec`] their [`crate::Paths`]
+/// carries, which is the real thing in production and a scripted fake in tests.
+pub trait Exec: std::fmt::Debug + Send + Sync {
+    /// Run `bin` with `args`, plus `env` for the child only.
+    fn run(&self, bin: &str, args: &[&str], env: &[(&str, &str)]) -> anyhow::Result<CmdOutput>;
+}
+
+/// The real one: spawns the process.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemExec;
+
+impl Exec for SystemExec {
+    fn run(&self, bin: &str, args: &[&str], env: &[(&str, &str)]) -> anyhow::Result<CmdOutput> {
+        run_env(bin, args, env)
+    }
+}
+
+/// One recorded invocation, for assertions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecCall {
+    pub bin: String,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+}
+
+impl ExecCall {
+    /// The command as a shell-ish line, for readable assertions.
+    pub fn line(&self) -> String {
+        std::iter::once(self.bin.clone())
+            .chain(self.args.iter().cloned())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+/// Scripted [`Exec`] for tests. Matches on a substring of the command line and
+/// records everything it was asked to run, so a test can assert both the
+/// outcome and the command that produced it — without a subprocess.
+#[derive(Debug, Default)]
+pub struct FakeExec {
+    /// `(substring the command line must contain, what to return)`, first match
+    /// wins. An empty substring matches anything.
+    scripted: std::sync::Mutex<Vec<(String, CmdOutput)>>,
+    calls: std::sync::Mutex<Vec<ExecCall>>,
+}
+
+impl FakeExec {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reply to any command whose line contains `matching`.
+    pub fn on(self, matching: &str, ok: bool, stdout: &str, stderr: &str) -> Self {
+        self.scripted.lock().expect("exec lock").push((
+            matching.to_string(),
+            CmdOutput {
+                ok,
+                stdout: stdout.to_string(),
+                stderr: stderr.to_string(),
+            },
+        ));
+        self
+    }
+
+    /// Every command run, in order.
+    pub fn calls(&self) -> Vec<ExecCall> {
+        self.calls.lock().expect("exec lock").clone()
+    }
+
+    pub fn last(&self) -> Option<ExecCall> {
+        self.calls.lock().expect("exec lock").last().cloned()
+    }
+}
+
+impl Exec for FakeExec {
+    fn run(&self, bin: &str, args: &[&str], env: &[(&str, &str)]) -> anyhow::Result<CmdOutput> {
+        let call = ExecCall {
+            bin: bin.to_string(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            env: env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        };
+        let line = call.line();
+        self.calls.lock().expect("exec lock").push(call);
+
+        let scripted = self.scripted.lock().expect("exec lock");
+        for (matching, output) in scripted.iter() {
+            if matching.is_empty() || line.contains(matching.as_str()) {
+                return Ok(CmdOutput {
+                    ok: output.ok,
+                    stdout: output.stdout.clone(),
+                    stderr: output.stderr.clone(),
+                });
+            }
+        }
+        // Nothing scripted: the same shape as a binary that is not there.
+        Err(anyhow::anyhow!("could not run `{line}`: no such file or directory"))
+    }
+}
+
+/// Shared handle to whichever [`Exec`] is in force.
+pub type SharedExec = Arc<dyn Exec>;
 
 // ---------------------------------------------------------------------------
 // writing other tools' config files

@@ -195,6 +195,20 @@ impl Registry {
         self.require(tool)?.verify()
     }
 
+    /// Verify one profile of one tool. `None` verifies whatever the tool
+    /// treats as active.
+    pub fn verify_profile(
+        &self,
+        tool: &str,
+        profile_id: Option<&str>,
+    ) -> anyhow::Result<VerifyOutcome> {
+        let probe = self.require(tool)?;
+        match profile_id {
+            Some(id) => probe.verify_profile(id),
+            None => probe.verify(),
+        }
+    }
+
     pub fn permissions(&self, tool: &str) -> anyhow::Result<PermissionsReport> {
         self.require(tool)?.permissions()
     }

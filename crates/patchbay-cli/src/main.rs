@@ -44,8 +44,16 @@ enum Command {
         json: bool,
     },
     /// Check whether a tool's credentials actually work right now.
+    ///
+    /// patchbay runs the tool's own check itself — it does not hand back a
+    /// command to paste. With `--profile`, it checks that one profile: an
+    /// rclone remote, an ssh host, a kubectl context.
     Verify {
         tool: String,
+        /// Profile to check, as listed by `pb status --json`. Defaults to
+        /// whatever the tool treats as active.
+        #[arg(long, value_name = "ID")]
+        profile: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -110,8 +118,12 @@ fn run() -> Result<i32> {
             }
             Ok(switch_exit_code(&outcome))
         }
-        Command::Verify { tool, json } => {
-            let outcome = registry.verify(&tool)?;
+        Command::Verify {
+            tool,
+            profile,
+            json,
+        } => {
+            let outcome = registry.verify_profile(&tool, profile.as_deref())?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&outcome)?);
             } else {

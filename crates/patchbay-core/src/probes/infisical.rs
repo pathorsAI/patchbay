@@ -24,7 +24,7 @@ use serde_json::Value;
 use crate::paths::Paths;
 use crate::probe::{unknown_profile, unsupported_verify, Probe};
 use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
-use crate::util::{backup, read_text, run, serialize_json_preserving_style, write_atomic};
+use crate::util::{backup, read_text, serialize_json_preserving_style, write_atomic};
 
 pub struct InfisicalProbe {
     paths: Paths,
@@ -272,7 +272,7 @@ impl Probe for InfisicalProbe {
                 Some("infisical login status"),
             ));
         }
-        let out = run("infisical", &["login", "status"])?;
+        let out = self.paths.run("infisical", &["login", "status"])?;
         Ok(if out.ok {
             VerifyOutcome::Valid {
                 tool: Self::TOOL.to_string(),

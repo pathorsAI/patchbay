@@ -38,7 +38,7 @@ use serde::Deserialize;
 use crate::paths::Paths;
 use crate::probe::{unsupported_switch, unsupported_verify, Probe};
 use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
-use crate::util::{read_text, run};
+use crate::util::{read_text};
 
 pub struct CloudflaredProbe {
     paths: Paths,
@@ -398,7 +398,7 @@ impl Probe for CloudflaredProbe {
         // Names the certificate explicitly so this checks the identity the
         // board just reported as active, not whatever the ambient environment
         // of this process happens to say.
-        let out = run(
+        let out = self.paths.run(
             "cloudflared",
             &[
                 "tunnel",

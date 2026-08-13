@@ -12,7 +12,7 @@ use serde::Deserialize;
 use crate::paths::Paths;
 use crate::probe::{unknown_profile, unsupported_switch, Probe};
 use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
-use crate::util::{read_text, run};
+use crate::util::{read_text};
 
 pub struct AzProbe {
     paths: Paths,
@@ -172,7 +172,7 @@ impl Probe for AzProbe {
             ));
         }
 
-        let out = run("az", &["account", "set", "--subscription", &id])?;
+        let out = self.paths.run("az", &["account", "set", "--subscription", &id])?;
         Ok(if out.ok {
             SwitchOutcome::Switched {
                 tool: Self::TOOL.to_string(),
@@ -200,7 +200,7 @@ impl Probe for AzProbe {
             ));
         }
         // `--output none` keeps the minted token off stdout entirely.
-        let out = run("az", &["account", "get-access-token", "--output", "none"])?;
+        let out = self.paths.run("az", &["account", "get-access-token", "--output", "none"])?;
         Ok(if out.ok {
             VerifyOutcome::Valid {
                 tool: Self::TOOL.to_string(),

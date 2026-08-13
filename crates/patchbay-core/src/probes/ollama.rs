@@ -21,7 +21,6 @@
 use crate::paths::Paths;
 use crate::probe::{unsupported_switch, unsupported_verify, Probe};
 use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
-use crate::util::run;
 
 pub struct OllamaProbe {
     paths: Paths,
@@ -135,7 +134,7 @@ impl Probe for OllamaProbe {
         // `ollama --version` reports the client version and warns when it
         // cannot reach the local daemon — the same answer as GET /api/version,
         // without pulling an HTTP client into patchbay-core.
-        let out = run("ollama", &["--version"])?;
+        let out = self.paths.run("ollama", &["--version"])?;
         let text = format!("{}\n{}", out.stdout, out.stderr);
         let unreachable = text.to_lowercase().contains("could not connect")
             || text.to_lowercase().contains("not running");

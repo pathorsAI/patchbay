@@ -23,7 +23,7 @@ use serde::Deserialize;
 use crate::paths::Paths;
 use crate::probe::{unknown_profile, unsupported_switch, unsupported_verify, Probe};
 use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
-use crate::util::{parse_timestamp, run};
+use crate::util::{parse_timestamp};
 
 pub struct TailscaleProbe {
     paths: Paths,
@@ -176,7 +176,7 @@ impl Probe for TailscaleProbe {
 
         // `switch` takes an id, a tailnet name or an account; validate against
         // the live list so an unknown value gets the available ids back.
-        let listed = run("tailscale", &["switch", "--list"])?;
+        let listed = self.paths.run("tailscale", &["switch", "--list"])?;
         if listed.ok {
             let profiles = Self::parse_switch_list(&listed.stdout);
             let known = profiles.iter().any(|(id, tailnet, account, _)| {
@@ -192,7 +192,7 @@ impl Probe for TailscaleProbe {
             }
         }
 
-        let out = run("tailscale", &["switch", profile_id])?;
+        let out = self.paths.run("tailscale", &["switch", profile_id])?;
         Ok(if out.ok {
             SwitchOutcome::Switched {
                 tool: Self::TOOL.to_string(),
@@ -225,7 +225,7 @@ impl Probe for TailscaleProbe {
                 Some("tailscale status --json"),
             ));
         }
-        let out = run("tailscale", &["status", "--json"])?;
+        let out = self.paths.run("tailscale", &["status", "--json"])?;
         if !out.ok {
             return Ok(VerifyOutcome::Invalid {
                 tool: Self::TOOL.to_string(),

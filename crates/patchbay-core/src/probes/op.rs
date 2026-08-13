@@ -31,7 +31,7 @@ use serde::Deserialize;
 use crate::paths::Paths;
 use crate::probe::{unsupported_switch, Probe};
 use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
-use crate::util::{read_text, run};
+use crate::util::{read_text};
 
 pub struct OpProbe {
     paths: Paths,
@@ -177,7 +177,7 @@ impl Probe for OpProbe {
                 Some("op whoami"),
             ));
         }
-        let out = run("op", &["whoami"])?;
+        let out = self.paths.run("op", &["whoami"])?;
         Ok(if out.ok {
             VerifyOutcome::Valid {
                 tool: Self::TOOL.to_string(),

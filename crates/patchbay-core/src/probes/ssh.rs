@@ -16,7 +16,7 @@
 use crate::paths::Paths;
 use crate::probe::{unsupported_switch, unsupported_verify, Probe};
 use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
-use crate::util::{read_text, run};
+use crate::util::{read_text};
 
 pub struct SshProbe {
     paths: Paths,
@@ -223,7 +223,7 @@ impl Probe for SshProbe {
             ));
         }
         // Talks to the local agent socket only; no host is contacted.
-        let out = run("ssh-add", &["-l"])?;
+        let out = self.paths.run("ssh-add", &["-l"])?;
         let keys = Self::parse_agent_list(&out.stdout);
         Ok(if out.ok && !keys.is_empty() {
             VerifyOutcome::Valid {

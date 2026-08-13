@@ -35,7 +35,7 @@ use crate::keys_verify::{HttpClient, UreqClient};
 use crate::paths::Paths;
 use crate::probe::{unsupported_switch, unsupported_verify, Probe};
 use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
-use crate::util::{read_text, run};
+use crate::util::{read_text};
 
 /// The ngrok API. Used only when an `api_key` is configured — an `authtoken`
 /// authenticates the *agent*, not the API, and cannot be checked this way.
@@ -244,7 +244,7 @@ impl Probe for NgrokProbe {
         // happens to parse.
         let mut details = Vec::new();
         if self.paths.has_binary("ngrok") {
-            let out = run("ngrok", &["config", "check"])?;
+            let out = self.paths.run("ngrok", &["config", "check"])?;
             if !out.ok {
                 return Ok(VerifyOutcome::Invalid {
                     tool: Self::TOOL.to_string(),

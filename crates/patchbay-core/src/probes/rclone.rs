@@ -48,6 +48,59 @@ impl RcloneProbe {
     }
 }
 
+impl RcloneProbe {
+    /// `used / total` from `rclone about --json`, when the backend reports it.
+    fn quota(stdout: &str) -> Option<String> {
+        #[derive(serde::Deserialize)]
+        struct About {
+            #[serde(default)]
+            total: Option<i64>,
+            #[serde(default)]
+            used: Option<i64>,
+            #[serde(default)]
+            free: Option<i64>,
+        }
+        let about: About = serde_json::from_str(stdout).ok()?;
+        match (about.used, about.total) {
+            (Some(used), Some(total)) if total > 0 => Some(format!(
+                "{} of {} used ({}%)",
+                human_bytes(used),
+                human_bytes(total),
+                (used as f64 / total as f64 * 100.0).round() as i64
+            )),
+            (Some(used), _) => Some(format!("{} used", human_bytes(used))),
+            (None, Some(total)) => Some(format!("{} total", human_bytes(total))),
+            _ => about.free.map(|free| format!("{} free", human_bytes(free))),
+        }
+    }
+
+    /// Whether the failure was "this backend has no `about`" rather than "your
+    /// credential is bad".
+    fn about_unsupported(message: &str) -> bool {
+        let lower = message.to_lowercase();
+        lower.contains("doesn't support about")
+            || lower.contains("does not support about")
+            || lower.contains("not supported")
+            || lower.contains("unsupported")
+    }
+}
+
+/// Bytes as something a human reads at a glance.
+fn human_bytes(bytes: i64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value.abs() >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 impl Probe for RcloneProbe {
     fn tool(&self) -> &'static str {
         Self::TOOL
@@ -123,12 +176,140 @@ impl Probe for RcloneProbe {
         ))
     }
 
+    /// Every remote, one line each. rclone has no active remote, so "verify
+    /// rclone" can only mean "verify all of them" — which patchbay does, rather
+    /// than asking the user which one they meant.
     fn verify(&self) -> anyhow::Result<VerifyOutcome> {
-        Ok(unsupported_verify(
-            Self::TOOL,
-            "verification needs a specific remote, which this call has no way to name",
-            Some("rclone about <remote>:"),
-        ))
+        if !self.paths.may_exec() || !self.paths.has_binary("rclone") {
+            return Ok(unsupported_verify(
+                Self::TOOL,
+                "the rclone CLI is not available on PATH",
+                Some("rclone about <remote>:"),
+            ));
+        }
+        let status = self.status()?;
+        if status.profiles.is_empty() {
+            return Ok(unsupported_verify(
+                Self::TOOL,
+                "no remotes are configured",
+                Some("rclone config"),
+            ));
+        }
+
+        let mut lines = Vec::new();
+        let mut any_invalid = false;
+        for profile in &status.profiles {
+            let outcome = self.verify_profile(&profile.id)?;
+            let (mark, detail) = match &outcome {
+                VerifyOutcome::Valid { detail, .. } => ("ok", detail),
+                VerifyOutcome::Invalid { detail, .. } => {
+                    any_invalid = true;
+                    ("FAILED", detail)
+                }
+                VerifyOutcome::Unsupported { reason, .. } => ("skipped", reason),
+            };
+            lines.push(format!("{}: {mark} — {detail}", profile.id));
+        }
+        let detail = lines.join("; ");
+        Ok(if any_invalid {
+            VerifyOutcome::Invalid {
+                tool: Self::TOOL.to_string(),
+                detail,
+            }
+        } else {
+            VerifyOutcome::Valid {
+                tool: Self::TOOL.to_string(),
+                detail,
+            }
+        })
+    }
+
+    /// One remote, actually checked.
+    ///
+    /// `rclone about <remote>:` is the cheapest call that proves the stored
+    /// credential still works, and on the backends that support it the answer
+    /// carries quota — genuinely useful, and free. Backends that do not support
+    /// `about` (an alias to a subfolder, an S3 bucket) fall back to a shallow
+    /// `lsd`, which proves reachability without listing anything deep.
+    fn verify_profile(&self, profile_id: &str) -> anyhow::Result<VerifyOutcome> {
+        if !self.paths.may_exec() || !self.paths.has_binary("rclone") {
+            return Ok(unsupported_verify(
+                Self::TOOL,
+                "the rclone CLI is not available on PATH",
+                Some(&format!("rclone about {profile_id}:")),
+            ));
+        }
+
+        let status = self.status()?;
+        let Some(profile) = status.profiles.iter().find(|p| p.id == profile_id) else {
+            return Ok(unsupported_verify(
+                Self::TOOL,
+                &format!(
+                    "no remote called `{profile_id}`; configured remotes: {}",
+                    status
+                        .profiles
+                        .iter()
+                        .map(|p| p.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                Some("rclone config"),
+            ));
+        };
+
+        // An alias forwards to another remote, so a check of it is really a
+        // check of the target. Say so, rather than reporting a pass whose
+        // meaning is one indirection away.
+        let via = profile
+            .meta
+            .get("remote")
+            .and_then(|v| v.as_str())
+            .map(|target| format!(" (alias → {target})"))
+            .unwrap_or_default();
+
+        let remote = format!("{profile_id}:");
+        let out = self
+            .paths
+            .run("rclone", &["about", &remote, "--json"])?;
+        if out.ok {
+            let detail = match Self::quota(&out.stdout) {
+                Some(quota) => format!("reachable{via}; {quota}"),
+                None => format!("reachable{via}"),
+            };
+            return Ok(VerifyOutcome::Valid {
+                tool: Self::TOOL.to_string(),
+                detail,
+            });
+        }
+
+        // `about` is optional in rclone's backend interface. A backend that
+        // does not implement it is not a broken credential, so fall back to
+        // something every backend can do.
+        let message = out.message();
+        if Self::about_unsupported(&message) {
+            let out = self
+                .paths
+                .run("rclone", &["lsd", &remote, "--max-depth", "1"])?;
+            return Ok(if out.ok {
+                VerifyOutcome::Valid {
+                    tool: Self::TOOL.to_string(),
+                    detail: format!(
+                        "reachable{via}; this backend does not report quota, so patchbay listed \
+                         the top level instead"
+                    ),
+                }
+            } else {
+                VerifyOutcome::Invalid {
+                    tool: Self::TOOL.to_string(),
+                    detail: format!("{}{via}", out.message()),
+                }
+            });
+        }
+
+        Ok(VerifyOutcome::Invalid {
+            tool: Self::TOOL.to_string(),
+            detail: format!("{message}{via}"),
+        })
     }
 
     fn permissions(&self) -> anyhow::Result<PermissionsReport> {
@@ -244,5 +425,150 @@ remote = work:Legal
             .notes
             .iter()
             .any(|n| n.contains("no readable remote sections")));
+    }
+
+    // --- verification, through the scripted exec seam ----------------------
+
+    use crate::util::FakeExec;
+    use std::sync::Arc;
+
+    /// A fixture home plus a scripted rclone. No subprocess, no network.
+    fn with_exec(conf: &str, exec: FakeExec) -> (tempfile::TempDir, RcloneProbe, Arc<FakeExec>) {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        fs::create_dir_all(home.join(".config/rclone")).unwrap();
+        fs::write(home.join(".config/rclone/rclone.conf"), conf).unwrap();
+        let exec = Arc::new(exec);
+        let paths = Paths::for_test(&home).with_exec(exec.clone());
+        (dir, RcloneProbe::new(paths), exec)
+    }
+
+    const REMOTES: &str = "[pathors]\ntype = drive\ntoken = {\"expiry\":\"2030-01-01T00:00:00Z\"}\n\n[legal]\ntype = alias\nremote = pathors:法務 Legal\n";
+
+    #[test]
+    fn test_verify_profile_runs_about_and_reports_quota() {
+        let (_dir, probe, exec) = with_exec(
+            REMOTES,
+            FakeExec::new().on(
+                "about pathors:",
+                true,
+                r#"{"total":161061273600,"used":6979321856,"free":154081951744}"#,
+                "",
+            ),
+        );
+
+        match probe.verify_profile("pathors").unwrap() {
+            VerifyOutcome::Valid { detail, .. } => {
+                assert!(detail.contains("reachable"), "{detail}");
+                assert!(detail.contains("6.5 GiB of 150.0 GiB used (4%)"), "{detail}");
+            }
+            other => panic!("expected Valid, got {other:?}"),
+        }
+        // It really ran the command, rather than describing one.
+        assert_eq!(exec.last().unwrap().line(), "rclone about pathors: --json");
+    }
+
+    #[test]
+    fn test_verify_profile_resolves_an_alias_and_says_so() {
+        let (_dir, probe, _exec) = with_exec(
+            REMOTES,
+            FakeExec::new().on("about legal:", true, r#"{"total":100,"used":25}"#, ""),
+        );
+        match probe.verify_profile("legal").unwrap() {
+            VerifyOutcome::Valid { detail, .. } => {
+                assert!(
+                    detail.contains("alias → pathors:法務 Legal"),
+                    "the target the check really went through is missing: {detail}"
+                );
+            }
+            other => panic!("expected Valid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_a_backend_without_about_falls_back_to_a_shallow_listing() {
+        let (_dir, probe, exec) = with_exec(
+            REMOTES,
+            FakeExec::new()
+                .on("about", false, "", "Error: doesn't support about")
+                .on("lsd", true, "          -1 2026-01-01 00:00:00        -1 folder\n", ""),
+        );
+
+        match probe.verify_profile("pathors").unwrap() {
+            VerifyOutcome::Valid { detail, .. } => {
+                assert!(detail.contains("does not report quota"), "{detail}");
+            }
+            other => panic!("expected Valid, got {other:?}"),
+        }
+        let lines: Vec<String> = exec.calls().iter().map(|c| c.line()).collect();
+        assert_eq!(
+            lines,
+            vec![
+                "rclone about pathors: --json",
+                "rclone lsd pathors: --max-depth 1"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_a_real_failure_is_invalid_and_keeps_rclones_own_message() {
+        let (_dir, probe, _exec) = with_exec(
+            REMOTES,
+            FakeExec::new().on(
+                "about",
+                false,
+                "",
+                "Failed to about: couldn't fetch token: oauth2: cannot fetch token: 400 Bad Request",
+            ),
+        );
+        match probe.verify_profile("pathors").unwrap() {
+            VerifyOutcome::Invalid { detail, .. } => {
+                assert!(detail.contains("couldn't fetch token"), "{detail}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_an_unknown_remote_lists_the_ones_that_exist() {
+        let (_dir, probe, exec) = with_exec(REMOTES, FakeExec::new());
+        match probe.verify_profile("nope").unwrap() {
+            VerifyOutcome::Unsupported { reason, .. } => {
+                assert!(reason.contains("no remote called `nope`"), "{reason}");
+                assert!(reason.contains("pathors"), "{reason}");
+                assert!(reason.contains("legal"), "{reason}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+        assert!(exec.calls().is_empty(), "an unknown remote must not exec");
+    }
+
+    #[test]
+    fn test_tool_level_verify_checks_every_remote_instead_of_refusing() {
+        // The old behaviour was `unsupported` plus a command to paste. Now the
+        // answer is the answer.
+        let (_dir, probe, exec) = with_exec(
+            REMOTES,
+            FakeExec::new()
+                .on("about pathors:", true, r#"{"total":100,"used":50}"#, "")
+                .on("about legal:", false, "", "directory not found"),
+        );
+
+        match probe.verify().unwrap() {
+            VerifyOutcome::Invalid { detail, .. } => {
+                assert!(detail.contains("pathors: ok"), "{detail}");
+                assert!(detail.contains("legal: FAILED"), "{detail}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        assert_eq!(exec.calls().len(), 2, "one check per remote");
+    }
+
+    #[test]
+    fn test_human_bytes_reads_like_a_human_wrote_it() {
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(1536), "1.5 KiB");
+        assert_eq!(human_bytes(6979321856), "6.5 GiB");
+        assert_eq!(human_bytes(161061273600), "150.0 GiB");
     }
 }

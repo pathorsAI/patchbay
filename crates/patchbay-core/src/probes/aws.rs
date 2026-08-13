@@ -18,7 +18,7 @@ use chrono::{DateTime, Utc};
 use crate::paths::Paths;
 use crate::probe::{unsupported_switch, unsupported_verify, Probe};
 use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
-use crate::util::{parse_timestamp, read_text, run, Ini};
+use crate::util::{parse_timestamp, read_text, Ini};
 
 pub struct AwsProbe {
     paths: Paths,
@@ -256,7 +256,7 @@ impl Probe for AwsProbe {
                 Some("aws sts get-caller-identity"),
             ));
         }
-        let out = run("aws", &["sts", "get-caller-identity", "--output", "json"])?;
+        let out = self.paths.run("aws", &["sts", "get-caller-identity", "--output", "json"])?;
         Ok(if out.ok {
             let arn = serde_json::from_str::<serde_json::Value>(&out.stdout)
                 .ok()

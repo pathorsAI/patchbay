@@ -22,7 +22,7 @@ use rusqlite::{Connection, OpenFlags};
 use crate::paths::Paths;
 use crate::probe::{unknown_profile, unsupported_switch, unsupported_verify, Probe};
 use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
-use crate::util::{read_text, run, Ini};
+use crate::util::{read_text, Ini};
 
 pub struct GcloudProbe {
     paths: Paths,
@@ -297,7 +297,7 @@ impl Probe for GcloudProbe {
             ));
         }
 
-        let out = run(
+        let out = self.paths.run(
             "gcloud",
             &["config", "configurations", "activate", profile_id],
         )?;
@@ -338,7 +338,7 @@ impl Probe for GcloudProbe {
         }
         // Mints/refreshes an access token for the active account: the cheapest
         // honest liveness check. The token itself is discarded, never parsed.
-        let out = run("gcloud", &["auth", "print-access-token", "--quiet"])?;
+        let out = self.paths.run("gcloud", &["auth", "print-access-token", "--quiet"])?;
         Ok(if out.ok {
             VerifyOutcome::Valid {
                 tool: Self::TOOL.to_string(),

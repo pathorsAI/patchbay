@@ -41,6 +41,10 @@ pub enum BinaryLookup {
     System,
     /// Never look. Used in tests so results depend only on the fixture home.
     Disabled,
+    /// Every binary is "present" and tier 2 is allowed, but execution goes to
+    /// a scripted [`crate::util::Exec`]. Used by tests that need to exercise a
+    /// verify path without a subprocess.
+    Scripted,
 }
 
 /// One overridable location: the key used in `[paths]`, and the environment
@@ -95,6 +99,8 @@ pub struct Paths {
     /// Problems with that config: a malformed file, an unknown key. Reported,
     /// never fatal — a typo must not blank the board.
     config_warnings: Vec<String>,
+    /// How this `Paths` runs other tools' CLIs.
+    exec: crate::util::SharedExec,
 }
 
 impl Paths {
@@ -121,6 +127,7 @@ impl Paths {
             lookup,
             overrides: BTreeMap::new(),
             config_warnings: Vec::new(),
+            exec: std::sync::Arc::new(crate::util::SystemExec),
         }
     }
 
@@ -214,18 +221,51 @@ impl Paths {
             .filter(|s| !s.is_empty())
     }
 
-    /// `true` when the binary is on `PATH`. Always `false` in tests.
+    /// `true` when the binary is on `PATH`. Always `false` in plain tests, and
+    /// always `true` when a scripted exec is in force — the fake decides what
+    /// running it does.
     pub fn has_binary(&self, name: &str) -> bool {
         match self.lookup {
             BinaryLookup::System => which::which(name).is_ok(),
             BinaryLookup::Disabled => false,
+            BinaryLookup::Scripted => true,
         }
     }
 
     /// Whether probes are allowed to execute the tool's own CLI. Tier-2
     /// operations short-circuit to `Unsupported` when this is false.
     pub fn may_exec(&self) -> bool {
-        self.lookup == BinaryLookup::System
+        matches!(self.lookup, BinaryLookup::System | BinaryLookup::Scripted)
+    }
+
+    /// Run another tool's CLI through whichever [`crate::util::Exec`] is in
+    /// force. **Every probe uses this rather than [`crate::util::run`]**, which
+    /// is what keeps the test suite out of subprocesses.
+    pub fn run(&self, bin: &str, args: &[&str]) -> anyhow::Result<crate::util::CmdOutput> {
+        self.exec.run(bin, args, &[])
+    }
+
+    /// [`Paths::run`], with extra environment for the child process only.
+    ///
+    /// patchbay cannot change the parent shell's environment, but the command
+    /// *it* runs is its own — which is how "verify that profile" works for the
+    /// tools that select an identity through a variable.
+    pub fn run_env(
+        &self,
+        bin: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> anyhow::Result<crate::util::CmdOutput> {
+        self.exec.run(bin, args, env)
+    }
+
+    /// Replace the exec. Tests pass a [`crate::util::FakeExec`]; doing so also
+    /// switches binary lookup to [`BinaryLookup::Scripted`], so the probe takes
+    /// its tier-2 path instead of short-circuiting.
+    pub fn with_exec(mut self, exec: crate::util::SharedExec) -> Self {
+        self.exec = exec;
+        self.lookup = BinaryLookup::Scripted;
+        self
     }
 
     fn join(&self, rel: &str) -> PathBuf {

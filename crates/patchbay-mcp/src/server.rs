@@ -104,6 +104,20 @@ is needed. Confirm with the user before removing anything. Never write a secret 
 `env` or `headers` through these tools: those land in a plain-text config file. Reference an \
 environment variable name, or register the secret with `store_key`, instead.";
 
+/// `{ "tool": "rclone", "profile_id": "legal" }` — one tool, optionally one
+/// profile of it.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct VerifyParams {
+    /// Tool key, e.g. "rclone". An unknown key returns an error listing every
+    /// valid key.
+    pub tool: String,
+    /// Optional: the single profile to check, as listed by `get_status`. For
+    /// tools whose meaningful unit is the profile — an rclone remote, an ssh
+    /// host, a kubectl context — this is what you want; omitting it checks
+    /// whatever the tool treats as active.
+    pub profile_id: Option<String>,
+}
+
 /// `{ "tool": "gcloud" }` — identifies one supported CLI.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ToolParams {
@@ -319,6 +333,12 @@ in the past, an `expires_at` of null you actually need pinned down, or notes sug
 config is inconsistent — AND the answer changes what you do next. If tier 1 already answered the \
 question, stop there.
 
+Pass `profile_id` to check ONE profile — an rclone remote, an ssh host alias, a kubectl \
+context, a cloudflared origin certificate. For those tools the profile is the meaningful unit, \
+and 'is my legal remote still working' is answered by naming it. Omit it to check whatever the \
+tool treats as active. patchbay runs the tool's own check itself; it never asks you to run a \
+command for it.
+
 Returns a VerifyOutcome, discriminated by the `result` field:
 
 - 'valid' — the credential works right now.
@@ -329,10 +349,10 @@ error: `hint` may name a command for the human to run. Surface it and stop; retr
 change anything.")]
     async fn verify(
         &self,
-        Parameters(ToolParams { tool }): Parameters<ToolParams>,
+        Parameters(VerifyParams { tool, profile_id }): Parameters<VerifyParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let registry = self.registry.clone();
-        match offload(move || registry.verify(&tool)).await? {
+        match offload(move || registry.verify_profile(&tool, profile_id.as_deref())).await? {
             Ok(outcome) => Ok(json_ok(encode(&outcome)?)),
             Err(err) => Ok(tool_error(err)),
         }

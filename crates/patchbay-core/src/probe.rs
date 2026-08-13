@@ -30,7 +30,25 @@ pub trait Probe: Send + Sync {
     fn switch(&self, profile_id: &str) -> anyhow::Result<SwitchOutcome>;
 
     /// Tier 2: check the credential actually works.
+    ///
+    /// Where the tool has an active profile, prefer delegating to
+    /// [`Probe::verify_profile`] rather than refusing: "which one did you
+    /// mean" is a question patchbay can usually answer for itself.
     fn verify(&self) -> anyhow::Result<VerifyOutcome>;
+
+    /// Tier 2: check one specific profile.
+    ///
+    /// For several tools the meaningful unit is the profile, not the tool: an
+    /// rclone remote, an ssh host, a kubectl context. The default delegates to
+    /// [`Probe::verify`], which is right for tools where the distinction is
+    /// meaningless (one login, one answer).
+    ///
+    /// Implementors: run the check for `profile_id` yourself. Handing back a
+    /// command for the user to paste is not an answer — if a CLI has to be
+    /// invoked, patchbay invokes it.
+    fn verify_profile(&self, _profile_id: &str) -> anyhow::Result<VerifyOutcome> {
+        self.verify()
+    }
 
     /// Tier 2: report what the active credential is allowed to do.
     fn permissions(&self) -> anyhow::Result<PermissionsReport>;

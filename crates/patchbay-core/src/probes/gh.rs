@@ -16,7 +16,7 @@ use serde::Deserialize;
 use crate::paths::Paths;
 use crate::probe::{unknown_profile, unsupported_switch, unsupported_verify, Probe};
 use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
-use crate::util::{read_text, run};
+use crate::util::{read_text};
 
 pub struct GhProbe {
     paths: Paths,
@@ -191,7 +191,7 @@ impl Probe for GhProbe {
             ));
         }
 
-        let out = run(
+        let out = self.paths.run(
             "gh",
             &["auth", "switch", "--hostname", &host, "--user", &user],
         )?;
@@ -225,7 +225,7 @@ impl Probe for GhProbe {
                 Some("gh auth status --active"),
             ));
         }
-        let out = run("gh", &["auth", "status", "--active"])?;
+        let out = self.paths.run("gh", &["auth", "status", "--active"])?;
         Ok(if out.ok {
             VerifyOutcome::Valid {
                 tool: Self::TOOL.to_string(),
@@ -249,7 +249,7 @@ impl Probe for GhProbe {
                 Some("gh auth status --active"),
             ));
         }
-        let out = run("gh", &["auth", "status", "--active"])?;
+        let out = self.paths.run("gh", &["auth", "status", "--active"])?;
         if !out.ok {
             return Ok(PermissionsReport {
                 tool: Self::TOOL.to_string(),
