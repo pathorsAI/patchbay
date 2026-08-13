@@ -1188,6 +1188,119 @@ button {
   line-height: 1.55;
 }
 
+/* The view's one action sits at the far end of its own head, the way the
+   detail drawer's close button does. */
+.view-head > .action {
+  margin-left: auto;
+}
+
+/* ---------- add key ---------- */
+
+/* Reuses the detail drawer wholesale — same scrim, same panel, same sections.
+   Only the fields are new. */
+.detail-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+}
+
+.field-input {
+  width: 100%;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel-2);
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 12px;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.field-input::placeholder {
+  color: var(--muted);
+}
+
+.field-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.check {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--ink-2);
+}
+
+.check input {
+  margin: 2px 0 0;
+  accent-color: var(--accent);
+}
+
+/* ---------- removing a vault entry ---------- */
+
+/* Narrow, right-aligned, and last: the trash is an affordance on the row, not
+   a column of data. */
+.cell-actions {
+  width: 1%;
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* The confirm is a row of the same table rather than a dialog: it says what
+   removing does and does not do, in place, under the key it is about. */
+.confirm-row > td {
+  background: var(--panel-2);
+}
+
+.confirm {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.confirm-why {
+  flex: 1 1 260px;
+  min-width: 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--ink-2);
+}
+
+/* .row-action's shape, the risk palette: the one destructive button in the
+   panel, and it is never the resting state of a row. */
+.row-danger {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 1px 7px;
+  border: 1px solid var(--risk);
+  border-radius: 4px;
+  background: var(--risk-wash);
+  color: var(--risk);
+  font-family: var(--mono);
+  font-size: 10px;
+  cursor: pointer;
+  transition: border-color 90ms linear, color 90ms linear;
+}
+
+.row-danger:hover:not(:disabled) {
+  color: var(--ink);
+}
+
+.row-danger:disabled {
+  cursor: default;
+  color: var(--muted);
+  border-color: var(--line);
+  background: transparent;
+}
+
 /* Wide tables scroll inside their own frame; the pane never scrolls sideways. */
 .scroller {
   overflow-x: auto;
