@@ -363,14 +363,14 @@ mod tests {
         assert_eq!(idle.connection_state_at(now), ConnectionState::Disconnected);
 
         let empty = ToolStatus::empty("gcloud", true);
-        assert_eq!(empty.connection_state_at(now), ConnectionState::Disconnected);
+        assert_eq!(
+            empty.connection_state_at(now),
+            ConnectionState::Disconnected
+        );
 
         // An undated credential (gh keeps tokens in the keychain) still counts.
         let undated = status_with(Some("pathors"), vec![Profile::new("pathors")]);
-        assert_eq!(
-            undated.connection_state_at(now),
-            ConnectionState::Connected
-        );
+        assert_eq!(undated.connection_state_at(now), ConnectionState::Connected);
 
         let healthy = status_with(
             Some("pathors"),
