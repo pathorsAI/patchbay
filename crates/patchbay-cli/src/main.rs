@@ -6,12 +6,15 @@
 
 mod keys;
 mod mcp;
+mod migrate;
 mod render;
 
 use anyhow::Result;
 use chrono::Utc;
 use clap::{Parser, Subcommand};
-use patchbay_core::{PermissionsReport, Registry, SwitchOutcome, VerifyOutcome};
+use patchbay_core::{
+    KeyRegistry, McpClientRegistry, PermissionsReport, Registry, SwitchOutcome, VerifyOutcome,
+};
 
 use render::Styles;
 
@@ -33,6 +36,10 @@ enum Command {
         /// Emit the raw status list as JSON instead of a table.
         #[arg(long)]
         json: bool,
+        /// Compare this machine against another one's `manifest.json` and list
+        /// what differs, instead of showing the board.
+        #[arg(long, value_name = "MANIFEST")]
+        diff: Option<std::path::PathBuf>,
     },
     /// Switch a tool to another profile.
     Use {
@@ -65,6 +72,39 @@ enum Command {
         #[command(subcommand)]
         command: mcp::Command,
     },
+    /// Pack this machine's movable logins into one encrypted bundle.
+    Export {
+        #[arg(long, short)]
+        out: Option<std::path::PathBuf>,
+        /// Include vault secret values: bare for all, `--keys=a,b` for some.
+        #[arg(long, num_args = 0..=1, value_delimiter = ',', default_missing_value = "")]
+        keys: Option<Vec<String>>,
+        /// Write into a cloud-sync folder anyway.
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Restore a bundle onto this machine.
+    Import {
+        bundle: std::path::PathBuf,
+        /// Print the plan and write nothing.
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// What still needs doing on this machine to finish a move.
+    Plan {
+        /// Compare against a `manifest.json` from another machine.
+        #[arg(long, value_name = "FILE")]
+        manifest: Option<std::path::PathBuf>,
+        /// Show closed items too.
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() {
@@ -84,7 +124,18 @@ fn run() -> Result<i32> {
     let registry = Registry::detect()?;
 
     match cli.command {
-        Command::Status { json } => {
+        Command::Status { json, diff } => {
+            if let Some(manifest) = diff {
+                let vault = KeyRegistry::detect()?;
+                let clients = McpClientRegistry::with_paths(registry.paths().clone());
+                return migrate::print_status_diff(
+                    &registry,
+                    &vault,
+                    &clients,
+                    &manifest,
+                    &styles(),
+                );
+            }
             let statuses = registry.status_all();
             if json {
                 // Must stay machine-readable: JSON only, no ANSI, no extras.
@@ -137,6 +188,47 @@ fn run() -> Result<i32> {
         // Likewise the MCP board: these are other tools' config files, not
         // credential state, so it has its own registry too.
         Command::Mcp { command } => mcp::run(command, &styles()),
+        // Migration needs all three registries at once — the board, the vault
+        // and the MCP clients are all part of what moves — so its subcommands
+        // are flattened onto the top level and dispatched together.
+        Command::Export {
+            out,
+            keys,
+            force,
+            json,
+        } => migrate::run(
+            migrate::Command::Export {
+                out,
+                keys,
+                force,
+                json,
+            },
+            &styles(),
+        ),
+        Command::Import {
+            bundle,
+            dry_run,
+            json,
+        } => migrate::run(
+            migrate::Command::Import {
+                bundle,
+                dry_run,
+                json,
+            },
+            &styles(),
+        ),
+        Command::Plan {
+            manifest,
+            all,
+            json,
+        } => migrate::run(
+            migrate::Command::Plan {
+                manifest,
+                all,
+                json,
+            },
+            &styles(),
+        ),
     }
 }
 

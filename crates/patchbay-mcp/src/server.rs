@@ -102,7 +102,15 @@ their MCP servers. `list_mcp_clients` is cheap and safe. The other three modify 
 config, which takes effect on that tool's NEXT start, so say what you changed and that a restart \
 is needed. Confirm with the user before removing anything. Never write a secret into a server's \
 `env` or `headers` through these tools: those land in a plain-text config file. Reference an \
-environment variable name, or register the secret with `store_key`, instead.";
+environment variable name, or register the secret with `store_key`, instead.
+
+11. `plan_setup` and `mark_setup_done` are the fourth thing again: the checklist for finishing a \
+MOVE to a new machine, after `pb export` / `pb import` have carried whatever could be carried. \
+Work the list one item at a time; run only the items whose `auto` is true; hand every \
+`needs_browser` item to the human with the exact command rather than trying to drive a browser \
+login yourself; and re-check with `mark_setup_done` after each one, because patchbay re-probes the \
+tool instead of believing what you report. Stop when `complete` is true, and do not invent extra \
+setup work.";
 
 /// `{ "tool": "gcloud" }` — identifies one supported CLI.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -132,7 +140,9 @@ pub struct SwitchParams {
 /// probes re-read their files on every call, so the data is never stale.
 #[derive(Clone)]
 pub struct PatchbayServer {
-    registry: Arc<Registry>,
+    /// `pub(crate)` because the migration tools in [`crate::migrate`] need both
+    /// the probes and the `Paths` they were bound to.
+    pub(crate) registry: Arc<Registry>,
     /// The key vault. `pub(crate)` because its tools live in [`crate::keys`].
     pub(crate) keys: Arc<KeyRegistry>,
     /// The MCP client board. `pub(crate)` because its tools live in
@@ -147,10 +157,13 @@ impl PatchbayServer {
             registry: Arc::new(registry),
             keys: Arc::new(keys),
             clients: Arc::new(clients),
-            // Three routers, merged: connection tools here, vault tools in
-            // `keys.rs`, MCP client tools in `mcp_clients.rs`. Built once, not
-            // per request.
-            tool_router: Self::tool_router() + Self::keys_router() + Self::mcp_clients_router(),
+            // Four routers, merged: connection tools here, vault tools in
+            // `keys.rs`, MCP client tools in `mcp_clients.rs`, migration tools
+            // in `migrate.rs`. Built once, not per request.
+            tool_router: Self::tool_router()
+                + Self::keys_router()
+                + Self::mcp_clients_router()
+                + Self::migrate_router(),
         }
     }
 }

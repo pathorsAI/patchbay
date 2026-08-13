@@ -12,6 +12,7 @@
 
 mod keys;
 mod mcp_clients;
+mod migrate;
 mod server;
 
 use rmcp::transport::stdio;
