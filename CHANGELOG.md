@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **kubectl** — a `~/.kube/config` that is a *directory* of per-cluster
+  kubeconfigs (a common layout, and one kubectl itself chokes on) is now
+  scanned instead of reported as zero contexts. The `*.yaml`/`*.yml` files
+  directly inside it are merged first-file-wins, each context records the file
+  it came from, files that are not kubeconfigs are skipped by name, and the
+  note now spells out the `export KUBECONFIG=…` that makes a shell agree.
+  Because every file carries its own `current-context`, no active context is
+  reported unless exactly one file defines contexts.
+
 ## [0.1.0] - 2026-08-13
 
 First public cut. macOS only, and deliberately narrow: read local state, report

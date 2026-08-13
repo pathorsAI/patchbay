@@ -1,11 +1,17 @@
 //! `kubectl` — contexts from the kubeconfig.
 //!
-//! Reads every file in `$KUBECONFIG` (`:`-separated, merged by kubectl) or
-//! `~/.kube/config` when unset. Contexts have no expiry of their own: a context
-//! points at a user, and that user is often an `exec` credential plugin
-//! (`gke-gcloud-auth-plugin`, `aws eks get-token`) that mints short-lived
-//! tokens on demand. That indirection is recorded in `meta.auth` because it is
-//! exactly what breaks when you switch the *other* tool's profile.
+//! Resolution order: every file in `$KUBECONFIG` (`:`-separated, merged by
+//! kubectl), else `~/.kube/config` as a file, else — the pattern this machine
+//! and plenty of others use — `~/.kube/config` as a *directory* of per-cluster
+//! yaml files, which is scanned non-recursively and merged the same way.
+//!
+//! Contexts have no expiry of their own: a context points at a user, and that
+//! user is often an `exec` credential plugin (`gke-gcloud-auth-plugin`, `aws
+//! eks get-token`) that mints short-lived tokens on demand. That indirection is
+//! recorded in `meta.auth` because it is exactly what breaks when you switch
+//! the *other* tool's profile.
+
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -82,6 +88,37 @@ impl KubectlProbe {
     }
 }
 
+/// One `~/.kube/config`-is-a-directory expansion, kept so the note at the end
+/// can name the files that actually parsed.
+struct DirScan {
+    dir: PathBuf,
+    /// Files that parsed as YAML, in scan order.
+    parsed: Vec<PathBuf>,
+    /// Of those, the ones that defined at least one context, with their own
+    /// `current-context`.
+    with_contexts: Vec<(PathBuf, Option<String>)>,
+}
+
+/// The `*.yaml`/`*.yml` files directly inside `dir`, sorted by name so the
+/// first-file-wins merge is deterministic. Anything else in there — the
+/// `gke_gcloud_auth_plugin_cache` blob, lock files, subdirectories — is not a
+/// kubeconfig and is left alone.
+fn kubeconfig_files_in(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|p| p.is_file())
+        .filter(|p| {
+            matches!(
+                p.extension().and_then(|e| e.to_str()),
+                Some("yaml") | Some("yml")
+            )
+        })
+        .collect();
+    files.sort();
+    Ok(files)
+}
+
 impl Probe for KubectlProbe {
     fn tool(&self) -> &'static str {
         Self::TOOL
@@ -92,17 +129,40 @@ impl Probe for KubectlProbe {
         let installed = self.paths.has_binary("kubectl") || candidates.iter().any(|p| p.exists());
         let mut status = ToolStatus::empty(Self::TOOL, installed);
 
+        // A real trap seen in the wild: ~/.kube/config exists but is a
+        // *directory* full of per-cluster yaml files. kubectl itself fails on
+        // that, but the contexts are right there — read them rather than
+        // reporting zero, and tell the operator how to make their shell agree.
+        let mut sources: Vec<(PathBuf, Option<usize>)> = Vec::new();
+        let mut scans: Vec<DirScan> = Vec::new();
         for path in &candidates {
-            // A real trap seen in the wild: ~/.kube/config exists but is a
-            // *directory* full of per-cluster yaml files, which makes every
-            // kubectl call fail until KUBECONFIG is set.
             if path.is_dir() {
-                status.note(format!(
-                    "{} is a directory, not a kubeconfig file; kubectl will fail until KUBECONFIG points at the files inside it",
-                    path.display()
-                ));
-                continue;
+                match kubeconfig_files_in(path) {
+                    Ok(files) => {
+                        let index = scans.len();
+                        scans.push(DirScan {
+                            dir: path.clone(),
+                            parsed: Vec::new(),
+                            with_contexts: Vec::new(),
+                        });
+                        sources.extend(files.into_iter().map(|f| (f, Some(index))));
+                    }
+                    Err(e) => status.note(format!(
+                        "{} is a directory that could not be listed ({e})",
+                        path.display()
+                    )),
+                }
+            } else {
+                sources.push((path.clone(), None));
             }
+        }
+
+        // `current-context` from the first file that names one — but only for
+        // files kubectl would itself merge. Directory scans decide separately.
+        let mut active: Option<String> = None;
+
+        for (path, scan) in &sources {
+            let path = path.as_path();
             let text = match read_text(path) {
                 Ok(Some(text)) => text,
                 Ok(None) => continue,
@@ -118,6 +178,24 @@ impl Probe for KubectlProbe {
                     continue;
                 }
             };
+
+            let current = config.current_context.clone().filter(|c| !c.is_empty());
+            let has_contexts = !config.contexts.is_empty();
+            match scan {
+                Some(index) => {
+                    scans[*index].parsed.push(path.to_path_buf());
+                    if has_contexts {
+                        scans[*index]
+                            .with_contexts
+                            .push((path.to_path_buf(), current));
+                    }
+                }
+                None => {
+                    if active.is_none() {
+                        active = current;
+                    }
+                }
+            }
 
             for named in config.contexts {
                 if status.profiles.iter().any(|p| p.id == named.name) {
@@ -155,11 +233,48 @@ impl Probe for KubectlProbe {
                         .with_meta("source", path.display().to_string()),
                 );
             }
+        }
 
-            if status.active.is_none() {
-                status.active = config.current_context.filter(|c| !c.is_empty());
+        for scan in &scans {
+            match scan.with_contexts.len() {
+                // Nothing usable in there: the old failure mode, unchanged.
+                0 => status.note(format!(
+                    "{} is a directory, not a kubeconfig file, and no *.yaml/*.yml file inside it defines any context; kubectl will fail until KUBECONFIG points at a real config",
+                    scan.dir.display()
+                )),
+                // Exactly one file carries contexts, so its own
+                // `current-context` is unambiguously the active one.
+                1 => {
+                    if active.is_none() {
+                        active = scan.with_contexts[0].1.clone();
+                    }
+                }
+                // Each file carries its own `current-context`, so there is no
+                // single active context to report.
+                _ => {
+                    active = None;
+                    status.note(
+                        "multiple kubeconfig files; no single current context (set KUBECONFIG to choose)"
+                            .to_string(),
+                    );
+                }
+            }
+
+            if !scan.with_contexts.is_empty() {
+                let list: Vec<String> = scan
+                    .parsed
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect();
+                status.note(format!(
+                    "{} is a directory of kubeconfigs, not a kubeconfig file; patchbay merged them, but kubectl in your shell will not until you set: export KUBECONFIG={}",
+                    scan.dir.display(),
+                    list.join(":")
+                ));
             }
         }
+
+        status.active = active;
 
         if let Some(active) = &status.active {
             if !status.profiles.iter().any(|p| &p.id == active) {
@@ -350,7 +465,7 @@ users:
     }
 
     #[test]
-    fn test_config_path_that_is_a_directory_is_called_out() {
+    fn test_config_path_that_is_an_empty_directory_is_called_out() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join(".kube/config")).unwrap();
         let status = KubectlProbe::new(Paths::for_test(dir.path()))
@@ -359,6 +474,114 @@ users:
         assert!(status.installed);
         assert!(status.profiles.is_empty());
         assert!(status.notes.iter().any(|n| n.contains("is a directory")));
+    }
+
+    /// The layout on a real machine: `~/.kube/config` is a directory of
+    /// per-cluster kubeconfigs next to files that are not kubeconfigs at all.
+    fn config_dir_fixture() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join(".kube/config");
+        fs::create_dir_all(&config).unwrap();
+        fs::write(
+            config.join("pathors-tw.yaml"),
+            "current-context: tw\ncontexts:\n  - name: tw\n    context:\n      cluster: gke-tw\n      user: gke-user\nusers:\n  - name: gke-user\n    user:\n      exec:\n        command: gke-gcloud-auth-plugin\n",
+        )
+        .unwrap();
+        fs::write(
+            config.join("llm-cluster.yaml"),
+            "current-context: llm\ncontexts:\n  - name: llm\n    context:\n      cluster: llm\n      user: llm-user\n  - name: tw\n    context:\n      cluster: shadowed\n",
+        )
+        .unwrap();
+        // Not a kubeconfig, and not even a yaml file: gcloud drops it there.
+        fs::write(
+            config.join("gke_gcloud_auth_plugin_cache"),
+            r#"{"current_context":"tw","access_token":"ya29.SECRET"}"#,
+        )
+        .unwrap();
+        // A yaml file that is not a kubeconfig at all.
+        fs::write(config.join("scratch.yaml"), "\tnot: [valid yaml").unwrap();
+        (dir, config)
+    }
+
+    #[test]
+    fn test_config_directory_is_scanned_and_merged() {
+        let (dir, config) = config_dir_fixture();
+        let status = KubectlProbe::new(Paths::for_test(dir.path()))
+            .status()
+            .unwrap();
+
+        // Sorted by filename, so llm-cluster.yaml is merged first and wins the
+        // duplicate `tw` context.
+        let ids: Vec<_> = status.profiles.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, vec!["llm", "tw"]);
+        assert_eq!(status.profiles[1].meta["cluster"], "shadowed");
+        assert_eq!(
+            status.profiles[0].meta["source"],
+            config.join("llm-cluster.yaml").display().to_string()
+        );
+        assert_eq!(
+            status.profiles[1].meta["source"],
+            config.join("llm-cluster.yaml").display().to_string()
+        );
+
+        // Two files carry contexts, each with its own current-context.
+        assert!(status.active.is_none());
+        assert!(status.notes.iter().any(|n| n
+            == "multiple kubeconfig files; no single current context (set KUBECONFIG to choose)"));
+
+        // The junk yaml is named and skipped; the non-yaml cache file is not
+        // touched at all, so its token can never leak into the report.
+        assert!(status
+            .notes
+            .iter()
+            .any(|n| n.contains("scratch.yaml") && n.contains("not valid YAML")));
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(!json.contains("ya29.SECRET"), "{json}");
+        assert!(!json.contains("gke_gcloud_auth_plugin_cache"), "{json}");
+
+        // And the fix for the shell is spelled out, listing only what parsed.
+        let hint = status
+            .notes
+            .iter()
+            .find(|n| n.contains("export KUBECONFIG="))
+            .expect("expected a KUBECONFIG hint");
+        assert!(hint.contains(&format!(
+            "export KUBECONFIG={}:{}",
+            config.join("llm-cluster.yaml").display(),
+            config.join("pathors-tw.yaml").display()
+        )));
+    }
+
+    #[test]
+    fn test_config_directory_with_one_kubeconfig_keeps_its_current_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join(".kube/config");
+        fs::create_dir_all(&config).unwrap();
+        fs::write(config.join("only.yaml"), CONFIG).unwrap();
+        fs::write(config.join("gke_gcloud_auth_plugin_cache"), "{}").unwrap();
+
+        let status = KubectlProbe::new(Paths::for_test(dir.path()))
+            .status()
+            .unwrap();
+        let ids: Vec<_> = status.profiles.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, vec!["prod", "local"]);
+        assert_eq!(status.active.as_deref(), Some("prod"));
+        assert_eq!(
+            status.profiles[0].meta["source"],
+            config.join("only.yaml").display().to_string()
+        );
+        assert!(!status
+            .notes
+            .iter()
+            .any(|n| n.contains("no single current context")));
+    }
+
+    #[test]
+    fn test_a_real_config_file_is_preferred_over_directory_scanning() {
+        let (_dir, home) = fixture(".kube/config", CONFIG);
+        let status = KubectlProbe::new(Paths::for_test(&home)).status().unwrap();
+        assert_eq!(status.active.as_deref(), Some("prod"));
+        assert!(!status.notes.iter().any(|n| n.contains("is a directory")));
     }
 
     #[test]
