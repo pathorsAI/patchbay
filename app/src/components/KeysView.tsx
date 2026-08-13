@@ -86,7 +86,7 @@ export function KeysView() {
         <span className="view-sub">
           {rows.length} {rows.length === 1 ? "key" : "keys"} · metadata only
         </span>
-        <button className="action" onClick={() => setAdding(true)}>
+        <button type="button" className="action" onClick={() => setAdding(true)}>
           add key
         </button>
       </div>
@@ -112,7 +112,7 @@ export function KeysView() {
             provider key an agent was handed. Metadata lives in a JSON file; the value goes straight
             to the OS keychain, and nothing in this window can read it back.
           </p>
-          <button className="action" onClick={() => setAdding(true)}>
+          <button type="button" className="action" onClick={() => setAdding(true)}>
             add key
           </button>
           <p className="muted small vault-blurb">
@@ -155,6 +155,7 @@ export function KeysView() {
                     <td className="cell-purpose">{k.purpose ?? <span className="muted">—</span>}</td>
                     <td className="cell-actions">
                       <button
+                        type="button"
                         className="row-action"
                         onClick={() => setConfirming(confirming === k.id ? null : k.id)}
                         disabled={removing !== null}
@@ -174,6 +175,7 @@ export function KeysView() {
                             credential itself keeps working — revoke it at the provider.
                           </span>
                           <button
+                            type="button"
                             className="row-action"
                             onClick={() => setConfirming(null)}
                             disabled={removing === k.id}
@@ -181,6 +183,7 @@ export function KeysView() {
                             cancel
                           </button>
                           <button
+                            type="button"
                             className="row-danger"
                             onClick={() => void remove(k.id)}
                             disabled={removing === k.id}
@@ -220,10 +223,10 @@ export function KeysView() {
 function AddKeyForm({
   onClose,
   onAdded,
-}: {
+}: Readonly<{
   onClose: () => void;
   onAdded: (row: KeyRow) => void | Promise<void>;
-}) {
+}>) {
   const [id, setId] = useState("");
   const [provider, setProvider] = useState("");
   const [label, setLabel] = useState("");
@@ -281,14 +284,22 @@ function AddKeyForm({
 
   return (
     <>
-      <div className="scrim" onClick={onClose} />
-      <aside className="detail" role="dialog" aria-label="add a key to the vault">
+      {/* Click-outside is a real button, not a div with a handler: it is a
+          control, so it answers to the keyboard and screen readers like one.
+          `.scrim` resets a button's chrome, and the div ToolDetail uses is
+          unaffected by the reset. */}
+      <button type="button" className="scrim" aria-label="Close" onClick={onClose} />
+      {/* Native <dialog>, so the semantics come from the element rather than a
+          hand-written role. Held open rather than shown with `showModal()`:
+          the top layer would put the drawer above the scrim's own stacking and
+          bring the UA's ::backdrop with it, and the panel already has a scrim. */}
+      <dialog open className="detail" aria-label="add a key to the vault">
         <header className="detail-head">
           <div className="detail-title">
             <h2 className="tool">add key</h2>
             <span className="detail-sub">metadata to keys.json · value to the OS keychain</span>
           </div>
-          <button className="action" onClick={onClose} aria-label="close">
+          <button type="button" className="action" onClick={onClose} aria-label="close">
             close
           </button>
         </header>
@@ -429,8 +440,8 @@ function AddKeyForm({
                   onChange={(e) => setOverwrite(e.target.checked)}
                 />
                 <span>
-                  rotating — replace the key already registered under this id
-                  <span className="muted"> (its registration date becomes today)</span>
+                  rotating — replace the key already registered under this id{" "}
+                  <span className="muted">(its registration date becomes today)</span>
                 </span>
               </label>
             </>
@@ -460,7 +471,7 @@ function AddKeyForm({
             </button>
           </div>
         </form>
-      </aside>
+      </dialog>
     </>
   );
 }

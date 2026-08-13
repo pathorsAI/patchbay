@@ -12,7 +12,7 @@
  */
 
 /** Registered vault keys. */
-export function KeyGlyph({ size = 11 }: { size?: number }) {
+export function KeyGlyph({ size = 11 }: Readonly<{ size?: number }>) {
   return (
     <svg
       className="glyph-svg"
@@ -36,7 +36,7 @@ export function KeyGlyph({ size = 11 }: { size?: number }) {
 /** Remove a vault entry. Drawn for the same reason as the others: 🗑 is an
  *  emoji on some machines and a tofu box on others, and this one sits in a
  *  table row where a colour surprise would read as an error state. */
-export function TrashGlyph({ size = 11 }: { size?: number }) {
+export function TrashGlyph({ size = 11 }: Readonly<{ size?: number }>) {
   return (
     <svg
       className="glyph-svg"
@@ -59,7 +59,7 @@ export function TrashGlyph({ size = 11 }: { size?: number }) {
 }
 
 /** The MCP servers-against-clients matrix. */
-export function MatrixGlyph({ size = 11 }: { size?: number }) {
+export function MatrixGlyph({ size = 11 }: Readonly<{ size?: number }>) {
   return (
     <svg
       className="glyph-svg"

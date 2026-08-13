@@ -719,10 +719,25 @@ button {
 
 /* ---------- tool detail ---------- */
 
+/* A wash over the board while a drawer is open. The add-key drawer's scrim is
+   a real <button> — click-outside is a control, so it answers to the keyboard
+   too — hence the button chrome is reset away here. A plain <div> with this
+   class is unaffected by the reset and renders exactly as before. */
 .scrim {
   position: fixed;
   inset: 0;
+  /* Explicit, because a <button> resolves `width: auto` from its content
+     rather than from its offsets the way a <div> does. */
+  width: 100%;
+  height: 100%;
+  display: block;
+  margin: 0;
+  padding: 0;
+  border: 0;
   background: rgba(0, 0, 0, 0.38);
+  cursor: default;
+  -webkit-appearance: none;
+  appearance: none;
 }
 
 .detail {
@@ -737,6 +752,26 @@ button {
   padding: 14px 16px 24px;
   overflow-y: auto;
   background: var(--panel);
+  border-left: 1px solid var(--line);
+}
+
+/* The add-key drawer is a native <dialog> so its semantics come from the
+   element. A UA-styled dialog is a centred, fit-content box with its own
+   border and canvas colours — none of which a full-height side panel wants,
+   and its `max-width`/`max-height` would shrink it outright. Reset back to
+   exactly what `.detail` describes; nothing here is new styling. */
+dialog.detail {
+  margin: 0;
+  /* The one that bites: a UA dialog sets `inset-inline-start: 0`, which in an
+     LTR window is `left: 0` — and left wins over right when a fixed box with a
+     width is over-constrained, so without this the drawer flies to the far
+     side of the window. */
+  left: auto;
+  height: auto;
+  max-width: none;
+  max-height: none;
+  color: inherit;
+  border: 0;
   border-left: 1px solid var(--line);
 }
 
