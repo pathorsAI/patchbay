@@ -35,10 +35,9 @@ use serde_json::{Map, Value};
 use toml_edit::{DocumentMut, Item, Table};
 
 use crate::paths::Paths;
-
-/// Appended to a config path to make its rolling backup. One generation only:
-/// the point is an undo for the write patchbay just did, not an archive.
-const BACKUP_SUFFIX: &str = ".patchbay-bak";
+// The write-safety machinery this module established now lives in `util`, so
+// the probes that edit another tool's config can use the same three steps.
+use crate::util::{backup, serialize_json_preserving_style, write_atomic};
 
 // ---------------------------------------------------------------------------
 // model
@@ -934,7 +933,7 @@ fn json_upsert(
     // position, so an overwrite does not reshuffle the file.
     map.insert(name.to_string(), entry);
 
-    Ok(serialize_json(&root, text))
+    Ok(serialize_json_preserving_style(&root, text))
 }
 
 fn json_remove(
@@ -962,7 +961,7 @@ fn json_remove(
         }
         anyhow::bail!("{label} has no MCP server called `{name}`");
     }
-    Ok(serialize_json(&root, Some(text)))
+    Ok(serialize_json_preserving_style(&root, Some(text)))
 }
 
 fn in_project_scope(root: &Value, dialect: JsonDialect, name: &str) -> bool {
@@ -977,22 +976,6 @@ fn in_project_scope(root: &Value, dialect: JsonDialect, name: &str) -> bool {
             })
         })
         .unwrap_or(false)
-}
-
-/// Serialize back out, matching the indentation the file already used. Clients
-/// write these files themselves; handing one back a two-space file as four-space
-/// makes a diff nobody asked for.
-fn serialize_json(root: &Value, original: Option<&str>) -> String {
-    let compact = original.is_some_and(|text| !text.contains('\n') && text.len() > 2);
-    let mut body = if compact {
-        serde_json::to_string(root).unwrap_or_default()
-    } else {
-        serde_json::to_string_pretty(root).unwrap_or_default()
-    };
-    if !compact {
-        body.push('\n');
-    }
-    body
 }
 
 // ---------------------------------------------------------------------------
@@ -1204,75 +1187,10 @@ fn codex_remove(text: &str, name: &str, label: &str) -> anyhow::Result<String> {
     Ok(doc.to_string())
 }
 
-// ---------------------------------------------------------------------------
-// file plumbing
-// ---------------------------------------------------------------------------
-
-/// `<path>.patchbay-bak`. Suffix, not extension: `mcp.json.patchbay-bak` keeps
-/// the original name visible, and `with_extension` would eat the `.json`.
-pub fn backup_path(path: &Path) -> PathBuf {
-    let mut name = path.as_os_str().to_os_string();
-    name.push(BACKUP_SUFFIX);
-    PathBuf::from(name)
-}
-
-/// Copy the file aside before it is modified. A single rolling generation: the
-/// undo for the write about to happen.
-fn backup(path: &Path) -> anyhow::Result<Option<PathBuf>> {
-    if !path.is_file() {
-        return Ok(None);
-    }
-    let dest = backup_path(path);
-    std::fs::copy(path, &dest).map_err(|e| {
-        anyhow::anyhow!(
-            "could not back {} up to {}: {e}; nothing was modified",
-            path.display(),
-            dest.display()
-        )
-    })?;
-    Ok(Some(dest))
-}
-
-/// Temp file in the same directory, then rename. A crash mid-write leaves the
-/// original untouched rather than a truncated config no client can parse.
-fn write_atomic(path: &Path, body: &str) -> anyhow::Result<()> {
-    let dir = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", path.display()))?;
-    std::fs::create_dir_all(dir)
-        .map_err(|e| anyhow::anyhow!("could not create {}: {e}", dir.display()))?;
-
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| anyhow::anyhow!("{} has no file name", path.display()))?
-        .to_string_lossy()
-        .into_owned();
-    let tmp = dir.join(format!(".{file_name}.patchbay-tmp"));
-
-    std::fs::write(&tmp, body)
-        .map_err(|e| anyhow::anyhow!("could not write {}: {e}", tmp.display()))?;
-
-    // Keep the file's own permissions; these configs hold API keys, and a new
-    // one should not be born world-readable.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(path)
-            .map(|m| m.permissions().mode() & 0o777)
-            .unwrap_or(0o600);
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))
-            .map_err(|e| anyhow::anyhow!("could not chmod {}: {e}", tmp.display()))?;
-    }
-
-    std::fs::rename(&tmp, path).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        anyhow::anyhow!("could not replace {}: {e}", path.display())
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::backup_path;
 
     /// A fixture home with whichever client files a test needs. Nothing here
     /// ever touches the real `$HOME`.
@@ -2249,17 +2167,5 @@ trust_level = "trusted"
         assert_eq!(spec.env_keys(), vec!["TOKEN"]);
         assert_eq!(spec.header_keys(), vec!["Authorization"]);
         assert!(!spec.summary().contains("secret"));
-    }
-
-    #[test]
-    fn test_backup_path_keeps_the_original_name_visible() {
-        assert_eq!(
-            backup_path(Path::new("/a/mcp.json")),
-            PathBuf::from("/a/mcp.json.patchbay-bak")
-        );
-        assert_eq!(
-            backup_path(Path::new("/a/config.toml")),
-            PathBuf::from("/a/config.toml.patchbay-bak")
-        );
     }
 }

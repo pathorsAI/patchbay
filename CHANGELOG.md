@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`pb use infisical <email>`** — the Infisical CLI's `user switch` is an
+  arrow-key picker with no non-interactive form, so patchbay makes the same
+  change itself: it repoints `loggedInUserEmail` and `LoggedInUserDomain` at one
+  of the accounts already in `loggedInUsers`. Switching to an email that has
+  never logged in is refused with the list of ones that have. No credential
+  moves — every user's JWT stays in the vault backend, so the switch is followed
+  by a note to run `infisical login status` if the JWT's freshness matters.
+
 - **MCP client management** — one board for the MCP servers registered across
   the AI clients on this machine: Claude Code (`~/.claude.json`, user and
   project scopes), Claude Desktop, Cursor, Codex CLI (`config.toml`), Windsurf
@@ -27,6 +35,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The board reports `env_keys`, `header_keys` and an argument *count* — never
   values, since those fields routinely hold API keys. A `copy` does carry values
   (a server that cannot authenticate is useless) and names what travelled.
+
+### Changed
+
+- `patchbay_core::util` now owns the write-safety machinery MCP client
+  management introduced — `backup`, `write_atomic` and a new
+  `serialize_json_preserving_style` — so every probe that edits another tool's
+  config gets the same rolling `.patchbay-bak`, the same atomic rename and the
+  same house style on the way out. The style part is not cosmetic: the Infisical
+  CLI writes one compact line with `": "` separators, and re-serializing it
+  serde_json's way would rewrite every byte of the file for a one-field change.
 
 ### Fixed
 

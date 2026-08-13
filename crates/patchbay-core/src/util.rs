@@ -1,7 +1,8 @@
 //! Small shared helpers: tolerant file reads, a minimal INI parser, timestamp
-//! parsing, and the one place where patchbay shells out.
+//! parsing, the one place where patchbay shells out, and the write-safety
+//! machinery every mutation of somebody else's config file goes through.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
@@ -167,9 +168,288 @@ pub fn run(bin: &str, args: &[&str]) -> anyhow::Result<CmdOutput> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// writing other tools' config files
+// ---------------------------------------------------------------------------
+//
+// Three steps, in this order, for every mutation patchbay makes to a file it
+// does not own:
+//
+//   1. a rolling backup — the file is copied to `<path>.patchbay-bak` first;
+//   2. parse–modify–serialize by the caller, never a rewrite from a template,
+//      so unknown keys and other entries survive;
+//   3. an atomic write: temp file in the same directory, then rename.
+//
+// Step 2 is the caller's job and the one that cannot be shared: every format
+// differs. Steps 1 and 3 are identical everywhere, and live here.
+
+/// Appended to a config path to make its rolling backup. One generation only:
+/// the point is an undo for the write patchbay just did, not an archive.
+const BACKUP_SUFFIX: &str = ".patchbay-bak";
+
+/// `<path>.patchbay-bak`. Suffix, not extension: `mcp.json.patchbay-bak` keeps
+/// the original name visible, and `with_extension` would eat the `.json`.
+pub fn backup_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(BACKUP_SUFFIX);
+    PathBuf::from(name)
+}
+
+/// Copy the file aside before it is modified. A single rolling generation: the
+/// undo for the write about to happen. `Ok(None)` when there was no file yet.
+pub fn backup(path: &Path) -> anyhow::Result<Option<PathBuf>> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let dest = backup_path(path);
+    std::fs::copy(path, &dest).map_err(|e| {
+        anyhow::anyhow!(
+            "could not back {} up to {}: {e}; nothing was modified",
+            path.display(),
+            dest.display()
+        )
+    })?;
+    Ok(Some(dest))
+}
+
+/// Temp file in the same directory, then rename. A crash mid-write leaves the
+/// original untouched rather than a truncated config no tool can parse.
+pub fn write_atomic(path: &Path, body: &str) -> anyhow::Result<()> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", path.display()))?;
+    std::fs::create_dir_all(dir)
+        .map_err(|e| anyhow::anyhow!("could not create {}: {e}", dir.display()))?;
+
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("{} has no file name", path.display()))?
+        .to_string_lossy()
+        .into_owned();
+    let tmp = dir.join(format!(".{file_name}.patchbay-tmp"));
+
+    std::fs::write(&tmp, body)
+        .map_err(|e| anyhow::anyhow!("could not write {}: {e}", tmp.display()))?;
+
+    // Keep the file's own permissions; these configs hold API keys and vault
+    // passphrases, and a new one should not be born world-readable.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path)
+            .map(|m| m.permissions().mode() & 0o777)
+            .unwrap_or(0o600);
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))
+            .map_err(|e| anyhow::anyhow!("could not chmod {}: {e}", tmp.display()))?;
+    }
+
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        anyhow::anyhow!("could not replace {}: {e}", path.display())
+    })
+}
+
+/// Serialize JSON back out in the shape the file already had.
+///
+/// Tools write these files themselves, and each has a house style: Claude Code
+/// pretty-prints, the Infisical CLI writes one compact line with `": "` and
+/// `", "` separators and no trailing newline. Handing either one back in the
+/// other's format makes a whole-file diff out of a two-field change — which
+/// buries the edit patchbay actually made and looks, to anyone reading
+/// `git diff` or the backup, like patchbay rewrote the lot.
+///
+/// `original` is the text as read; `None` for a file being created, which gets
+/// the pretty form.
+pub fn serialize_json_preserving_style(root: &serde_json::Value, original: Option<&str>) -> String {
+    match JsonStyle::of(original) {
+        JsonStyle::Pretty => {
+            let mut body = serde_json::to_string_pretty(root).unwrap_or_default();
+            body.push('\n');
+            body
+        }
+        JsonStyle::Compact => serde_json::to_string(root).unwrap_or_default(),
+        JsonStyle::CompactSpaced => {
+            let mut out = Vec::new();
+            let mut ser = serde_json::Serializer::with_formatter(&mut out, SpacedCompactFormatter);
+            match serde::Serialize::serialize(root, &mut ser) {
+                Ok(()) => String::from_utf8(out).unwrap_or_default(),
+                // Unreachable for an in-memory Value; fall back rather than panic.
+                Err(_) => serde_json::to_string(root).unwrap_or_default(),
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonStyle {
+    /// Indented, one key per line, trailing newline.
+    Pretty,
+    /// One line, `{"a":1}`.
+    Compact,
+    /// One line, `{"a": 1, "b": 2}` — what Go's encoder with `SetIndent("","")`
+    /// and several CLIs produce.
+    CompactSpaced,
+}
+
+impl JsonStyle {
+    fn of(original: Option<&str>) -> Self {
+        let Some(text) = original else {
+            return Self::Pretty;
+        };
+        // A one-key file is not evidence of a house style; `{}` even less so.
+        if text.trim_end().contains('\n') || text.len() <= 2 {
+            return Self::Pretty;
+        }
+        // Majority vote over the object separators actually used, so a `": "`
+        // sitting inside a string value cannot swing the whole file.
+        let spaced = text.matches("\": \"").count() + text.matches("\": ").count();
+        let tight = text.matches("\":\"").count() + text.matches("\":").count();
+        if spaced > tight - spaced.min(tight) {
+            Self::CompactSpaced
+        } else {
+            Self::Compact
+        }
+    }
+}
+
+/// serde_json's compact form writes `{"a":1}`. Tools that write `{"a": 1}` on
+/// one line need this formatter, or every byte of their file changes.
+struct SpacedCompactFormatter;
+
+impl serde_json::ser::Formatter for SpacedCompactFormatter {
+    fn begin_object_key<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(b", ")
+        }
+    }
+
+    fn begin_object_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+    ) -> std::io::Result<()> {
+        writer.write_all(b": ")
+    }
+
+    fn begin_array_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(b", ")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_serialize_json_keeps_the_files_own_shape() {
+        let value: serde_json::Value = serde_json::from_str(r#"{"a":"x","b":"y"}"#).unwrap();
+
+        // A tight one-liner stays tight, with no trailing newline.
+        let out = serialize_json_preserving_style(&value, Some(r#"{"a":"x","b":"y"}"#));
+        assert_eq!(out, r#"{"a":"x","b":"y"}"#);
+
+        // A spaced one-liner keeps its spaces.
+        let out = serialize_json_preserving_style(&value, Some(r#"{"a": "x", "b": "y"}"#));
+        assert_eq!(out, r#"{"a": "x", "b": "y"}"#);
+
+        // A pretty file stays pretty, with the trailing newline it had.
+        let out = serialize_json_preserving_style(&value, Some("{\n  \"a\": \"x\"\n}\n"));
+        assert!(out.contains("\n  \"a\": \"x\""), "{out}");
+        assert!(out.ends_with('\n'));
+
+        // A file being created gets the readable form.
+        assert!(serialize_json_preserving_style(&value, None).ends_with("}\n"));
+        // An empty or trivial original is not evidence of a compact house style.
+        assert!(serialize_json_preserving_style(&value, Some("{}")).ends_with("}\n"));
+    }
+
+    #[test]
+    fn test_spaced_compact_round_trips_a_real_infisical_config() {
+        // The exact shape the Infisical CLI writes: one line, `": "` and `", "`
+        // separators, a nested array of objects, no trailing newline.
+        let original = r#"{"loggedInUserEmail": "a@example.com", "LoggedInUserDomain": "https://app.infisical.com/api", "loggedInUsers": [{"email": "a@example.com", "domain": "https://app.infisical.com/api"}], "vaultBackendType": "file", "vaultBackendPassphrase": "ZmFrZQ=="}"#;
+        let value: serde_json::Value = serde_json::from_str(original).unwrap();
+        // Untouched in, byte-identical out.
+        assert_eq!(
+            serialize_json_preserving_style(&value, Some(original)),
+            original
+        );
+    }
+
+    #[test]
+    fn test_a_colon_space_inside_a_value_does_not_flip_the_style() {
+        // Every separator here is tight; the `": "` lives inside a URL-ish
+        // string. One occurrence must not outvote three real separators.
+        let original = r#"{"a":"x: y","b":"z","c":"w"}"#;
+        let value: serde_json::Value = serde_json::from_str(original).unwrap();
+        assert_eq!(
+            serialize_json_preserving_style(&value, Some(original)),
+            original
+        );
+    }
+
+    #[test]
+    fn test_backup_path_keeps_the_original_name_visible() {
+        assert_eq!(
+            backup_path(Path::new("/a/mcp.json")),
+            PathBuf::from("/a/mcp.json.patchbay-bak")
+        );
+        assert_eq!(
+            backup_path(Path::new("/a/config.toml")),
+            PathBuf::from("/a/config.toml.patchbay-bak")
+        );
+    }
+
+    #[test]
+    fn test_backup_of_a_missing_file_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(backup(&dir.path().join("nope.json")).unwrap(), None);
+    }
+
+    #[test]
+    fn test_write_atomic_leaves_no_temp_file_and_keeps_the_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, "old").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let saved = backup(&path).unwrap().unwrap();
+        write_atomic(&path, "new").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        assert_eq!(std::fs::read_to_string(&saved).unwrap(), "old");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "mode was {:o}", mode & 0o777);
+        }
+        // The temp file is a rename source, never a leftover.
+        let stray: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("patchbay-tmp"))
+            .collect();
+        assert!(stray.is_empty(), "left a temp file behind: {stray:?}");
+    }
 
     #[test]
     fn test_ini_parses_sections_and_keeps_json_values_intact() {
