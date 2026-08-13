@@ -31,4 +31,7 @@ pub mod util;
 pub use paths::Paths;
 pub use probe::Probe;
 pub use registry::Registry;
-pub use types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
+pub use types::{
+    ConnectionState, PermissionsReport, Profile, SwitchOutcome, ToolCategory, ToolStatus,
+    VerifyOutcome,
+};

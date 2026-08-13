@@ -153,9 +153,16 @@ from the conversation, from earlier in this session, or from what a command 'usu
 the active profile is machine-global state that the user or another process may have changed \
 since you last looked.
 
-Returns a JSON array of ToolStatus objects: { tool, installed, profiles: [{ id, label, \
-expires_at, meta }], active, notes }.
+Returns a JSON array of ToolStatus objects: { tool, installed, category, profiles: [{ id, label, \
+expires_at, meta }], active, notes, connection_state }.
 
+- `category` groups the board: cloud (gcloud, aws, az), code (gh), secrets (infisical), \
+cluster (kubectl), edge (wrangler), storage (rclone), other. Filter on it when the user's \
+request is about a class of tool ('am I logged into my cloud accounts?') rather than a named one.
+- `connection_state` is patchbay's own verdict, derived from the fields below: `connected` \
+(an active profile, nothing expiring within 24h), `attention` (active, but the credential is \
+expired or expires within 24h — this is the one to surface), `disconnected` (installed, nothing \
+active), `not_installed`. Prefer it over re-deriving the state from expiries yourself.
 - `active` is the id you would pass to switch_profile. It may be null when nothing is logged in, \
 or when the tool has no notion of an active profile.
 - `expires_at: null` means UNKNOWN, not expired — usually the token lives in the OS keychain \
@@ -180,9 +187,11 @@ same caveats as list_connections, narrowed to a single tool.
 Use this before any operation whose result depends on the active account, project or context, \
 instead of assuming the login is still what it was earlier.
 
-Returns one ToolStatus: { tool, installed, profiles: [{ id, label, expires_at, meta }], active, \
-notes }. Remember that `expires_at: null` means the expiry is unknown (token held in the OS \
-keychain), which is not the same as expired — use `verify` if the difference matters.
+Returns one ToolStatus: { tool, installed, category, profiles: [{ id, label, expires_at, meta }], \
+active, notes, connection_state }. `connection_state` is the quickest read: `connected`, \
+`attention` (expired or expiring within 24h), `disconnected`, `not_installed`. Remember that \
+`expires_at: null` means the expiry is unknown (token held in the OS keychain), which is not the \
+same as expired — use `verify` if the difference matters.
 
 An unrecognised `tool` comes back as an error whose message lists every valid tool key; retry \
 with one of those.")]

@@ -59,6 +59,12 @@ Each release also carries `SHA256SUMS-*.txt`; verify with `shasum -a 256 -c`.
 | `crates/patchbay-mcp` | MCP server (stdio) exposing the core to AI agents |
 | `app` | Tauri 2 desktop app — the panel (React 19 + Vite front end, `app/src-tauri` Rust shell) |
 
+The panel's board is one fixed-size card per tool; everything you can *do* to a
+tool lives in its detail view. The sidebar slices the board by category and by
+connection state — both derived in `patchbay-core`, so `pb --json` and the MCP
+server report the same `category` and `connection_state` fields. `/` focuses
+the search box, `Esc` clears the filters.
+
 ## Development
 
 Rust workspace (core, CLI, MCP server):
