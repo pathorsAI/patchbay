@@ -1,0 +1,19 @@
+[package]
+name = "patchbay-cli"
+description = "pb - status board for the CLI logins on your machine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "pb"
+path = "src/main.rs"
+
+[dependencies]
+patchbay-core.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+clap = { version = "4", features = ["derive"] }
+anstyle = "1"
