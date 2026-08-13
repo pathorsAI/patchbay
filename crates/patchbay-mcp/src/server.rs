@@ -107,9 +107,12 @@ environment variable name, or register the secret with `store_key`, instead.";
 /// `{ "tool": "gcloud" }` — identifies one supported CLI.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ToolParams {
-    /// Tool key, e.g. "gcloud", "aws", "gh", "kubectl", "az", "wrangler",
-    /// "rclone", "infisical". An unknown key returns an error listing every
-    /// valid key, so you can retry with a correct one.
+    /// Tool key. One of: "gcloud", "aws", "az", "firebase", "neon",
+    /// "supabase", "flyctl", "doctl", "gh", "npm", "infisical", "op",
+    /// "kubectl", "wrangler", "vercel", "rclone", "docker", "tailscale",
+    /// "ssh", "stripe", "ollama", "huggingface", "claude". An unknown key
+    /// returns an error listing every valid key, so you can retry with a
+    /// correct one.
     pub tool: String,
 }
 
@@ -209,9 +212,14 @@ since you last looked.
 Returns a JSON array of ToolStatus objects: { tool, installed, category, profiles: [{ id, label, \
 expires_at, meta }], active, notes, connection_state }.
 
-- `category` groups the board: cloud (gcloud, aws, az), code (gh), secrets (infisical), \
-cluster (kubectl), edge (wrangler), storage (rclone), other. Filter on it when the user's \
-request is about a class of tool ('am I logged into my cloud accounts?') rather than a named one.
+- `category` groups the board's 23 tools: cloud (gcloud, aws, az, firebase, neon, supabase, \
+flyctl, doctl), code (gh, npm), secrets (infisical, op), cluster (kubectl), edge (wrangler, \
+vercel), storage (rclone), containers (docker), network (tailscale, ssh), payments (stripe), \
+ai (ollama, huggingface, claude), other. Filter on it when the user's request is about a class \
+of tool ('am I logged into my cloud accounts?') rather than a named one.
+- Some tools have no *active* profile by design — docker, rclone, ssh and npm all use every \
+credential concurrently and pick one per command — so `active: null` there is normal, not a \
+problem to fix.
 - `connection_state` is patchbay's own verdict, derived from the fields below: `connected` \
 (an active profile, nothing expiring within 24h), `attention` (active, but the credential is \
 expired or expires within 24h — this is the one to surface), `disconnected` (installed, nothing \

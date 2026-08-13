@@ -128,6 +128,9 @@ impl Probe for KubectlProbe {
         let candidates = self.paths.kube_configs();
         let installed = self.paths.has_binary("kubectl") || candidates.iter().any(|p| p.exists());
         let mut status = ToolStatus::empty(Self::TOOL, installed);
+        for note in self.paths.path_notes("kubeconfig") {
+            status.note(note);
+        }
 
         // A real trap seen in the wild: ~/.kube/config exists but is a
         // *directory* full of per-cluster yaml files. kubectl itself fails on

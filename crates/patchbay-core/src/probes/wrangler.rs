@@ -55,6 +55,9 @@ impl Probe for WranglerProbe {
         let present: Vec<_> = candidates.iter().filter(|p| p.is_file()).collect();
         let installed = self.paths.has_binary("wrangler") || !present.is_empty();
         let mut status = ToolStatus::empty(Self::TOOL, installed);
+        for note in self.paths.path_notes("wrangler") {
+            status.note(note);
+        }
 
         let Some(path) = present.first().copied() else {
             return Ok(status);

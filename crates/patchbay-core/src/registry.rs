@@ -18,23 +18,53 @@ pub struct Registry {
     /// usable in tests without a keystore, and so a machine with no vault is a
     /// normal empty board rather than a special case.
     keys: Option<KeyRegistry>,
+    /// Kept so [`Registry::status_all`] can surface problems with patchbay's
+    /// own config (see [`Paths::config_warnings`]).
+    paths: Paths,
 }
 
 impl Registry {
-    /// Every probe, bound to the given paths.
+    /// Every probe, bound to the given paths. Grouped by category, matching
+    /// the order the panel's sidebar lists them in.
     pub fn all(paths: Paths) -> Self {
         Self {
             probes: vec![
+                // cloud
                 Box::new(probes::gcloud::GcloudProbe::new(paths.clone())),
                 Box::new(probes::aws::AwsProbe::new(paths.clone())),
+                Box::new(probes::az::AzProbe::new(paths.clone())),
+                Box::new(probes::firebase::FirebaseProbe::new(paths.clone())),
+                Box::new(probes::neon::NeonProbe::new(paths.clone())),
+                Box::new(probes::supabase::SupabaseProbe::new(paths.clone())),
+                Box::new(probes::flyctl::FlyctlProbe::new(paths.clone())),
+                Box::new(probes::doctl::DoctlProbe::new(paths.clone())),
+                // code
                 Box::new(probes::gh::GhProbe::new(paths.clone())),
+                Box::new(probes::npm::NpmProbe::new(paths.clone())),
+                // secrets
                 Box::new(probes::infisical::InfisicalProbe::new(paths.clone())),
+                Box::new(probes::op::OpProbe::new(paths.clone())),
+                // cluster
                 Box::new(probes::kubectl::KubectlProbe::new(paths.clone())),
+                // edge
                 Box::new(probes::wrangler::WranglerProbe::new(paths.clone())),
+                Box::new(probes::vercel::VercelProbe::new(paths.clone())),
+                // storage
                 Box::new(probes::rclone::RcloneProbe::new(paths.clone())),
-                Box::new(probes::az::AzProbe::new(paths)),
+                // containers
+                Box::new(probes::docker::DockerProbe::new(paths.clone())),
+                // network
+                Box::new(probes::tailscale::TailscaleProbe::new(paths.clone())),
+                Box::new(probes::ssh::SshProbe::new(paths.clone())),
+                // payments
+                Box::new(probes::stripe::StripeProbe::new(paths.clone())),
+                // ai
+                Box::new(probes::ollama::OllamaProbe::new(paths.clone())),
+                Box::new(probes::huggingface::HuggingfaceProbe::new(paths.clone())),
+                Box::new(probes::claude::ClaudeProbe::new(paths.clone())),
             ],
             keys: None,
+            paths,
         }
     }
 
@@ -79,7 +109,8 @@ impl Registry {
     pub fn status_all(&self) -> Vec<ToolStatus> {
         // Read the vault once for the whole board, not once per tool.
         let linked = self.linked_keys();
-        self.probes
+        let mut all: Vec<ToolStatus> = self
+            .probes
             .iter()
             .map(|p| {
                 let mut status = p.status().unwrap_or_else(|e| {
@@ -90,7 +121,20 @@ impl Registry {
                 linked.attach(&mut status);
                 status
             })
-            .collect()
+            .collect();
+
+        // A broken patchbay config is about patchbay, not about any one tool,
+        // and the data model has no global slot for it. It goes on the first
+        // status only — repeating it 23 times would drown the board and, for
+        // an agent reading list_connections, cost 23 copies of the same
+        // sentence. The message names itself, so it does not read as a
+        // complaint about that tool.
+        if let Some(first) = all.first_mut() {
+            for warning in self.paths.config_warnings() {
+                first.note(warning.clone());
+            }
+        }
+        all
     }
 
     pub fn status(&self, tool: &str) -> anyhow::Result<ToolStatus> {
@@ -182,13 +226,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let registry = Registry::all(Paths::for_test(dir.path()));
         let all = registry.status_all();
-        assert_eq!(all.len(), 8);
+        assert_eq!(all.len(), 23);
         for status in &all {
             assert!(!status.installed, "{} should look absent", status.tool);
             assert!(
                 status.profiles.is_empty(),
                 "{} leaked profiles",
                 status.tool
+            );
+            assert!(
+                status.notes.is_empty(),
+                "{} is noisy on a machine that has nothing: {:?}",
+                status.tool,
+                status.notes
             );
         }
     }
@@ -293,8 +343,9 @@ mod tests {
         let vault = KeyRegistry::new(path, Box::new(crate::keystore::MemoryKeystore::new()));
 
         let registry = Registry::all(Paths::for_test(dir.path())).with_keys(vault);
+        let expected = registry.tool_names().len();
         let board = registry.status_all();
-        assert_eq!(board.len(), 8, "the board must still be complete");
+        assert_eq!(board.len(), expected, "the board must still be complete");
         for status in &board {
             assert!(status.registered_keys.is_empty());
             assert!(
@@ -306,6 +357,54 @@ mod tests {
                 status.tool
             );
         }
+    }
+
+    #[test]
+    fn test_tool_keys_are_unique() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::all(Paths::for_test(dir.path()));
+        let mut names = registry.tool_names();
+        names.sort_unstable();
+        let count = names.len();
+        names.dedup();
+        assert_eq!(names.len(), count, "duplicate tool key in the registry");
+    }
+
+    #[test]
+    fn test_every_tool_is_categorised() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::all(Paths::for_test(dir.path()));
+        for status in registry.status_all() {
+            assert_ne!(
+                status.category,
+                crate::types::ToolCategory::Other,
+                "{} has no category",
+                status.tool
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_broken_patchbay_config_is_reported_on_the_board() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".config/patchbay")).unwrap();
+        std::fs::write(
+            dir.path().join(".config/patchbay/config.toml"),
+            "[paths]\nnot_a_tool = \"/x\"\n",
+        )
+        .unwrap();
+        let registry = Registry::all(Paths::for_test(dir.path()).load_config());
+        let all = registry.status_all();
+        assert!(all[0]
+            .notes
+            .iter()
+            .any(|n| n.contains("patchbay config: unknown key `not_a_tool`")));
+        // Once, not once per tool.
+        let carriers = all
+            .iter()
+            .filter(|s| s.notes.iter().any(|n| n.contains("unknown key")))
+            .count();
+        assert_eq!(carriers, 1);
     }
 
     #[test]

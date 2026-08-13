@@ -117,6 +117,16 @@ pub fn parse_timestamp(raw: &str) -> Option<DateTime<Utc>> {
     None
 }
 
+/// Epoch **milliseconds**, the dialect the JS-based CLIs write (`neon`'s
+/// `credentials.json`, `firebase-tools`' `tokens.expires_at`).
+///
+/// Kept separate from [`parse_timestamp`] on purpose: a millisecond value fed
+/// to a seconds parser silently lands ~55 000 years in the future, which would
+/// read as a perfectly healthy credential.
+pub fn parse_epoch_millis(millis: i64) -> Option<DateTime<Utc>> {
+    DateTime::from_timestamp_millis(millis)
+}
+
 /// Outcome of shelling out to a tool's own CLI.
 pub struct CmdOutput {
     pub ok: bool,
@@ -187,6 +197,17 @@ mod tests {
         assert!(parse_timestamp("2026-03-13T10:24:29.685Z").is_some());
         assert!(parse_timestamp("").is_none());
         assert!(parse_timestamp("never").is_none());
+    }
+
+    #[test]
+    fn test_parse_epoch_millis_is_not_the_seconds_parser() {
+        // A real value out of ~/.config/neonctl/credentials.json.
+        let at = parse_epoch_millis(1785611828464).unwrap();
+        assert_eq!(at.to_rfc3339(), "2026-08-01T19:17:08.464+00:00");
+        // The same number through the seconds path lands in the far future.
+        use chrono::Datelike;
+        assert!(parse_timestamp("1785611828464").unwrap().year() > 9999);
+        assert!(parse_epoch_millis(i64::MAX).is_none());
     }
 
     #[test]

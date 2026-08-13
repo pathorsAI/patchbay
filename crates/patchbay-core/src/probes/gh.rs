@@ -97,6 +97,9 @@ impl Probe for GhProbe {
         let path = self.paths.gh_hosts();
         let installed = self.paths.has_binary("gh") || path.is_file();
         let mut status = ToolStatus::empty(Self::TOOL, installed);
+        for note in self.paths.path_notes("gh") {
+            status.note(note);
+        }
 
         let text = match read_text(&path) {
             Ok(Some(text)) => text,

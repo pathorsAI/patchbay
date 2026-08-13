@@ -39,6 +39,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Because every file carries its own `current-context`, no active context is
   reported unless exactly one file defines contexts.
 
+- **15 new probes**, taking the board from 8 tools to 23: `vercel`, `firebase`,
+  `neon`, `docker`, `tailscale`, `ssh`, `stripe`, `supabase`, `flyctl`,
+  `doctl`, `npm`, `op`, `ollama`, `huggingface`, `claude`.
+- **Four new categories** — `containers`, `network`, `payments`, `ai`. The
+  panel's sidebar picks them up from the JSON.
+- **Custom config paths.** Every probe honours the environment variable its own
+  CLI honours, and patchbay gained an optional `~/.config/patchbay/config.toml`
+  with a `[paths]` table for the case where there is no shell environment to
+  inherit (the panel launched from Finder) or the state lives on another
+  volume. Precedence is tool variable → `[paths]` → platform default, and an
+  override in effect is named in the tool's `notes`. See "Custom paths" in the
+  README.
+
+### Fixed
+
+- `gh` and `rclone` now honour `XDG_CONFIG_HOME`, as those CLIs do. `gcloud`
+  deliberately still does not, because it does not either.
+
 ## [0.1.0] - 2026-08-13
 
 First public cut. macOS only, and deliberately narrow: read local state, report
