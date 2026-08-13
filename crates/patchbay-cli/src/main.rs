@@ -5,6 +5,7 @@
 //! [`render`]; this file is argument parsing, dispatch and exit codes.
 
 mod keys;
+mod mcp;
 mod render;
 
 use anyhow::Result;
@@ -58,6 +59,11 @@ enum Command {
     Key {
         #[command(subcommand)]
         command: keys::Command,
+    },
+    /// MCP servers across the AI clients on this machine.
+    Mcp {
+        #[command(subcommand)]
+        command: mcp::Command,
     },
 }
 
@@ -128,6 +134,9 @@ fn run() -> Result<i32> {
         // The vault has its own registry: it stores keys the user gave patchbay
         // on purpose, not state discovered by a probe.
         Command::Key { command } => keys::run(command, &styles()),
+        // Likewise the MCP board: these are other tools' config files, not
+        // credential state, so it has its own registry too.
+        Command::Mcp { command } => mcp::run(command, &styles()),
     }
 }
 

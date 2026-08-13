@@ -9,10 +9,15 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+# `preserve_order` is load-bearing for `mcp_clients`: rewriting an AI client's
+# config must not reshuffle its keys into alphabetical order.
+serde_json = { workspace = true, features = ["preserve_order"] }
 chrono.workspace = true
 serde_yaml_ng = "0.10"
 toml = "0.9"
+# Format-preserving TOML, for Codex's config.toml: comments, ordering and the
+# user's own layout survive a write.
+toml_edit = "0.23"
 which = "8"
 rusqlite = { version = "0.40", features = ["bundled"] }
 

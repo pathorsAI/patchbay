@@ -29,6 +29,7 @@
 
 pub mod keys;
 pub mod keystore;
+pub mod mcp_clients;
 pub mod paths;
 pub mod probe;
 pub mod probes;
@@ -38,6 +39,9 @@ pub mod util;
 
 pub use keys::{KeyEntry, KeyPatch, KeyRegistry, NewKey};
 pub use keystore::Keystore;
+pub use mcp_clients::{
+    McpClient, McpClientRegistry, McpServerEntry, McpTransport, ServerSpec, TransportSpec,
+};
 pub use paths::Paths;
 pub use probe::Probe;
 pub use registry::Registry;
