@@ -14,6 +14,7 @@
 - [What it does](#what-it-does)
 - [Install](#install)
 - [Use](#use)
+- [Moving to a new machine](#moving-to-a-new-machine)
 - [MCP — let your AI operate it](#mcp--let-your-ai-operate-it)
 - [Showcase](#showcase)
 - [Build from source](#build-from-source)
@@ -26,7 +27,7 @@
 - **Permissions** — see what your tokens can actually do (`gh` scopes today) and fix missing scopes with one hint.
 - **[MCP client management](docs/mcp-clients.md)** — every MCP server registered in Claude Code, Claude Desktop, Cursor, Codex, Windsurf and VS Code in one matrix; copy a server between clients without hand-editing four files in two formats.
 - **[Key vault](docs/key-vault.md)** — standalone API keys no CLI tracks: values in the macOS Keychain, metadata on disk, provider-aware `pb key verify`, and AI registration over MCP.
-- **Migrate** — export to a new machine; whatever can't travel, your AI walks you through re-authing.
+- **[Migrate](docs/migration.md)** — export to a new machine; whatever can't travel, your AI walks you through re-authing.
 
 ## Install
 
@@ -52,13 +53,32 @@ pb key list          # your registered API keys
 
 Or just open the panel: search with `/`, filter by category or connection state, click a card to operate that tool.
 
+## Moving to a new machine
+
+```sh
+pb export                        # one encrypted .pbx: the logins that can travel
+pb import patchbay-*.pbx         # --dry-run first; existing files are backed up
+pb plan                          # what's left, with the exact command for each
+```
+
+Files that work anywhere get copied (`gcloud`, `aws`, `kubectl`, `wrangler`,
+`rclone`, `npm`, `docker`, `ssh` config…). Credentials the OS keychain or the
+device itself is holding can't, and patchbay says so instead of pretending —
+each becomes one line with the command that fixes it. Your AI can work that list
+over MCP (`plan_setup`, `mark_setup_done`), and patchbay re-probes after every
+step rather than believing it.
+
+Encrypted with a passphrase, refuses to be written into a cloud-sync folder, and
+never copies a private key. **[Full details, and the per-tool portability
+table →](docs/migration.md)**
+
 ## MCP — let your AI operate it
 
 ```json
 { "mcpServers": { "patchbay": { "command": "/usr/local/bin/patchbay-mcp" } } }
 ```
 
-Your agent gets `list_connections`, `switch_profile`, `verify`, `get_permissions`, `store_key`, and friends — "switch to the work gcloud account and deploy" becomes one sentence, and a key your AI creates mid-task gets registered instead of rotting in a chat log. Reading secret values back is **off by default** (`PATCHBAY_ALLOW_SECRET_READ=1` to opt in).
+Your agent gets `list_connections`, `switch_profile`, `verify`, `get_permissions`, `store_key`, `plan_setup`, and friends — "switch to the work gcloud account and deploy" becomes one sentence, and a key your AI creates mid-task gets registered instead of rotting in a chat log. Reading secret values back is **off by default** (`PATCHBAY_ALLOW_SECRET_READ=1` to opt in).
 
 ## Showcase
 
@@ -75,6 +95,7 @@ cd app && bun install && bun run tauri dev          # the panel (Tauri 2 + React
 
 ## Docs
 
+- [Moving to a new machine](docs/migration.md)
 - [Key vault — security model](docs/key-vault.md)
 - [MCP client management](docs/mcp-clients.md)
 - [Contributing & development](CONTRIBUTING.md)
