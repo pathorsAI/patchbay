@@ -24,6 +24,8 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 # sync throughout) and pulls no async runtime; rustls + webpki-roots keep
 # OpenSSL off the dependency graph entirely.
 ureq = { version = "3", default-features = false, features = ["rustls"] }
+age = "0.12"
+base64 = "0.23"
 
 [dev-dependencies]
 tempfile = "3"

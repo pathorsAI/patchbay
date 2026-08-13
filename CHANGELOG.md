@@ -42,6 +42,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keys without one never grow the field. A `grafana` key deliberately maps to no
   probe — there is no Grafana CLI for it to sit beside.
 
+- **Machine migration** — `pb export` packs the logins that survive a machine
+  move into one `age`-encrypted `.pbx` bundle: the portable credential files,
+  optionally the key vault (`--keys`, off by default), a secret-free
+  `manifest.json`, and a generated `SETUP.md` that tells a machine with no
+  patchbay on it how to install one. `pb import` puts it back, backing up
+  anything it would replace to `<path>.patchbay-bak`, and `--dry-run` prints the
+  whole plan without writing a byte. Running an import twice produces the same
+  machine.
+- **A portability policy per tool** (`patchbay_core::migrate::policy`). Every
+  probe declares `Portable`, `DeviceBound` or `PointerOnly` with the reason in
+  the table — `gh`'s token is in the keychain, `tailscale`'s node key *is* this
+  device, `ssh`'s private keys are never touched. A probe added without a policy
+  fails the test suite. Files are collected and restored through `Paths` on both
+  machines independently, so an override on either side is honoured.
+- **`pb plan`, `pb status --diff <manifest>`, and the `plan_setup` /
+  `mark_setup_done` MCP tools** — the gap list, re-derived from the machine in
+  front of you rather than copied out of the manifest. Each item carries whether
+  patchbay can close it itself, the exact command, and whether that command
+  opens a browser. `mark_setup_done` re-probes rather than believing the agent
+  that claims it ran something.
+- Cloud-sync destinations (iCloud Drive, Dropbox, Google Drive, OneDrive, Box,
+  pCloud) are refused without `--force`, with the reason: copying credential
+  files is the technique sessions get hijacked with, and a bundle in a sync
+  folder hands a service the whole set.
+- No secret value leaves the encrypted payload — not into the manifest,
+  `SETUP.md`, a log line, an error, `--json` or an MCP response. Decryption is
+  in memory only: there is no staging directory, and each file goes straight to
+  its destination through a temp file in that destination's own directory.
+
 - **`pb use infisical <email>`** — the Infisical CLI's `user switch` is an
   arrow-key picker with no non-interactive form, so patchbay makes the same
   change itself: it repoints `loggedInUserEmail` and `LoggedInUserDomain` at one
