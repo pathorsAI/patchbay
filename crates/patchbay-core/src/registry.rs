@@ -87,23 +87,30 @@ impl Registry {
     /// becomes a status carrying the error as a note, so one broken tool never
     /// blanks the board.
     pub fn status_all(&self) -> Vec<ToolStatus> {
-        // A broken patchbay config affects where *every* probe looks, so the
-        // warning belongs on every tool rather than on an arbitrary one.
-        let warnings = self.paths.config_warnings();
-        self.probes
+        let mut all: Vec<ToolStatus> = self
+            .probes
             .iter()
             .map(|p| {
-                let mut status = p.status().unwrap_or_else(|e| {
+                p.status().unwrap_or_else(|e| {
                     let mut status = ToolStatus::empty(p.tool(), false);
                     status.note(format!("probe failed: {e}"));
                     status
-                });
-                for warning in warnings {
-                    status.note(warning.clone());
-                }
-                status
+                })
             })
-            .collect()
+            .collect();
+
+        // A broken patchbay config is about patchbay, not about any one tool,
+        // and the data model has no global slot for it. It goes on the first
+        // status only — repeating it 23 times would drown the board and, for
+        // an agent reading list_connections, cost 23 copies of the same
+        // sentence. The message names itself, so it does not read as a
+        // complaint about that tool.
+        if let Some(first) = all.first_mut() {
+            for warning in self.paths.config_warnings() {
+                first.note(warning.clone());
+            }
+        }
+        all
     }
 
     pub fn status(&self, tool: &str) -> anyhow::Result<ToolStatus> {
@@ -184,13 +191,17 @@ mod tests {
         )
         .unwrap();
         let registry = Registry::all(Paths::for_test(dir.path()).load_config());
-        for status in registry.status_all() {
-            assert!(
-                status.notes.iter().any(|n| n.contains("unknown key")),
-                "{} did not carry the config warning",
-                status.tool
-            );
-        }
+        let all = registry.status_all();
+        assert!(all[0]
+            .notes
+            .iter()
+            .any(|n| n.contains("patchbay config: unknown key `not_a_tool`")));
+        // Once, not once per tool.
+        let carriers = all
+            .iter()
+            .filter(|s| s.notes.iter().any(|n| n.contains("unknown key")))
+            .count();
+        assert_eq!(carriers, 1);
     }
 
     #[test]

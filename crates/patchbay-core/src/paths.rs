@@ -141,7 +141,7 @@ impl Paths {
             Ok(Some(text)) => text,
             Ok(None) => return self,
             Err(e) => {
-                self.config_warnings.push(e);
+                self.config_warnings.push(format!("patchbay config: {e}"));
                 return self;
             }
         };
@@ -156,7 +156,8 @@ impl Paths {
             Ok(config) => config,
             Err(e) => {
                 self.config_warnings.push(format!(
-                    "{} is not valid TOML ({e}); its [paths] overrides were ignored",
+                    "patchbay config: {} is not valid TOML ({e}); its [paths] overrides were \
+                     ignored",
                     path.display()
                 ));
                 return self;
@@ -168,7 +169,8 @@ impl Paths {
                 self.overrides.insert(key, PathBuf::from(value));
             } else {
                 self.config_warnings.push(format!(
-                    "unknown key `{key}` in the [paths] table of {}; known keys: {}",
+                    "patchbay config: unknown key `{key}` in the [paths] table of {}; known \
+                     keys: {}",
                     path.display(),
                     LOCATIONS
                         .iter()
