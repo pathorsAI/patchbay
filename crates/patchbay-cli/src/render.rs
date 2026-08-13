@@ -143,6 +143,18 @@ pub fn humanize_expiry(now: DateTime<Utc>, at: DateTime<Utc>) -> String {
     }
 }
 
+/// How long ago something happened: `2h ago`, `3d 4h ago`.
+///
+/// A timestamp in the future is a clock that disagrees with itself, not news
+/// worth reporting, so it reads as `just now` rather than a negative age.
+pub fn humanize_ago(now: DateTime<Utc>, at: DateTime<Utc>) -> String {
+    let elapsed = now - at;
+    if elapsed <= Duration::zero() {
+        return "just now".to_string();
+    }
+    format!("{} ago", magnitude(elapsed))
+}
+
 // ---------------------------------------------------------------------------
 // truncation / padding
 // ---------------------------------------------------------------------------
@@ -537,6 +549,18 @@ pub fn render_check_updates(
 // shared bits for the other subcommands
 // ---------------------------------------------------------------------------
 
+/// `~/…` for paths under the home directory: output is about *which* file, not
+/// about how long the user's home path is.
+pub fn tilde(path: &std::path::Path) -> String {
+    let Some(home) = std::env::var_os("HOME") else {
+        return path.display().to_string();
+    };
+    match path.strip_prefix(&home) {
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.display().to_string(),
+    }
+}
+
 /// Indent a list of lines under a heading line.
 pub fn indent_lines(items: &[String]) -> String {
     items
@@ -598,6 +622,17 @@ mod tests {
             humanize_expiry(now(), now() + Duration::seconds(20)),
             "in <1m"
         );
+    }
+
+    #[test]
+    fn test_humanize_ago_reads_as_an_age() {
+        assert_eq!(humanize_ago(now(), now() - Duration::hours(2)), "2h ago");
+        assert_eq!(
+            humanize_ago(now(), now() - Duration::days(3) - Duration::hours(4)),
+            "3d 4h ago"
+        );
+        // A future timestamp is a disagreeing clock, not a negative age.
+        assert_eq!(humanize_ago(now(), now() + Duration::hours(1)), "just now");
     }
 
     #[test]

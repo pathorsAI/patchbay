@@ -647,6 +647,13 @@ impl Paths {
         self.patchbay_dir().join("keys.json")
     }
 
+    /// The project env vault's metadata registry. Variable *names* and their
+    /// provenance live here; the values never do — they are in the OS keychain
+    /// (see [`crate::envs`]).
+    pub fn projects_file(&self) -> PathBuf {
+        self.patchbay_dir().join("projects.json")
+    }
+
     /// The version-check cache (see [`crate::versions`]). Public information
     /// about public software — no secrets, so no 0600 handling.
     pub fn versions_file(&self) -> PathBuf {
@@ -680,8 +687,13 @@ mod tests {
             p.keys_file(),
             PathBuf::from("/nowhere/.config/patchbay/keys.json")
         );
+        assert_eq!(
+            p.projects_file(),
+            PathBuf::from("/nowhere/.config/patchbay/projects.json")
+        );
         let p = Paths::for_test("/nowhere").with_env("PATCHBAY_CONFIG_DIR", "/custom/pb");
         assert_eq!(p.keys_file(), PathBuf::from("/custom/pb/keys.json"));
+        assert_eq!(p.projects_file(), PathBuf::from("/custom/pb/projects.json"));
     }
 
     #[test]

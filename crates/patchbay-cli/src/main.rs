@@ -4,6 +4,7 @@
 //! probes found, and never reads tool state itself. Formatting lives in
 //! [`render`]; this file is argument parsing, dispatch and exit codes.
 
+mod env;
 mod keys;
 mod mcp;
 mod migrate;
@@ -87,6 +88,11 @@ enum Command {
     Key {
         #[command(subcommand)]
         command: keys::Command,
+    },
+    /// Project env vault: per-project variables in synced + local layers.
+    Env {
+        #[command(subcommand)]
+        command: env::Command,
     },
     /// MCP servers across the AI clients on this machine.
     Mcp {
@@ -241,6 +247,10 @@ fn run() -> Result<i32> {
         // The vault has its own registry: it stores keys the user gave patchbay
         // on purpose, not state discovered by a probe.
         Command::Key { command } => keys::run(command, &styles()),
+        // The env vault is the other half of the same idea: values the user
+        // handed patchbay on purpose, filed against a directory instead of a
+        // person.
+        Command::Env { command } => env::run(command, &styles()),
         // Likewise the MCP board: these are other tools' config files, not
         // credential state, so it has its own registry too.
         Command::Mcp { command } => mcp::run(command, &styles()),

@@ -25,9 +25,14 @@
 //! keys that no CLI tracks, which the user (or an AI agent) hands to patchbay on
 //! purpose. Even there the split holds — metadata goes to a JSON file, the value
 //! goes straight to the OS keychain ([`keystore`]), and
-//! [`KeyRegistry::get_secret`] is the single, gated way back out.
+//! [`KeyRegistry::get_secret`] is the single, gated way back out. The **project
+//! env vault** ([`envs`]) holds the same line for the variable sets a repo needs
+//! — names and provenance on disk, values in the keychain, and pull-only sync
+//! ([`env_sync`]) so patchbay can never push a local value to a shared remote.
 
 pub mod deprecations;
+pub mod env_sync;
+pub mod envs;
 pub mod keys;
 pub mod keys_verify;
 pub mod keystore;
@@ -42,6 +47,10 @@ pub mod util;
 pub mod versions;
 
 pub use deprecations::{Advisory, AdvisoryKind};
+pub use env_sync::{pull, PullOutcome};
+pub use envs::{
+    EnvLayer, EnvMeta, EnvRegistry, EnvVarInfo, EnvVarSource, MergedEnv, ProjectEntry, SyncConfig,
+};
 pub use keys::{KeyEntry, KeyExpiryState, KeyPatch, KeyRegistry, NewKey};
 pub use keys_verify::{verify_key, KeyVerifyOutcome, KeyVerifyStatus};
 pub use keystore::Keystore;

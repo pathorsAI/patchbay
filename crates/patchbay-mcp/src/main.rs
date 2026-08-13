@@ -10,6 +10,7 @@
 //! { "mcpServers": { "patchbay": { "command": "patchbay-mcp" } } }
 //! ```
 
+mod envs;
 mod keys;
 mod mcp_clients;
 mod migrate;
@@ -29,8 +30,11 @@ async fn main() -> anyhow::Result<()> {
     let keys = patchbay_core::KeyRegistry::detect()?;
     // The MCP client board: other tools' config files, re-read per call.
     let clients = patchbay_core::McpClientRegistry::detect()?;
+    // The project env vault: projects.json plus the OS keychain, re-read per
+    // call, so a `pb env pull` from a terminal is visible here immediately.
+    let envs = patchbay_core::EnvRegistry::detect()?;
 
-    let service = PatchbayServer::new(registry, keys, clients)
+    let service = PatchbayServer::new(registry, keys, clients, envs)
         .serve(stdio())
         .await
         .inspect_err(|e| eprintln!("patchbay-mcp: failed to start: {e}"))?;

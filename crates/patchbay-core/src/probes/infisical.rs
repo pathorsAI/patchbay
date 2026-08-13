@@ -50,6 +50,25 @@ struct LoggedInUser {
     domain: Option<String>,
 }
 
+/// The account the `infisical` CLI would act as right now, or `None` when
+/// nobody is logged in on this machine.
+///
+/// Machine-global state, and the reason [`crate::env_sync`] needs it: an
+/// `infisical export` runs as whoever this says, not as whoever the caller had
+/// in mind. A missing config is a normal "never logged in" answer, not an
+/// error; a *malformed* one is an error, because guessing would be worse.
+pub fn active_account(paths: &Paths) -> anyhow::Result<Option<String>> {
+    let path = paths.infisical_config();
+    let Some(text) = read_text(&path).map_err(anyhow::Error::msg)? else {
+        return Ok(None);
+    };
+    let config: Config = serde_json::from_str(&text)
+        .map_err(|e| anyhow::anyhow!("{} is not valid JSON ({e})", path.display()))?;
+    Ok(config
+        .logged_in_user_email
+        .filter(|email| !email.trim().is_empty()))
+}
+
 impl InfisicalProbe {
     pub const TOOL: &'static str = "infisical";
     /// The field naming the active account.
@@ -330,6 +349,30 @@ mod tests {
         let json = serde_json::to_string(&status).unwrap();
         assert!(!json.contains("ZmFrZS1maXh0dXJl"), "{json}");
         assert!(!json.to_lowercase().contains("passphrase"), "{json}");
+    }
+
+    #[test]
+    fn test_active_account_reads_the_machine_global_login() {
+        let (_dir, home) = fixture(
+            r#"{"loggedInUserEmail":"b@example.com","loggedInUsers":[{"email":"a@example.com"},{"email":"b@example.com"}],"vaultBackendPassphrase":"ZmFrZQ=="}"#,
+        );
+        assert_eq!(
+            active_account(&Paths::for_test(&home)).unwrap().as_deref(),
+            Some("b@example.com")
+        );
+
+        // Never logged in: no file, or a file with no active account.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(active_account(&Paths::for_test(dir.path())).unwrap(), None);
+        let (_dir, home) = fixture(r#"{"loggedInUsers":[]}"#);
+        assert_eq!(active_account(&Paths::for_test(&home)).unwrap(), None);
+
+        // Unreadable is an error, not a silent "logged out".
+        let (_dir, home) = fixture("{ this is not json");
+        let err = active_account(&Paths::for_test(&home))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not valid JSON"), "{err}");
     }
 
     #[test]

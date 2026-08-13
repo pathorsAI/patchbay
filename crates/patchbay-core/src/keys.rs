@@ -633,31 +633,41 @@ pub fn expiring_within_at(entries: &[KeyEntry], now: DateTime<Utc>, days: i64) -
 /// keeps an id from being mistaken for an option when it is handed to
 /// `security` as an argument.
 pub fn validate_id(id: &str) -> anyhow::Result<()> {
-    if id.is_empty() {
-        anyhow::bail!("a key id cannot be empty");
+    validate_slug("key id", id)
+}
+
+/// The slug rules of [`validate_id`], for the other things patchbay names the
+/// same way — project ids and environment names (see [`crate::envs`]).
+///
+/// `noun` is what the value *is*, singular and lowercase: an error has to say
+/// "environment name `Prod`" rather than blaming a key id the caller never
+/// mentioned. It is pluralised with a bare `s`, so keep it a plain noun phrase.
+pub fn validate_slug(noun: &str, value: &str) -> anyhow::Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("{noun} cannot be empty");
     }
-    if id.len() > MAX_ID_LEN {
-        anyhow::bail!("key id `{id}` is longer than {MAX_ID_LEN} characters");
+    if value.len() > MAX_ID_LEN {
+        anyhow::bail!("{noun} `{value}` is longer than {MAX_ID_LEN} characters");
     }
-    if id.chars().any(|c| c.is_ascii_uppercase()) {
+    if value.chars().any(|c| c.is_ascii_uppercase()) {
         anyhow::bail!(
-            "key ids are lowercase slugs; try `{}`",
-            id.to_ascii_lowercase()
+            "{noun}s are lowercase slugs; try `{}`",
+            value.to_ascii_lowercase()
         );
     }
-    if !id
+    if !value
         .chars()
         .next()
         .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
     {
-        anyhow::bail!("key id `{id}` must start with a letter or digit");
+        anyhow::bail!("{noun} `{value}` must start with a letter or digit");
     }
-    if let Some(bad) = id
+    if let Some(bad) = value
         .chars()
         .find(|c| !(c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.')))
     {
         anyhow::bail!(
-            "key id `{id}` contains `{bad}`; use lowercase letters, digits, `-`, `_` and `.`"
+            "{noun} `{value}` contains `{bad}`; use lowercase letters, digits, `-`, `_` and `.`"
         );
     }
     Ok(())
@@ -1278,6 +1288,22 @@ mod tests {
         let err = validate_id("CF-Deploy").unwrap_err().to_string();
         assert!(err.contains("cf-deploy"), "{err}");
         assert!(validate_id(&"x".repeat(MAX_ID_LEN + 1)).is_err());
+    }
+
+    #[test]
+    fn test_validate_slug_names_the_thing_it_rejected() {
+        // The env vault validates project ids and environment names with these
+        // same rules; the error must not talk about key ids.
+        for (noun, value) in [("project id", "My Repo"), ("environment name", "Prod")] {
+            let err = validate_slug(noun, value).unwrap_err().to_string();
+            assert!(err.contains(noun), "{err}");
+            assert!(!err.contains("key id"), "{err}");
+        }
+        assert!(validate_slug("environment name", "")
+            .unwrap_err()
+            .to_string()
+            .contains("environment name cannot be empty"));
+        assert!(validate_slug("project id", "pathors").is_ok());
     }
 
     #[test]
