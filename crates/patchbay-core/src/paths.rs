@@ -155,6 +155,21 @@ impl Paths {
             None => self.join(".azure/azureProfile.json"),
         }
     }
+
+    /// patchbay's own config directory. `PATCHBAY_CONFIG_DIR` wins, else
+    /// `~/.config/patchbay`.
+    pub fn patchbay_dir(&self) -> PathBuf {
+        match self.env("PATCHBAY_CONFIG_DIR") {
+            Some(dir) => PathBuf::from(dir),
+            None => self.join(".config/patchbay"),
+        }
+    }
+
+    /// The key vault's metadata registry. Secret values are never stored here —
+    /// they live in the OS keychain (see [`crate::keystore`]).
+    pub fn keys_file(&self) -> PathBuf {
+        self.patchbay_dir().join("keys.json")
+    }
 }
 
 #[cfg(test)]
@@ -173,6 +188,17 @@ mod tests {
     fn test_env_overrides_win() {
         let p = Paths::for_test("/nowhere").with_env("CLOUDSDK_CONFIG", "/custom/gcloud");
         assert_eq!(p.gcloud_dir(), PathBuf::from("/custom/gcloud"));
+    }
+
+    #[test]
+    fn test_keys_file_lives_under_the_patchbay_config_dir() {
+        let p = Paths::for_test("/nowhere");
+        assert_eq!(
+            p.keys_file(),
+            PathBuf::from("/nowhere/.config/patchbay/keys.json")
+        );
+        let p = Paths::for_test("/nowhere").with_env("PATCHBAY_CONFIG_DIR", "/custom/pb");
+        assert_eq!(p.keys_file(), PathBuf::from("/custom/pb/keys.json"));
     }
 
     #[test]
