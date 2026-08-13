@@ -1,0 +1,20 @@
+[package]
+name = "patchbay-core"
+description = "Probes for local developer CLI auth state: status, switch, verify, permissions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+serde_yaml_ng = "0.10"
+toml = "0.9"
+which = "8"
+rusqlite = { version = "0.40", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile = "3"
