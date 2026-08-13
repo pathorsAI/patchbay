@@ -24,6 +24,7 @@
 - **Status board** — every tool, every profile, which is active, when tokens expire. File reads only; no API calls unless you ask to `verify`.
 - **Switch** — change profile/context from the panel, the CLI, or an AI — including the traps (`gcloud` ADC).
 - **Permissions** — see what your tokens can actually do (`gh` scopes today) and fix missing scopes with one hint.
+- **[MCP client management](docs/mcp-clients.md)** — every MCP server registered in Claude Code, Claude Desktop, Cursor, Codex, Windsurf and VS Code in one matrix; copy a server between clients without hand-editing four files in two formats.
 - **[Key vault](docs/key-vault.md)** — standalone API keys no CLI tracks: values in the macOS Keychain, metadata on disk, provider-aware `pb key verify`, and AI registration over MCP.
 - **Migrate** — export to a new machine; whatever can't travel, your AI walks you through re-authing.
 
@@ -75,6 +76,7 @@ cd app && bun install && bun run tauri dev          # the panel (Tauri 2 + React
 ## Docs
 
 - [Key vault — security model](docs/key-vault.md)
+- [MCP client management](docs/mcp-clients.md)
 - [Contributing & development](CONTRIBUTING.md)
 - [Changelog](CHANGELOG.md)
 

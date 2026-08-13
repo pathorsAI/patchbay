@@ -11,6 +11,7 @@
 //! ```
 
 mod keys;
+mod mcp_clients;
 mod server;
 
 use rmcp::transport::stdio;
@@ -25,8 +26,10 @@ async fn main() -> anyhow::Result<()> {
     let registry = patchbay_core::Registry::detect()?;
     // The key vault: metadata file plus the OS keychain, re-read per call.
     let keys = patchbay_core::KeyRegistry::detect()?;
+    // The MCP client board: other tools' config files, re-read per call.
+    let clients = patchbay_core::McpClientRegistry::detect()?;
 
-    let service = PatchbayServer::new(registry, keys)
+    let service = PatchbayServer::new(registry, keys, clients)
         .serve(stdio())
         .await
         .inspect_err(|e| eprintln!("patchbay-mcp: failed to start: {e}"))?;

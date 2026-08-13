@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **MCP client management** — one board for the MCP servers registered across
+  the AI clients on this machine: Claude Code (`~/.claude.json`, user and
+  project scopes), Claude Desktop, Cursor, Codex CLI (`config.toml`), Windsurf
+  and VS Code. `patchbay_core::mcp_clients` reads all six formats into one
+  model and writes three of the operations back.
+- **`pb mcp`** — `pb mcp list` (the server × client matrix, or `--json`),
+  `pb mcp add <client> <name>`, `pb mcp copy <name> --from … --to …` (translates
+  between the JSON and TOML dialects), `pb mcp rm <client> <name>`.
+- **MCP tools** — `list_mcp_clients`, `add_mcp_server`, `copy_mcp_server`,
+  `remove_mcp_server`, so an agent that just set a server up can register it in
+  every client the user has.
+- Write safety for other tools' config files: a rolling `<path>.patchbay-bak`
+  backup before every change, atomic temp-file-and-rename writes, and
+  parse-modify-serialize so unknown keys, JSON key order and TOML comments all
+  survive. Claude Code's project scopes are read and labelled but never written.
+- The board reports `env_keys`, `header_keys` and an argument *count* — never
+  values, since those fields routinely hold API keys. A `copy` does carry values
+  (a server that cannot authenticate is useless) and names what travelled.
+
 ### Fixed
 
 - **kubectl** — a `~/.kube/config` that is a *directory* of per-cluster

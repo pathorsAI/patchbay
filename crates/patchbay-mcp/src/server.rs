@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use patchbay_core::{KeyRegistry, Registry};
+use patchbay_core::{KeyRegistry, McpClientRegistry, Registry};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -93,7 +93,16 @@ codebase and its environments, not in the user's personal vault. Do not dump a `
 application config, which is the failure mode this rule exists to prevent.
 
    Unsure? Ask which project the value is scoped to. If the answer is 'all of them' or 'it is \
-mine', it is a patchbay key.";
+mine', it is a patchbay key.
+
+10. The MCP client tools (`list_mcp_clients`, `add_mcp_server`, `copy_mcp_server`, \
+`remove_mcp_server`) are a third thing again: they read and edit the config files in which the AI \
+clients on this machine — Claude Code, Claude Desktop, Cursor, Codex, Windsurf, VS Code — register \
+their MCP servers. `list_mcp_clients` is cheap and safe. The other three modify another tool's \
+config, which takes effect on that tool's NEXT start, so say what you changed and that a restart \
+is needed. Confirm with the user before removing anything. Never write a secret into a server's \
+`env` or `headers` through these tools: those land in a plain-text config file. Reference an \
+environment variable name, or register the secret with `store_key`, instead.";
 
 /// `{ "tool": "gcloud" }` — identifies one supported CLI.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -123,17 +132,22 @@ pub struct PatchbayServer {
     registry: Arc<Registry>,
     /// The key vault. `pub(crate)` because its tools live in [`crate::keys`].
     pub(crate) keys: Arc<KeyRegistry>,
+    /// The MCP client board. `pub(crate)` because its tools live in
+    /// [`crate::mcp_clients`].
+    pub(crate) clients: Arc<McpClientRegistry>,
     tool_router: ToolRouter<Self>,
 }
 
 impl PatchbayServer {
-    pub fn new(registry: Registry, keys: KeyRegistry) -> Self {
+    pub fn new(registry: Registry, keys: KeyRegistry, clients: McpClientRegistry) -> Self {
         Self {
             registry: Arc::new(registry),
             keys: Arc::new(keys),
-            // Two routers, merged: connection tools here, vault tools in
-            // `keys.rs`. Built once, not per request.
-            tool_router: Self::tool_router() + Self::keys_router(),
+            clients: Arc::new(clients),
+            // Three routers, merged: connection tools here, vault tools in
+            // `keys.rs`, MCP client tools in `mcp_clients.rs`. Built once, not
+            // per request.
+            tool_router: Self::tool_router() + Self::keys_router() + Self::mcp_clients_router(),
         }
     }
 }

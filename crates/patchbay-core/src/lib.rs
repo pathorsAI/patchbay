@@ -30,6 +30,7 @@
 pub mod keys;
 pub mod keys_verify;
 pub mod keystore;
+pub mod mcp_clients;
 pub mod paths;
 pub mod probe;
 pub mod probes;
@@ -40,6 +41,9 @@ pub mod util;
 pub use keys::{KeyEntry, KeyExpiryState, KeyPatch, KeyRegistry, NewKey};
 pub use keys_verify::{verify_key, KeyVerifyOutcome, KeyVerifyStatus};
 pub use keystore::Keystore;
+pub use mcp_clients::{
+    McpClient, McpClientRegistry, McpServerEntry, McpTransport, ServerSpec, TransportSpec,
+};
 pub use paths::Paths;
 pub use probe::Probe;
 pub use registry::Registry;
