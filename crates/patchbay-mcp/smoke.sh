@@ -115,7 +115,8 @@ names = {t["name"] for t in tl["result"]["tools"]}
 expected = {"list_connections", "get_status", "switch_profile", "verify", "get_permissions",
             "store_key", "list_keys", "get_key", "remove_key", "verify_key",
             "list_mcp_clients", "add_mcp_server", "copy_mcp_server", "remove_mcp_server",
-            "check_updates", "plan_setup", "mark_setup_done"}
+            "check_updates", "plan_setup", "mark_setup_done",
+            "list_env_projects", "list_env_vars", "pull_env", "set_env_var"}
 need(names == expected, f"tool set mismatch: {sorted(names)}")
 for t in tl["result"]["tools"]:
     need(t.get("description"), f"{t['name']} has no description")
