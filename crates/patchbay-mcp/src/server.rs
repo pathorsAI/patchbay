@@ -37,9 +37,11 @@ Read this before using the tools.
 
 1. Two tiers, very different costs. `list_connections` and `get_status` are tier 1: they read \
 local config files only, take milliseconds, and never touch the network. Call them freely. \
-`verify` and `get_permissions` are tier 2: they execute the tool's own CLI and may hit the \
+`verify`, `get_permissions` and `check_updates` are tier 2: they execute CLIs and may hit the \
 network, taking seconds. Call those only when the user asks, or to resolve something tier 1 \
-left genuinely ambiguous.
+left genuinely ambiguous. `check_updates` additionally caches its results for 24 hours — calling \
+it twice in a session is waste, and its answers show up on the tier-1 board as `version` \
+afterwards.
 
 2. Look before you act. Which account, project or context is active is machine-global state \
 that the user or another process may have changed since you last looked. Start from \
@@ -56,7 +58,13 @@ run. Surface the hint; do not retry, and do not run the hint yourself.
 
 5. `expires_at: null` means the expiry is UNKNOWN — commonly the token lives in the OS \
 keychain where patchbay cannot read it without running the tool. It does not mean expired. \
-Use `verify` if you need certainty.
+Use `verify` if you need certainty. The same rule governs versions: a null `latest` means \
+patchbay could not find out, never that the tool is current.
+
+5a. When a tool behaves in a way its documentation does not explain — a missing flag, a command \
+that 'does not exist', an import that vanished — check `advisories` on the board before \
+theorising. Renames and removals (`neonctl` -> `neon`, `huggingface-cli` -> `hf`) look exactly \
+like bugs from the inside, and patchbay already knows about the ones it ships.
 
 6. Every connection tool returns metadata about credentials. Token, secret and key values are \
 never returned by them.
@@ -140,6 +148,15 @@ pub struct SwitchParams {
     /// reported by `get_status` for this tool — look it up rather than
     /// guessing at an account name.
     pub profile_id: String,
+}
+
+/// `{ "refresh": true }` — optional; omit it to use the 24-hour cache.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CheckUpdatesParams {
+    /// Re-check everything even if the cached answers are still current.
+    /// Leave this unset unless the user just installed or upgraded something:
+    /// the cache is what stops repeated calls from costing seconds each.
+    pub refresh: Option<bool>,
 }
 
 /// The MCP server. Holds one detected [`Registry`] for the process lifetime;
@@ -247,6 +264,15 @@ expired credential; call `verify` if you need certainty.
 token used for direct API calls shows up on the `wrangler` row even though no CLI tracks it. \
 Each carries { id, label, last4, expires_at, expiry_state }; anything `expired` or \
 `expiring_soon` is worth surfacing, and `verify_key` can confirm it against the issuer.
+- `version` is the CACHED result of the last `check_updates` run: { installed, latest, source, \
+update_command, checked_at, note }. It is null until someone runs `check_updates`, and null means \
+NOT CHECKED — never report it as up to date. It is never recomputed here, which is what keeps this \
+tool cheap.
+- `advisories` is curated, static knowledge about the tool itself — renames, removals, \
+end-of-life — independent of the version cache, so it is populated even when `version` is null. \
+Each is { tool, kind: { type: renamed | removed | unmaintained | info, … }, message, url }. \
+`removed` and `unmaintained` are the ones worth raising unprompted: they explain failures the user \
+has not hit yet. Pass the `url` along; every advisory is sourced.
 - `notes` carries the real caveats (malformed config, mismatched Application Default \
 Credentials, missing directory). Read them; they explain surprises.
 - A probe that fails degrades to `installed: false` plus an explanatory note, so one broken tool \
@@ -381,6 +407,64 @@ Relay the hint; do not retry.")]
             Ok(report) => Ok(json_ok(encode(&report)?)),
             Err(err) => Ok(tool_error(err)),
         }
+    }
+
+    #[tool(description = "\
+TIER 2, EXPENSIVE. Find out which CLIs on this machine are out of date, and how to update each \
+one. This EXECUTES every tool's version command and makes network calls (Homebrew, the npm \
+registry, GitHub), so it takes seconds — unlike the tier-1 board, which only reads files.
+
+Call it when the user asks about versions or updates, or before debugging a tool that is behaving \
+oddly: 'my CLI does not have that flag' and 'this command was renamed' are the failures this \
+answers. Do NOT call it as a warm-up, and do not call it again in the same session — results are \
+cached for 24 hours, and a second call inside that window returns the cache without doing any \
+work. Set refresh: true only if the user just installed or upgraded something and wants the board \
+to catch up.
+
+Results are written to a cache, so after calling this the `version` field on list_connections is \
+populated for the rest of the day.
+
+Returns { report: { entries, brew_calls, network_calls, from_cache, elapsed_ms, notes }, \
+advisories }.
+
+- `entries[]` is { tool, installed, latest, source, update_command, checked_at, note }. `source` \
+is where the tool came from and therefore who updates it, one of: homebrew, npm, bun, pnpm, \
+github, self_managed, system, unknown.
+- `latest: null` NEVER means up to date — it means patchbay could not find out, and `note` says \
+why (a self-updating vendor CLI with no package index, a spent GitHub rate limit, an unknown \
+install source). Say 'could not check', not 'current'.
+- `update_command` is the exact command for THIS machine's install — `brew upgrade gh` and \
+`npm install -g wrangler@latest` are not interchangeable, so use the one given rather than \
+guessing at a package manager. Offer it; do not run it without being asked.
+- `advisories[]` is curated deprecation knowledge, independent of version numbers: renames, \
+removals, end-of-life dates. `removed` and `unmaintained` entries are worth raising even when the \
+user only asked about versions. Every one carries a source `url` — pass it on.
+- One tool failing to answer degrades only that tool; the rest of the run still returns.")]
+    async fn check_updates(
+        &self,
+        Parameters(CheckUpdatesParams { refresh }): Parameters<CheckUpdatesParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let registry = self.registry.clone();
+        let (report, advisories) = offload(move || {
+            let report = registry.check_updates(patchbay_core::CheckOptions {
+                refresh: refresh.unwrap_or(false),
+                ..patchbay_core::CheckOptions::default()
+            });
+            // Read the board after the check so the advisories reflect the
+            // versions this run just discovered.
+            let advisories: Vec<patchbay_core::Advisory> = registry
+                .status_all()
+                .iter()
+                .flat_map(|s| s.advisories.clone())
+                .collect();
+            (report, advisories)
+        })
+        .await?;
+
+        Ok(json_ok(serde_json::json!({
+            "report": encode(&report)?,
+            "advisories": encode(&advisories)?,
+        })))
     }
 }
 

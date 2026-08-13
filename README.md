@@ -14,6 +14,7 @@
 - [What it does](#what-it-does)
 - [Install](#install)
 - [Use](#use)
+- [Keeping CLIs current](#keeping-clis-current)
 - [MCP — let your AI operate it](#mcp--let-your-ai-operate-it)
 - [Showcase](#showcase)
 - [Build from source](#build-from-source)
@@ -26,6 +27,7 @@
 - **Permissions** — see what your tokens can actually do (`gh` scopes today) and fix missing scopes with one hint.
 - **[MCP client management](docs/mcp-clients.md)** — every MCP server registered in Claude Code, Claude Desktop, Cursor, Codex, Windsurf and VS Code in one matrix; copy a server between clients without hand-editing four files in two formats.
 - **[Key vault](docs/key-vault.md)** — standalone API keys no CLI tracks: values in the macOS Keychain, metadata on disk, provider-aware `pb key verify`, and AI registration over MCP.
+- **[Keeping CLIs current](#keeping-clis-current)** — which tools are outdated, which were renamed out from under you, and the exact command to update each one.
 - **Migrate** — export to a new machine; whatever can't travel, your AI walks you through re-authing.
 
 ## Install
@@ -51,6 +53,36 @@ pb key list          # your registered API keys
 ```
 
 Or just open the panel: search with `/`, filter by category or connection state, click a card to operate that tool.
+
+## Keeping CLIs current
+
+Twenty-three CLIs drift. Some are versions behind, some were renamed out from under you (`neonctl` → `neon`, `huggingface-cli` → `hf`), and you find out when something breaks.
+
+```sh
+pb check-updates             # what's outdated, and the exact command to fix each one
+pb check-updates --refresh   # ignore the 24h cache and re-check everything
+```
+
+```
+TOOL         INSTALLED       LATEST          SOURCE         UPDATE WITH
+gh           2.95.0          2.97.0          brew           brew upgrade gh
+kubectl      1.32.2          1.36.3          brew           brew upgrade kubernetes-cli
+neon         2.38.2          3.1.1           brew           brew upgrade neonctl
+wrangler     4.105.0         4.122.0         bun            bun add -g wrangler@latest
+vercel       42.2.0          58.11.0         pnpm           pnpm add -g vercel@latest
+gcloud       578.0.0         —               self-managed
+```
+
+patchbay works out **how each tool was installed** and asks the right place. Every Homebrew tool is answered by a single `brew outdated --json=v2` call, npm/bun/pnpm globals by one small registry request each, and self-updating vendor CLIs (`gcloud`, `az`) by nothing at all — they get their own update command instead of a made-up version number. `latest: —` always means "could not check", never "up to date".
+
+Results are cached at `~/.config/patchbay/versions.json` for 24 hours. **`pb status` only ever reads that cache** — it never executes a binary and never touches the network, so the board stays in the tens of milliseconds whether the cache is warm or cold. A warm cache adds an update marker to the board:
+
+```
+gh           github.com/YJack0000          2         —      ↑ 2.95.0 → 2.97.0 · token expiry unknown…
+neon         default                       1         —      ⚠ advisory · ↑ 2.38.2 → 3.1.1
+```
+
+**Advisories** (`⚠`) are curated deprecation notices — renames, removals, end-of-life dates — and they show up whether or not the version cache is warm, because they are static data. Each one is gated so it only appears where it applies (the AWS CLI v1 end-of-support notice never shows on v2), carries a source URL, and `pb check-updates` exits non-zero when something is genuinely removed or unmaintained. Nothing goes in the table without vendor documentation behind it.
 
 ## MCP — let your AI operate it
 

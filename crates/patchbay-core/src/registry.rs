@@ -5,12 +5,14 @@ use std::collections::HashMap;
 
 use chrono::Utc;
 
+use crate::deprecations;
 use crate::keys::KeyRegistry;
 use crate::keystore::SecurityCliKeystore;
 use crate::paths::Paths;
 use crate::probe::Probe;
 use crate::probes;
 use crate::types::{KeyRef, PermissionsReport, SwitchOutcome, ToolStatus, VerifyOutcome};
+use crate::versions::{self, CheckOptions, CheckReport, VersionCache};
 
 pub struct Registry {
     probes: Vec<Box<dyn Probe>>,
@@ -111,6 +113,10 @@ impl Registry {
     pub fn status_all(&self) -> Vec<ToolStatus> {
         // Read the vault once for the whole board, not once per tool.
         let linked = self.linked_keys();
+        // Likewise the version cache: one file read for all 23 rows. This path
+        // never execs and never dials out — a cold cache simply means no
+        // version column.
+        let versions = VersionCache::load(&self.paths.versions_file());
         let mut all: Vec<ToolStatus> = self
             .probes
             .iter()
@@ -121,6 +127,7 @@ impl Registry {
                     status
                 });
                 linked.attach(&mut status);
+                self.attach_versions(&mut status, &versions);
                 status
             })
             .collect();
@@ -142,7 +149,49 @@ impl Registry {
     pub fn status(&self, tool: &str) -> anyhow::Result<ToolStatus> {
         let mut status = self.require(tool)?.status()?;
         self.linked_keys().attach(&mut status);
+        self.attach_versions(
+            &mut status,
+            &VersionCache::load(&self.paths.versions_file()),
+        );
         Ok(status)
+    }
+
+    /// Stamp the cached version info and any curated advisories onto a row.
+    ///
+    /// Deliberately cheap and deliberately incomplete: it reads the cache and a
+    /// static table, and would rather report nothing than execute anything.
+    fn attach_versions(&self, status: &mut ToolStatus, cache: &VersionCache) {
+        status.version = cache.get(&status.tool).cloned();
+
+        // Advisories are static data, so they do not need the cache to be warm.
+        // The `PATH` lookups that feed the context only happen for the handful
+        // of tools that actually have a rule.
+        if !deprecations::has_rules(&status.tool) {
+            return;
+        }
+        let installed = status.version.as_ref().and_then(|v| v.installed.as_deref());
+        let binaries: Vec<&'static str> = versions::spec_for(&status.tool)
+            .map(|spec| {
+                spec.bins
+                    .iter()
+                    .copied()
+                    .filter(|bin| self.paths.has_binary(bin))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let ctx = deprecations::AdvisoryContext::new(installed, &binaries);
+        status.advisories = deprecations::advisories_for(&status.tool, &ctx);
+    }
+
+    /// TIER 2. Execute every tool's version command and ask its install source
+    /// what the current release is, then write the answers to the cache that
+    /// [`Registry::status_all`] reads.
+    ///
+    /// Seconds, not milliseconds: this is the only entry point in patchbay that
+    /// both spawns processes and makes outbound requests.
+    pub fn check_updates(&self, options: CheckOptions) -> CheckReport {
+        let tools = self.tool_names();
+        versions::check_updates(&self.paths, &tools, options)
     }
 
     /// The vault, indexed by the tool each key belongs beside.
@@ -472,6 +521,156 @@ mod tests {
             .filter(|s| s.notes.iter().any(|n| n.contains("unknown key")))
             .count();
         assert_eq!(carriers, 1);
+    }
+
+    // --- versions and advisories on the board -------------------------------
+
+    fn write_versions(paths: &Paths, entries: &[(&str, &str, Option<&str>)]) {
+        let mut cache = crate::versions::VersionCache::default();
+        for (tool, installed, latest) in entries {
+            let mut info = crate::versions::VersionInfo {
+                tool: tool.to_string(),
+                installed: Some(installed.to_string()),
+                latest: latest.map(String::from),
+                source: crate::versions::Source::Homebrew,
+                update_command: Some(format!("brew upgrade {tool}")),
+                checked_at: Utc::now(),
+                note: None,
+            };
+            info.note = None;
+            cache.put(info);
+        }
+        cache.save(&paths.versions_file()).unwrap();
+    }
+
+    #[test]
+    fn test_a_cold_cache_means_no_version_info_and_never_a_delay() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::all(Paths::for_test(dir.path()));
+        for status in registry.status_all() {
+            assert!(
+                status.version.is_none(),
+                "{} invented version info from nothing",
+                status.tool
+            );
+            assert!(!status.update_available());
+        }
+    }
+
+    #[test]
+    fn test_the_board_reads_whatever_the_version_cache_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::for_test(dir.path());
+        write_versions(
+            &paths,
+            &[
+                ("gh", "2.95.0", Some("2.97.0")),
+                ("rclone", "1.73.5", Some("1.73.5")),
+                ("docker", "28.3.2", None),
+            ],
+        );
+
+        let board = Registry::all(paths).status_all();
+        let row = |tool: &str| board.iter().find(|s| s.tool == tool).unwrap();
+
+        let gh = row("gh");
+        assert!(gh.update_available());
+        assert_eq!(
+            gh.version.as_ref().unwrap().marker().as_deref(),
+            Some("2.95.0 → 2.97.0")
+        );
+        // Current: version shown, no update claimed.
+        assert!(!row("rclone").update_available());
+        // Unknown latest is never reported as an update.
+        assert!(!row("docker").update_available());
+        // A tool with nothing cached simply has nothing.
+        assert!(row("kubectl").version.is_none());
+    }
+
+    #[test]
+    fn test_advisories_reach_the_board_from_static_data_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::for_test(dir.path());
+        // Only the version is needed for a version-gated advisory — no exec,
+        // no network, and no PATH lookups (which are disabled in tests).
+        write_versions(&paths, &[("aws", "1.29.0", None), ("op", "2.30.0", None)]);
+
+        let board = Registry::all(paths).status_all();
+        let row = |tool: &str| board.iter().find(|s| s.tool == tool).unwrap();
+
+        let aws = row("aws");
+        assert_eq!(aws.advisories.len(), 1, "AWS CLI v1 is in maintenance mode");
+        assert_eq!(aws.blocking_advisories().len(), 1);
+        assert!(aws.advisories[0].message.contains("v2"));
+        assert!(aws.advisories[0].url.is_some(), "every advisory is sourced");
+
+        // v2 of the 1Password CLI has nothing to answer for.
+        assert!(row("op").advisories.is_empty());
+        // Neither does a tool with no rules at all.
+        assert!(row("gh").advisories.is_empty());
+    }
+
+    #[test]
+    fn test_version_and_advisories_survive_the_json_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::for_test(dir.path());
+        write_versions(&paths, &[("aws", "1.29.0", Some("2.32.6"))]);
+
+        let board = Registry::all(paths).status_all();
+        let aws = board.iter().find(|s| s.tool == "aws").unwrap();
+
+        let json = serde_json::to_value(aws).unwrap();
+        assert_eq!(json["version"]["installed"], "1.29.0");
+        // The wire name is the full `homebrew`; `brew` is only the short label
+        // the terminal column uses.
+        assert_eq!(json["version"]["source"], "homebrew");
+        assert_eq!(json["advisories"][0]["kind"]["type"], "unmaintained");
+        // The derived field is still there, and still not an input.
+        assert_eq!(json["connection_state"], "not_installed");
+
+        let back: ToolStatus = serde_json::from_value(json).unwrap();
+        assert_eq!(&back, aws);
+    }
+
+    #[test]
+    fn test_json_written_before_versions_existed_still_reads() {
+        let legacy = serde_json::json!({
+            "tool": "gh", "installed": true, "profiles": [], "active": null,
+            "notes": [], "category": "code", "registered_keys": []
+        });
+        let back: ToolStatus = serde_json::from_value(legacy).unwrap();
+        assert!(back.version.is_none());
+        assert!(back.advisories.is_empty());
+    }
+
+    #[test]
+    fn test_a_corrupt_version_cache_never_blanks_the_board() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::for_test(dir.path());
+        std::fs::create_dir_all(paths.patchbay_dir()).unwrap();
+        std::fs::write(paths.versions_file(), "{ not json").unwrap();
+
+        let registry = Registry::all(paths);
+        let board = registry.status_all();
+        assert_eq!(board.len(), 23);
+        for status in &board {
+            assert!(status.version.is_none());
+            assert!(status.notes.is_empty(), "{} got noisy", status.tool);
+        }
+    }
+
+    #[test]
+    fn test_the_single_tool_path_agrees_with_the_board() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::for_test(dir.path());
+        write_versions(&paths, &[("gh", "2.95.0", Some("2.97.0"))]);
+
+        let registry = Registry::all(paths);
+        let one = registry.status("gh").unwrap();
+        let board = registry.status_all();
+        let from_board = board.iter().find(|s| s.tool == "gh").unwrap();
+        assert_eq!(&one, from_board);
+        assert!(one.update_available());
     }
 
     #[test]

@@ -27,6 +27,7 @@
 //! goes straight to the OS keychain ([`keystore`]), and
 //! [`KeyRegistry::get_secret`] is the single, gated way back out.
 
+pub mod deprecations;
 pub mod keys;
 pub mod keys_verify;
 pub mod keystore;
@@ -37,7 +38,9 @@ pub mod probes;
 pub mod registry;
 pub mod types;
 pub mod util;
+pub mod versions;
 
+pub use deprecations::{Advisory, AdvisoryKind};
 pub use keys::{KeyEntry, KeyExpiryState, KeyPatch, KeyRegistry, NewKey};
 pub use keys_verify::{verify_key, KeyVerifyOutcome, KeyVerifyStatus};
 pub use keystore::Keystore;
@@ -51,3 +54,4 @@ pub use types::{
     ConnectionState, KeyRef, PermissionsReport, Profile, SwitchOutcome, ToolCategory, ToolStatus,
     VerifyOutcome,
 };
+pub use versions::{CheckOptions, CheckReport, Source, VersionCache, VersionInfo};

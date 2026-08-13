@@ -134,6 +134,16 @@ pub struct ToolStatus {
     /// by [`crate::Registry`] when a key registry is attached; empty otherwise.
     #[serde(default)]
     pub registered_keys: Vec<KeyRef>,
+    /// Installed version, latest version and how to update — read from the
+    /// version cache, never computed here. `None` on a cold cache, which is the
+    /// normal state until someone runs `pb check-updates`; it means "not
+    /// checked yet", never "up to date".
+    #[serde(default)]
+    pub version: Option<crate::versions::VersionInfo>,
+    /// Curated notices: renames, removals, end-of-life. Static data, so these
+    /// are present whether or not the version cache is warm.
+    #[serde(default)]
+    pub advisories: Vec<crate::deprecations::Advisory>,
 }
 
 impl ToolCategory {
@@ -155,8 +165,10 @@ impl Serialize for ToolStatus {
             notes,
             category,
             registered_keys,
+            version,
+            advisories,
         } = self;
-        let mut out = serializer.serialize_struct("ToolStatus", 8)?;
+        let mut out = serializer.serialize_struct("ToolStatus", 10)?;
         out.serialize_field("tool", tool)?;
         out.serialize_field("installed", installed)?;
         out.serialize_field("category", category)?;
@@ -164,6 +176,8 @@ impl Serialize for ToolStatus {
         out.serialize_field("active", active)?;
         out.serialize_field("notes", notes)?;
         out.serialize_field("registered_keys", registered_keys)?;
+        out.serialize_field("version", version)?;
+        out.serialize_field("advisories", advisories)?;
         out.serialize_field("connection_state", &self.connection_state())?;
         out.end()
     }
@@ -180,7 +194,20 @@ impl ToolStatus {
             active: None,
             notes: Vec::new(),
             registered_keys: Vec::new(),
+            version: None,
+            advisories: Vec::new(),
         }
+    }
+
+    /// `true` when the version cache says a newer release is available.
+    /// `false` on a cold cache — an unknown is never reported as an update.
+    pub fn update_available(&self) -> bool {
+        self.version.as_ref().is_some_and(|v| v.update_available())
+    }
+
+    /// Advisories serious enough to act on: something removed or abandoned.
+    pub fn blocking_advisories(&self) -> Vec<&crate::deprecations::Advisory> {
+        self.advisories.iter().filter(|a| a.is_blocking()).collect()
     }
 
     /// Keys on this row that have expired or are about to.
