@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
-import { permissions as fetchPerms, statusAll, switchProfile, verify as runVerify } from "./api";
+import { permissions as fetchPerms, statusAll, switchProfile, verifyProfile } from "./api";
 import { clockTime, summarize, summaryLine } from "./expiry";
 import { apply, isFiltered, NO_FILTERS, type Filters } from "./filters";
-import { switchMessage, type Panel, type SwitchNote } from "./panel";
-import { CATEGORY_LABEL, STATE_LABEL, type PermissionsReport, type ToolStatus, type VerifyOutcome } from "./types";
+import { rowKey, switchMessage, type Panel, type SwitchNote, type View } from "./panel";
+import { categoryLabel, STATE_LABEL, type PermissionsReport, type ToolStatus, type VerifyOutcome } from "./types";
+import { KeysView } from "./components/KeysView";
+import { McpView } from "./components/McpView";
 import { Sidebar } from "./components/Sidebar";
 import { ToolCard } from "./components/ToolCard";
 import { ToolDetail } from "./components/ToolDetail";
@@ -21,6 +23,7 @@ export default function App() {
   const [now, setNow] = useState(() => Date.now());
   const [version, setVersion] = useState("");
   const [filters, setFilters] = useState<Filters>(NO_FILTERS);
+  const [view, setView] = useState<View>("board");
 
   const [detail, setDetail] = useState<{ tool: string; permissions: boolean } | null>(null);
   const [verdicts, setVerdicts] = useState<Record<string, VerifyOutcome | null>>({});
@@ -74,6 +77,7 @@ export default function App() {
         searchRef.current?.select();
       } else if (e.key === "Escape" && !detailOpen) {
         setFilters(NO_FILTERS);
+        setView("board");
         searchRef.current?.blur();
       }
     };
@@ -86,12 +90,13 @@ export default function App() {
 
   const actions = useMemo(
     () => ({
-      verify(tool: string) {
-        setVerdicts((v) => ({ ...v, [tool]: null }));
-        runVerify(tool)
-          .then((outcome) => setVerdicts((v) => ({ ...v, [tool]: outcome })))
+      verifyRow(tool: string, profileId: string) {
+        const key = rowKey(tool, profileId);
+        setVerdicts((v) => ({ ...v, [key]: null }));
+        verifyProfile(tool, profileId)
+          .then((outcome) => setVerdicts((v) => ({ ...v, [key]: outcome })))
           .catch((e) =>
-            setVerdicts((v) => ({ ...v, [tool]: { result: "invalid", tool, detail: String(e) } })),
+            setVerdicts((v) => ({ ...v, [key]: { result: "invalid", tool, detail: String(e) } })),
           );
       },
       loadPerms(tool: string) {
@@ -113,7 +118,7 @@ export default function App() {
           );
       },
       switchTo(tool: string, profileId: string) {
-        setSwitching(`${tool}:${profileId}`);
+        setSwitching(rowKey(tool, profileId));
         setSwitchNotes((n) => {
           const next = { ...n };
           delete next[tool];
@@ -141,13 +146,17 @@ export default function App() {
   const filtered = isFiltered(filters);
 
   let summary: string;
-  if (!statuses) {
+  if (view === "keys") {
+    summary = "key vault — keys no CLI tracks";
+  } else if (view === "mcp") {
+    summary = "MCP clients — one board per AI client";
+  } else if (!statuses) {
     summary = "reading local state…";
   } else if (!filtered) {
     summary = summaryLine(summarize(all, now));
   } else {
     const parts = [`${shown.length} of ${all.length}`];
-    if (filters.category) parts.push(CATEGORY_LABEL[filters.category]);
+    if (filters.category) parts.push(categoryLabel(filters.category));
     if (filters.state) parts.push(STATE_LABEL[filters.state]);
     if (filters.query.trim()) parts.push(`“${filters.query.trim()}”`);
     summary = parts.join(" · ");
@@ -176,37 +185,51 @@ export default function App() {
       </header>
 
       <div className="body">
-        <Sidebar ref={searchRef} statuses={all} filters={filters} onChange={setFilters} />
+        <Sidebar
+          ref={searchRef}
+          statuses={all}
+          filters={filters}
+          onChange={setFilters}
+          view={view}
+          onView={setView}
+        />
 
         <main className="board">
-          {error && (
-            <div className="banner">
-              <span className="glyph">△</span>
-              <span>{error}</span>
-            </div>
-          )}
+          {view === "keys" && <KeysView />}
+          {view === "mcp" && <McpView />}
 
-          {!statuses && !error && <p className="placeholder">probing…</p>}
+          {view === "board" && (
+            <>
+              {error && (
+                <div className="banner">
+                  <span className="glyph">△</span>
+                  <span>{error}</span>
+                </div>
+              )}
 
-          {statuses && all.length === 0 && (
-            <p className="placeholder">no probes registered — nothing to show</p>
-          )}
+              {!statuses && !error && <p className="placeholder">probing…</p>}
 
-          {statuses && all.length > 0 && shown.length === 0 && (
-            <div className="empty">
-              <p className="empty-line">no tools match</p>
-              <button className="action" onClick={() => setFilters(NO_FILTERS)}>
-                clear filters
-              </button>
-            </div>
-          )}
+              {statuses && all.length === 0 && (
+                <p className="placeholder">no probes registered — nothing to show</p>
+              )}
 
-          {shown.length > 0 && (
-            <div className="grid">
-              {shown.map((s) => (
-                <ToolCard key={s.tool} status={s} panel={panel} />
-              ))}
-            </div>
+              {statuses && all.length > 0 && shown.length === 0 && (
+                <div className="empty">
+                  <p className="empty-line">no tools match</p>
+                  <button className="action" onClick={() => setFilters(NO_FILTERS)}>
+                    clear filters
+                  </button>
+                </div>
+              )}
+
+              {shown.length > 0 && (
+                <div className="grid">
+                  {shown.map((s) => (
+                    <ToolCard key={s.tool} status={s} panel={panel} />
+                  ))}
+                </div>
+              )}
+            </>
           )}
         </main>
       </div>

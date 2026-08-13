@@ -25,11 +25,22 @@
   /* Brand marks that are monochrome by design have no colour of their own to
      hold onto, so they follow the panel instead: GitHub's mark is black or
      white, AWS's is orange on dark and squid ink on light, Infisical's is the
-     pale blue of their own dark-ground asset. Every other mark keeps its
-     literal brand colours and needs no token. */
+     pale blue of their own dark-ground asset. Vercel's triangle and Anthropic's
+     mark are defined as black-or-white; Tailscale and Ollama publish a single
+     near-black glyph; Fly.io's brandmark carries no fill at all and its brand
+     navy (#24175B) would vanish here, as would ngrok's #1F1E37. patchbay's own
+     ssh monogram follows the ink, since it is lettering more than a logo.
+     Every other mark keeps its literal brand colours and needs no token. */
   --logo-gh: #e4e8e7;
   --logo-aws: #ff9900;
   --logo-infisical: #d9e8ff;
+  --logo-vercel: #e4e8e7;
+  --logo-claude: #e4e8e7;
+  --logo-tailscale: #e4e8e7;
+  --logo-ollama: #e4e8e7;
+  --logo-flyctl: #b6a6f0;
+  --logo-ngrok: #e4e8e7;
+  --logo-ssh: #b2bcbb;
 
   color-scheme: dark;
 }
@@ -56,6 +67,13 @@
     --logo-gh: #181717;
     --logo-aws: #232f3e;
     --logo-infisical: #0b0b0b;
+    --logo-vercel: #141a1b;
+    --logo-claude: #141a1b;
+    --logo-tailscale: #141a1b;
+    --logo-ollama: #141a1b;
+    --logo-flyctl: #24175b;
+    --logo-ngrok: #1f1e37;
+    --logo-ssh: #3d4849;
 
     color-scheme: light;
   }
@@ -288,6 +306,28 @@ button {
   color: var(--muted);
 }
 
+/* The views below this rule replace the board rather than narrow it, so they
+   are separated from the filters instead of being mixed in with them. */
+.side-rule {
+  flex: none;
+  margin: 0 6px;
+  border: 0;
+  border-top: 1px solid var(--line);
+}
+
+.side-glyph {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 11px;
+  color: var(--muted);
+}
+
+.side-item.is-on .side-glyph {
+  color: var(--accent);
+}
+
 /* ---------- connection state ---------- */
 
 .state-dot {
@@ -443,6 +483,28 @@ button {
   white-space: nowrap;
 }
 
+/* Vault keys registered against this tool. Count only, same as the notes
+   badge: the labels are in the detail view and the values are nowhere. */
+.key-badge {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--muted);
+}
+
+.key-badge.is-warn {
+  color: var(--warn);
+}
+
+/* Drawn, not typed: see Glyphs.tsx. */
+.glyph-svg {
+  flex: none;
+  display: block;
+}
+
 /* Count only — the note text itself belongs to the detail view. */
 .warn-badge {
   flex: none;
@@ -453,32 +515,6 @@ button {
   font-family: var(--mono);
   font-size: 10px;
   color: var(--warn);
-}
-
-.switch {
-  flex: none;
-  padding: 1px 7px;
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  background: transparent;
-  color: var(--muted);
-  font-family: var(--mono);
-  font-size: 10.5px;
-  cursor: pointer;
-  opacity: 0.55;
-  transition: opacity 90ms linear, color 90ms linear, border-color 90ms linear;
-}
-
-.switch:hover,
-.switch:focus-visible {
-  opacity: 1;
-  color: var(--ink);
-  border-color: var(--accent);
-}
-
-.switch:disabled {
-  cursor: default;
-  opacity: 0.35;
 }
 
 /* chips */
@@ -825,9 +861,200 @@ button {
   color: var(--accent);
 }
 
-.switch.always {
-  opacity: 1;
+/* Switching *is* what a profile row is for, so the row's information is the
+   target — not a 60px button beside it. The whole row lights up; the foot
+   names the actions. The active row has nothing to switch to and stays inert. */
+.dprofile {
+  transition: border-color 90ms linear, background 90ms linear;
+}
+
+.dprofile-body {
+  min-width: 0;
+}
+
+.dprofile.is-armed .dprofile-body {
+  cursor: pointer;
+}
+
+.dprofile.is-armed:hover,
+.dprofile.is-armed:focus-within {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
+  background: var(--panel);
+}
+
+.dprofile.is-armed .dprofile-body[aria-disabled="true"] {
+  cursor: default;
+}
+
+/* Actions live below the information, in the row but outside the switch
+   target, so no interactive element is nested inside another. */
+.dprofile-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px -10px -8px;
+  padding: 4px 10px;
+  border-top: 1px solid var(--line-soft);
+  border-radius: 0 0 7px 7px;
+  min-width: 0;
+}
+
+.row-action {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 1px 7px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: transparent;
   color: var(--ink-2);
+  font-family: var(--mono);
+  font-size: 10px;
+  cursor: pointer;
+  transition: border-color 90ms linear, color 90ms linear;
+}
+
+.row-action:hover:not(:disabled) {
+  color: var(--ink);
+  border-color: var(--accent);
+}
+
+.row-action:disabled {
+  cursor: default;
+  color: var(--muted);
+}
+
+/* The result of the last check on this profile. Persists until the board
+   refreshes: an answer that vanishes while you read it is not an answer. */
+.row-verdict {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10.5px;
+  color: var(--ink-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Named the action, not decorated it: the switch button carries the row's
+   accent wash and is revealed on hover, but it is a real button all along. */
+.row-switch {
+  flex: none;
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 9px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--accent);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 90ms linear, background 90ms linear;
+}
+
+.dprofile.is-armed:hover .row-switch,
+.dprofile.is-armed:focus-within .row-switch,
+.row-switch:focus-visible,
+.dprofile.is-busy .row-switch {
+  opacity: 1;
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.row-switch:disabled {
+  cursor: default;
+  color: var(--muted);
+}
+
+.switch-arrow {
+  display: inline-block;
+  transition: transform 90ms ease-out;
+}
+
+.dprofile.is-armed:hover .switch-arrow {
+  transform: translateX(2px);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dprofile,
+  .row-action,
+  .row-switch,
+  .switch-arrow {
+    transition: none;
+  }
+
+  .dprofile.is-armed:hover .switch-arrow {
+    transform: none;
+  }
+}
+
+/* The labelled last resort: an action patchbay genuinely cannot perform, with
+   the reason first and the command second. Never used for something the panel
+   could have just run. */
+.last-resort {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line-soft);
+  border-left: 2px solid var(--warn);
+  border-radius: 6px;
+  background: var(--panel-2);
+}
+
+.last-resort-why {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--ink-2);
+}
+
+/* registered vault keys, in the detail view */
+
+.dkeys {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.dkey {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 6px 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--panel-2);
+}
+
+.dkey-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The only thing in the panel derived from a secret value. */
+.dkey-last4 {
+  flex: none;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--muted);
 }
 
 .kvs {
@@ -912,4 +1139,201 @@ button {
   display: flex;
   flex-wrap: wrap;
   gap: 4px;
+}
+
+/* ---------- key vault / MCP clients ---------- */
+
+.view {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+}
+
+.view-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+
+.view-head-sub {
+  margin-top: 4px;
+}
+
+.view-title {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.small-title {
+  font-size: 11px;
+  color: var(--muted);
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.view-sub {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.vault-blurb {
+  margin: 0;
+  max-width: 56ch;
+  line-height: 1.55;
+}
+
+/* Wide tables scroll inside their own frame; the pane never scrolls sideways. */
+.scroller {
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11.5px;
+}
+
+.table th {
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--line);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  text-align: left;
+  white-space: nowrap;
+}
+
+.table td {
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--line-soft);
+  color: var(--ink-2);
+  vertical-align: middle;
+}
+
+.table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.table tbody tr:hover {
+  background: var(--panel-2);
+}
+
+.table-keys {
+  min-width: 640px;
+}
+
+.table-mcp {
+  min-width: 760px;
+}
+
+.cell-id {
+  font-family: var(--mono);
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+.cell-mono {
+  font-family: var(--mono);
+  white-space: nowrap;
+}
+
+.cell-last4 {
+  color: var(--muted);
+}
+
+.cell-purpose {
+  min-width: 170px;
+}
+
+.cell-transport {
+  max-width: 240px;
+  font-size: 10.5px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.col-client,
+.cell-mark {
+  text-align: center;
+}
+
+/* A client with no config file keeps its column: an empty column is the answer
+   to "did I set it up there?", and hiding it would lose the answer. */
+.col-client.is-absent {
+  opacity: 0.5;
+}
+
+.cell-mark {
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.mark-user {
+  color: var(--ok);
+}
+
+.mark-project {
+  font-size: 9.5px;
+  color: var(--accent);
+}
+
+.mark-none {
+  color: var(--line);
+}
+
+.paths {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.paths li {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+
+.paths li.is-absent {
+  opacity: 0.5;
+}
+
+.path-label {
+  flex: none;
+  width: 92px;
+  font-size: 11px;
+  color: var(--ink-2);
+}
+
+.path-file {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.path-count {
+  flex: none;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--muted);
 }

@@ -79,6 +79,17 @@ jobs:
         run: bun run build
         working-directory: app
 
+      # Every tool the core reports must have a brand mark in the panel. This
+      # is a set difference — the tool keys `pb status --json` emits minus the
+      # keys ToolLogo.tsx registers — and it exists because the failure it
+      # catches is silent: a new probe lands, its card renders a two-letter
+      # monogram next to two dozen real logos, and nobody notices in review.
+      # See the rule in CONTRIBUTING.md.
+      - name: Logo check (every tool has a mark)
+        run: |
+          cargo run -q -p patchbay-cli -- status --json \
+            | bun scripts/ci/logo-check.ts
+
       - name: Clippy (src-tauri)
         run: cargo clippy --all-targets -- -D warnings
         working-directory: app/src-tauri

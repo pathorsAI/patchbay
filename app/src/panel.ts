@@ -1,5 +1,12 @@
 import type { Meta, PermissionsReport, SwitchOutcome, VerifyOutcome } from "./types";
 
+/**
+ * What the main pane is showing. The board is the app; the other two are
+ * read-only surfaces onto the same machine that the board cannot express —
+ * keys no CLI tracks, and MCP servers that belong to clients rather than tools.
+ */
+export type View = "board" | "keys" | "mcp";
+
 /** A finished switch attempt, flattened for display. */
 export interface SwitchNote {
   text: string;
@@ -12,15 +19,25 @@ export interface SwitchNote {
  * two views onto the same thing: a verify run from a card is still there when
  * the tool's detail opens, and a switch from either re-reads the board.
  */
+/** The key a per-profile result is filed under. */
+export function rowKey(tool: string, profileId: string): string {
+  return `${tool}:${profileId}`;
+}
+
 export interface Panel {
   now: number;
-  /** `null` = in flight, `undefined` = never run. */
+  /**
+   * Keyed by `rowKey`: verification is per profile, because "is this login
+   * still good?" is a question about a credential, not about a tool.
+   * `null` = in flight, `undefined` = never run. Results persist until the
+   * next board refresh, so an answer does not vanish while you read it.
+   */
   verdicts: Record<string, VerifyOutcome | null>;
   perms: Record<string, PermissionsReport | null>;
-  /** `"<tool>:<profile_id>"` of the switch in flight. */
+  /** `rowKey` of the switch in flight. */
   switching: string | null;
   switchNotes: Record<string, SwitchNote>;
-  verify(tool: string): void;
+  verifyRow(tool: string, profileId: string): void;
   loadPerms(tool: string): void;
   switchTo(tool: string, profileId: string): void;
   open(tool: string, opts?: { permissions?: boolean }): void;

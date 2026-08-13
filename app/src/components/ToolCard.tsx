@@ -3,6 +3,7 @@ import { headlineExpiry } from "../expiry";
 import type { Panel } from "../panel";
 import { STATE_LABEL, type ToolStatus } from "../types";
 import { ExpiryChip } from "./Chip";
+import { KeyGlyph } from "./Glyphs";
 import { ToolLogo } from "./ToolLogo";
 
 /**
@@ -15,6 +16,13 @@ export function ToolCard({ status, panel }: { status: ToolStatus; panel: Panel }
   const active = status.profiles.find((p) => p.id === status.active) ?? null;
   const state = status.connection_state;
   const profiles = status.profiles.length;
+  const keys = status.registered_keys;
+  // A vault key sitting beside this tool's login is a fact about the tool that
+  // no probe can see, so it earns a mark of its own. Count only — the labels
+  // and expiries are in the detail view, and the values are nowhere.
+  const keysWanting = keys.filter(
+    (k) => k.expiry_state === "expired" || k.expiry_state === "expiring_soon",
+  ).length;
 
   const open = () => panel.open(status.tool);
   const onKey = (e: KeyboardEvent) => {
@@ -58,6 +66,17 @@ export function ToolCard({ status, panel }: { status: ToolStatus; panel: Panel }
         <span className="card-count">
           {profiles} {profiles === 1 ? "profile" : "profiles"}
         </span>
+        {keys.length > 0 && (
+          <span
+            className={`key-badge${keysWanting > 0 ? " is-warn" : ""}`}
+            title={`${keys.length} registered key${keys.length === 1 ? "" : "s"}${
+              keysWanting > 0 ? `, ${keysWanting} needing attention` : ""
+            } — open for detail`}
+          >
+            <KeyGlyph size={10} />
+            {keys.length}
+          </span>
+        )}
         {status.notes.length > 0 && (
           <span className="warn-badge" title={`${status.notes.length} note(s) — open for detail`}>
             <span className="glyph">△</span>

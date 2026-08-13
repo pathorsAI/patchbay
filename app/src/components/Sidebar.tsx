@@ -1,43 +1,51 @@
 import { forwardRef } from "react";
 import type { Filters } from "../filters";
 import { counts } from "../filters";
+import type { View } from "../panel";
+import { KeyGlyph, MatrixGlyph } from "./Glyphs";
 import {
-  CATEGORY_LABEL,
+  categoriesPresent,
+  categoryLabel,
   STATE_LABEL,
   STATES,
   type ConnectionState,
-  type ToolCategory,
   type ToolStatus,
 } from "../types";
-
-/** Categories in a fixed order, so the list does not reshuffle as tools change. */
-const CATEGORY_ORDER: ToolCategory[] = [
-  "cloud",
-  "code",
-  "secrets",
-  "cluster",
-  "edge",
-  "storage",
-  "other",
-];
 
 interface Props {
   statuses: ToolStatus[];
   filters: Filters;
   onChange(next: Filters): void;
+  view: View;
+  onView(next: View): void;
 }
 
 /**
  * The board's index: search at the top, what a tool is in the middle, how it
  * is doing at the bottom. Category and state compose with AND; "All" in either
  * list clears that dimension only.
+ *
+ * Below a rule sit the two views that are not the board. They are a different
+ * kind of thing from a filter — they replace the board rather than narrow it —
+ * so they are separated rather than mixed into the lists above.
  */
 export const Sidebar = forwardRef<HTMLInputElement, Props>(function Sidebar(
-  { statuses, filters, onChange },
+  { statuses, filters, onChange, view, onView },
   searchRef,
 ) {
   const { total, byCategory, byState } = counts(statuses, filters.query);
-  const categories = CATEGORY_ORDER.filter((c) => (byCategory.get(c) ?? 0) > 0);
+  // Derived from what the probes actually reported, not from a list in this
+  // file: a category core adds tomorrow shows up here without a panel release,
+  // and a machine with no payments CLI is not offered a Payments filter.
+  const categories = categoriesPresent(byCategory.keys());
+
+  // Clicking a filter while a side view is open means "show me the board",
+  // otherwise the click would appear to do nothing.
+  const filter = (next: Filters) => {
+    onChange(next);
+    onView("board");
+  };
+  const onBoard = view === "board";
 
   return (
     <nav className="sidebar" aria-label="filters">
@@ -60,8 +68,8 @@ export const Sidebar = forwardRef<HTMLInputElement, Props>(function Sidebar(
         <ul className="side-list">
           <li>
             <button
-              className={`side-item${filters.category === null ? " is-on" : ""}`}
-              onClick={() => onChange({ ...filters, category: null })}
+              className={`side-item${onBoard && filters.category === null ? " is-on" : ""}`}
+              onClick={() => filter({ ...filters, category: null })}
             >
               <span className="side-name">All</span>
               <span className="side-count">{total}</span>
@@ -70,10 +78,10 @@ export const Sidebar = forwardRef<HTMLInputElement, Props>(function Sidebar(
           {categories.map((c) => (
             <li key={c}>
               <button
-                className={`side-item${filters.category === c ? " is-on" : ""}`}
-                onClick={() => onChange({ ...filters, category: filters.category === c ? null : c })}
+                className={`side-item${onBoard && filters.category === c ? " is-on" : ""}`}
+                onClick={() => filter({ ...filters, category: filters.category === c ? null : c })}
               >
-                <span className="side-name">{CATEGORY_LABEL[c]}</span>
+                <span className="side-name">{categoryLabel(c)}</span>
                 <span className="side-count">{byCategory.get(c)}</span>
               </button>
             </li>
@@ -86,8 +94,8 @@ export const Sidebar = forwardRef<HTMLInputElement, Props>(function Sidebar(
         <ul className="side-list">
           <li>
             <button
-              className={`side-item${filters.state === null ? " is-on" : ""}`}
-              onClick={() => onChange({ ...filters, state: null })}
+              className={`side-item${onBoard && filters.state === null ? " is-on" : ""}`}
+              onClick={() => filter({ ...filters, state: null })}
             >
               <span className="side-name">All</span>
               <span className="side-count">{total}</span>
@@ -98,8 +106,8 @@ export const Sidebar = forwardRef<HTMLInputElement, Props>(function Sidebar(
             return (
               <li key={s}>
                 <button
-                  className={`side-item${filters.state === s ? " is-on" : ""}${n === 0 ? " is-void" : ""}`}
-                  onClick={() => onChange({ ...filters, state: filters.state === s ? null : s })}
+                  className={`side-item${onBoard && filters.state === s ? " is-on" : ""}${n === 0 ? " is-void" : ""}`}
+                  onClick={() => filter({ ...filters, state: filters.state === s ? null : s })}
                   disabled={n === 0}
                 >
                   <span className={`state-dot state-${s}`} />
@@ -109,6 +117,37 @@ export const Sidebar = forwardRef<HTMLInputElement, Props>(function Sidebar(
               </li>
             );
           })}
+        </ul>
+      </div>
+
+      <hr className="side-rule" />
+
+      <div className="side-group">
+        <ul className="side-list">
+          <li>
+            <button
+              className={`side-item${view === "keys" ? " is-on" : ""}`}
+              onClick={() => onView(view === "keys" ? "board" : "keys")}
+              aria-pressed={view === "keys"}
+            >
+              <span className="side-glyph">
+                <KeyGlyph />
+              </span>
+              <span className="side-name">Key vault</span>
+            </button>
+          </li>
+          <li>
+            <button
+              className={`side-item${view === "mcp" ? " is-on" : ""}`}
+              onClick={() => onView(view === "mcp" ? "board" : "mcp")}
+              aria-pressed={view === "mcp"}
+            >
+              <span className="side-glyph">
+                <MatrixGlyph />
+              </span>
+              <span className="side-name">MCP clients</span>
+            </button>
+          </li>
         </ul>
       </div>
     </nav>

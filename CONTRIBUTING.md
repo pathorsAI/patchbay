@@ -39,6 +39,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 
 cd app && bun install --frozen-lockfile && bun run build
+cargo run -q -p patchbay-cli -- status --json | bun scripts/ci/logo-check.ts
 cd app/src-tauri && cargo clippy --all-targets -- -D warnings
 ```
 
@@ -81,6 +82,31 @@ a secret value can reach:
 
 If you need to prove a token works, shell out to the tool's own CLI (`pb
 verify`) rather than moving the token around yourself.
+
+**Every tool the core reports must have a brand mark in the panel.** A probe is
+not done until its mark ships in `app/src/components/ToolLogo.tsx`. The board is
+a wall of logos; one card falling back to a two-letter monogram reads as a bug
+in the app, and it is the kind of gap nobody catches in review because the
+author's screenshot predates the probe. CI enforces it — `scripts/ci/logo-check.ts`
+diffs the tool keys from `pb status --json` against the panel's mark registry and
+fails naming anything missing. Run it yourself with:
+
+```sh
+cargo run -q -p patchbay-cli -- status --json | bun scripts/ci/logo-check.ts
+```
+
+Marks are inline SVG path data from a permissively-licensed source (Devicon,
+MIT; Simple Icons, CC0; or the project's own artwork), noted in that file's
+header. If a tool has no mark anywhere, draw a simple one rather than leaving
+the fallback to render.
+
+**The panel operates tools; it does not hand out commands to paste.** If a row
+implies an operation, the operation happens in the app: run it, show a spinner
+on the thing you clicked, and render the result inline where you clicked it. A
+copyable command is a last resort reserved for what patchbay genuinely cannot
+do — changing a variable in the shell that launched it, or anything that would
+mean typing a secret into the GUI — and it always comes with one line saying
+why. A bare command where an action would have worked is rejected.
 
 **Tests use fixture directories, never the real `$HOME`.** Every probe test
 builds a `tempfile::TempDir`, writes the state files it wants to exercise, and
