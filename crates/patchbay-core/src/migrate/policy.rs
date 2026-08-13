@@ -155,9 +155,19 @@ fn cloudflared_include(rel: &Path) -> bool {
     name == "cert.pem" || rel.extension().is_some_and(|e| e == "json")
 }
 
-/// ngrok's config, newest location first. Resolved from `Paths`' home and
-/// environment rather than a named accessor, because `Paths` has no ngrok entry
-/// yet — swap this for `Paths::ngrok_config()` the day it grows one.
+// The next two resolvers duplicate what `Paths` does for every other location,
+// because the ngrok and cloudflared probes landed on a different branch from
+// this module. They mirror `Paths::ngrok_candidates` and
+// `Paths::cloudflared_dir` exactly — same order, same variables, same defaults —
+// so replacing each body with a call to its accessor is a behaviour-preserving
+// one-liner, and is what should happen the moment the two branches meet. The
+// only thing they cannot see is the `[paths]` override table, which is private
+// to `Paths`; that is the whole reason to do the swap rather than keep these.
+
+/// ngrok's config: `NGROK_CONFIG` wins outright, else the current location, else
+/// the `~/.ngrok2` one that upgrading ngrok leaves behind rather than migrating.
+///
+/// TODO: `first_existing(paths.ngrok_candidates())`.
 fn ngrok_config(paths: &Paths) -> PathBuf {
     if let Some(explicit) = paths.env("NGROK_CONFIG") {
         return PathBuf::from(explicit);
@@ -166,19 +176,19 @@ fn ngrok_config(paths: &Paths) -> PathBuf {
         paths
             .home()
             .join("Library/Application Support/ngrok/ngrok.yml"),
-        paths.home().join(".config/ngrok/ngrok.yml"),
         paths.home().join(".ngrok2/ngrok.yml"),
     ])
 }
 
-/// cloudflared's state directory. `TUNNEL_ORIGIN_CERT` names the *certificate*,
-/// so the directory that holds it is what matters here.
+/// cloudflared's credential directory.
+///
+/// `TUNNEL_ORIGIN_CERT` is deliberately *not* consulted: it selects which
+/// certificate is in force, not where the tunnel credentials live, and a bundle
+/// that followed it would carry one machine's cert without the tunnel JSONs
+/// beside it.
+///
+/// TODO: `paths.cloudflared_dir()`.
 fn cloudflared_dir(paths: &Paths) -> PathBuf {
-    if let Some(cert) = paths.env("TUNNEL_ORIGIN_CERT") {
-        if let Some(dir) = Path::new(cert).parent() {
-            return dir.to_path_buf();
-        }
-    }
     paths.home().join(".cloudflared")
 }
 
@@ -900,9 +910,11 @@ mod tests {
             cloudflared_dir(&paths),
             PathBuf::from("/nowhere/.cloudflared")
         );
+        // TUNNEL_ORIGIN_CERT picks a certificate, not a credential directory:
+        // following it would carry a cert with no tunnel JSONs beside it.
         assert_eq!(
             cloudflared_dir(&paths.with_env("TUNNEL_ORIGIN_CERT", "/vol/cf/cert.pem")),
-            PathBuf::from("/vol/cf")
+            PathBuf::from("/nowhere/.cloudflared")
         );
     }
 
