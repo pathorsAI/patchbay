@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>patchbay</title>
+    <style>
+      /* Painted before the bundle's CSS arrives, so the window is never a
+         white rectangle — not on a slow dev server, not on a broken bundle. */
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #0e1314;
+        color: #7e8a89;
+      }
+      #boot {
+        display: flex;
+        height: 100%;
+        align-items: center;
+        justify-content: center;
+        padding: 24px;
+        text-align: center;
+        font: 12px/1.5 ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace;
+      }
+      @media (prefers-color-scheme: light) {
+        html,
+        body {
+          background: #f1f2f0;
+          color: #6b7778;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"><div id="boot">patchbay — starting…</div></div>
+    <script>
+      // The panel must always say something. If the module bundle fails to
+      // load or throws before React mounts, the boot node becomes the report.
+      (function () {
+        function fail(what) {
+          var boot = document.getElementById("boot");
+          if (boot && boot.isConnected) boot.textContent = "patchbay front end failed to start — " + what;
+        }
+        addEventListener("error", function (e) {
+          fail(String((e && (e.message || (e.target && e.target.src))) || "unknown error"));
+        });
+        addEventListener("unhandledrejection", function (e) {
+          fail(String((e && e.reason) || "unknown rejection"));
+        });
+        setTimeout(function () {
+          var boot = document.getElementById("boot");
+          if (boot && boot.isConnected) {
+            boot.textContent = "patchbay front end did not mount — check the dev server at " + location.origin;
+          }
+        }, 8000);
+      })();
+    </script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

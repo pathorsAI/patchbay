@@ -5,6 +5,9 @@ members = [
     "crates/patchbay-cli",
     "crates/patchbay-mcp",
 ]
+# The Tauri app is its own crate with its own lockfile: `tauri build` wants to
+# own the target dir and the dependency graph of the shell it generates.
+exclude = ["app/src-tauri"]
 
 [workspace.package]
 version = "0.1.0"
