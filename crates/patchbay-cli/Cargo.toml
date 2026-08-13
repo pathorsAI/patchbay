@@ -17,3 +17,6 @@ serde_json.workspace = true
 chrono.workspace = true
 clap = { version = "4", features = ["derive"] }
 anstyle = "1"
+# Hidden prompt for `pb key add` when nothing is piped in. The secret must
+# never reach the terminal, the scrollback or the shell history.
+rpassword = "7"
