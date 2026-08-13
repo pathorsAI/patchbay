@@ -647,6 +647,28 @@ impl Paths {
         self.patchbay_dir().join("keys.json")
     }
 
+    /// The project env vault's metadata registry. Variable *names* and their
+    /// provenance live here; the values never do — they are in the OS keychain
+    /// (see [`crate::envs`]).
+    ///
+    /// Portable: it holds no absolute path, so copying it to another machine is
+    /// the supported way to take your projects with you.
+    pub fn projects_file(&self) -> PathBuf {
+        self.patchbay_dir().join("projects.json")
+    }
+
+    /// Which directories on **this machine** belong to which project (see
+    /// [`crate::envs::Attachment`]).
+    ///
+    /// Machine-local by design, and deliberately kept out of
+    /// [`Paths::projects_file`] rather than being one more field in it: the
+    /// paths in here are meaningless on any other machine, so this file is
+    /// excluded from every migration, copy or export story patchbay has. Moving
+    /// to a new laptop means re-attaching, not restoring this.
+    pub fn attachments_file(&self) -> PathBuf {
+        self.patchbay_dir().join("attachments.json")
+    }
+
     /// The version-check cache (see [`crate::versions`]). Public information
     /// about public software — no secrets, so no 0600 handling.
     pub fn versions_file(&self) -> PathBuf {
@@ -680,8 +702,21 @@ mod tests {
             p.keys_file(),
             PathBuf::from("/nowhere/.config/patchbay/keys.json")
         );
+        assert_eq!(
+            p.projects_file(),
+            PathBuf::from("/nowhere/.config/patchbay/projects.json")
+        );
+        assert_eq!(
+            p.attachments_file(),
+            PathBuf::from("/nowhere/.config/patchbay/attachments.json")
+        );
         let p = Paths::for_test("/nowhere").with_env("PATCHBAY_CONFIG_DIR", "/custom/pb");
         assert_eq!(p.keys_file(), PathBuf::from("/custom/pb/keys.json"));
+        assert_eq!(p.projects_file(), PathBuf::from("/custom/pb/projects.json"));
+        assert_eq!(
+            p.attachments_file(),
+            PathBuf::from("/custom/pb/attachments.json")
+        );
     }
 
     #[test]

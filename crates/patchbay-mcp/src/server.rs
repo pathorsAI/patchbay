@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use patchbay_core::{KeyRegistry, McpClientRegistry, Registry};
+use patchbay_core::{EnvRegistry, KeyRegistry, McpClientRegistry, Registry};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -118,7 +118,21 @@ Work the list one item at a time; run only the items whose `auto` is true; hand 
 `needs_browser` item to the human with the exact command rather than trying to drive a browser \
 login yourself; and re-check with `mark_setup_done` after each one, because patchbay re-probes the \
 tool instead of believing what you report. Stop when `complete` is true, and do not invent extra \
-setup work.";
+setup work.
+
+12. The project env vault (`list_env_projects`, `list_env_vars`, `pull_env`, `set_env_var`) is a \
+fifth thing: the environment variables one PROJECT needs, per environment, in two \
+layers — `synced` (a local mirror of that project's remote secret manager, refreshed wholesale \
+only by `pull_env`) and `local` (set on this machine, never pushed anywhere, and it WINS over a \
+synced variable of the same name). This does not contradict rule 9: the remote is still the \
+source of truth for app env, and patchbay has no push. `set_env_var` is the one to reach for \
+unprompted — when a task creates or obtains a value that belongs to ONE project's environment \
+rather than to the human, write it there so the machine keeps knowing about it. The two `list_` \
+tools are tier 1 (one local file, no keychain); `pull_env` is tier 2 — it executes the infisical \
+CLI and hits the network, and its account-mismatch refusal names the fix, so relay it rather than \
+retrying. NO env tool returns a variable's value: there is no read or export tool at all, gated \
+or otherwise, and PATCHBAY_ALLOW_SECRET_READ does not unlock one. If the user needs the values, \
+the answer is `pb env run -- <cmd>` or `pb env export` in their own terminal.";
 
 /// `{ "tool": "rclone", "profile_id": "legal" }` — one tool, optionally one
 /// profile of it.
@@ -179,22 +193,33 @@ pub struct PatchbayServer {
     /// The MCP client board. `pub(crate)` because its tools live in
     /// [`crate::mcp_clients`].
     pub(crate) clients: Arc<McpClientRegistry>,
+    /// The project env vault. `pub(crate)` because its tools live in
+    /// [`crate::envs`].
+    pub(crate) envs: Arc<EnvRegistry>,
     tool_router: ToolRouter<Self>,
 }
 
 impl PatchbayServer {
-    pub fn new(registry: Registry, keys: KeyRegistry, clients: McpClientRegistry) -> Self {
+    pub fn new(
+        registry: Registry,
+        keys: KeyRegistry,
+        clients: McpClientRegistry,
+        envs: EnvRegistry,
+    ) -> Self {
         Self {
             registry: Arc::new(registry),
             keys: Arc::new(keys),
             clients: Arc::new(clients),
-            // Four routers, merged: connection tools here, vault tools in
+            envs: Arc::new(envs),
+            // Five routers, merged: connection tools here, key vault tools in
             // `keys.rs`, MCP client tools in `mcp_clients.rs`, migration tools
-            // in `migrate.rs`. Built once, not per request.
+            // in `migrate.rs`, project env vault tools in `envs.rs`. Built
+            // once, not per request.
             tool_router: Self::tool_router()
                 + Self::keys_router()
                 + Self::mcp_clients_router()
-                + Self::migrate_router(),
+                + Self::migrate_router()
+                + Self::envs_router(),
         }
     }
 }

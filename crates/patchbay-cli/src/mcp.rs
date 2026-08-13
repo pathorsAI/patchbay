@@ -9,7 +9,6 @@
 //! those fields hold `--figma-api-key=…` and `Authorization: Bearer …`.
 
 use std::io::Write;
-use std::path::Path;
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
@@ -250,9 +249,9 @@ fn confirm(client: &McpClient, entry: &McpServerEntry) -> Result<bool> {
 // ---------------------------------------------------------------------------
 
 fn print_write(report: &WriteReport) {
-    println!("  config:   {}", tilde(&report.config_path));
+    println!("  config:   {}", render::tilde(&report.config_path));
     match &report.backup_path {
-        Some(path) => println!("  backup:   {}", tilde(path)),
+        Some(path) => println!("  backup:   {}", render::tilde(path)),
         None => println!("  backup:   none — the file did not exist yet"),
     }
     for note in &report.notes {
@@ -280,25 +279,13 @@ fn print_copy(report: &CopyReport) {
     }
     for write in &report.written {
         println!("  {}:", write.label);
-        println!("    config: {}", tilde(&write.config_path));
+        println!("    config: {}", render::tilde(&write.config_path));
         if let Some(path) = &write.backup_path {
-            println!("    backup: {}", tilde(path));
+            println!("    backup: {}", render::tilde(path));
         }
         for note in &write.notes {
             println!("    note: {note}");
         }
-    }
-}
-
-/// `~/…` for paths under the home directory: the table is about which file, not
-/// about how long the user's home path is.
-fn tilde(path: &Path) -> String {
-    let Some(home) = std::env::var_os("HOME") else {
-        return path.display().to_string();
-    };
-    match path.strip_prefix(&home) {
-        Ok(rest) => format!("~/{}", rest.display()),
-        Err(_) => path.display().to_string(),
     }
 }
 
@@ -347,7 +334,7 @@ pub fn render_board(clients: &[McpClient], styles: &Styles) -> String {
             out.push_str(&format!(
                 "  {} would keep one at {}\n",
                 client.label,
-                tilde(&client.config_path)
+                render::tilde(&client.config_path)
             ));
         }
         return out;
@@ -397,7 +384,7 @@ pub fn render_board(clients: &[McpClient], styles: &Styles) -> String {
         out.push('\n');
         out.push_str(&styles.paint(bold(), &format!("{} — {}", client.client, client.label)));
         out.push('\n');
-        out.push_str(&format!("  {}\n", tilde(&client.config_path)));
+        out.push_str(&format!("  {}\n", render::tilde(&client.config_path)));
         if client.servers.is_empty() {
             out.push_str(&format!("  {}\n", styles.paint(dim(), "no servers")));
         }
@@ -435,7 +422,7 @@ pub fn render_board(clients: &[McpClient], styles: &Styles) -> String {
             out.push_str(&format!(
                 "  {}: {}\n",
                 client.client,
-                tilde(&client.config_path)
+                render::tilde(&client.config_path)
             ));
         }
     }
