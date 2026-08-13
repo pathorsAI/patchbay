@@ -1,0 +1,200 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Fail fast and loudly if the tag and the tree disagree about the version.
+  # Everything downstream names its artifacts after the tag, so a mismatch here
+  # would ship binaries whose `--version` lies.
+  verify:
+    name: verify version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag must match the workspace version
+        id: check
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          echo "tag=$tag version=$version"
+          bash scripts/bump-version.sh --check "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  # `pb` and `patchbay-mcp`, one tarball per arch. macos-latest is arm64; the
+  # x86_64 target is a cross-compile from the same runner.
+  binaries:
+    name: binaries (${{ matrix.target }})
+    needs: verify
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} -p patchbay-cli -p patchbay-mcp
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          target="${{ matrix.target }}"
+          bin="target/$target/release"
+          mkdir -p dist
+          for name in pb patchbay-mcp; do
+            staging="dist/$name"
+            mkdir -p "$staging"
+            cp "$bin/$name" "$staging/"
+            cp README.md LICENSE "$staging/"
+            tar -czf "dist/$name-$tag-$target.tar.gz" -C "$staging" "$name" README.md LICENSE
+            rm -rf "$staging"
+          done
+          # Generated from inside dist/ so the file names in the checksum file
+          # are bare, and `shasum -a 256 -c` works next to the downloads.
+          (cd dist && shasum -a 256 ./*.tar.gz > "SHA256SUMS-$target.txt")
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  # The desktop panel, as a universal (arm64 + x86_64) .dmg.
+  #
+  # Unsigned and un-notarized: no Apple Developer identity is wired into this
+  # repo yet. tauri-action skips signing when APPLE_CERTIFICATE / SIGNING_IDENTITY
+  # are absent, and tauri.conf.json sets no signingIdentity, so the bundle is
+  # produced ad-hoc. Users get Gatekeeper's "unidentified developer" prompt and
+  # must right-click > Open (or clear the quarantine bit) on first launch; the
+  # README says so. Wiring signing = add the APPLE_* secrets below and drop this
+  # comment.
+  app:
+    name: panel dmg
+    needs: verify
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache cargo (src-tauri)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri
+          key: release-src-tauri
+
+      - name: Install front-end deps
+        run: bun install --frozen-lockfile
+        working-directory: app
+
+      - name: Build bundle
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # APPLE_CERTIFICATE / APPLE_SIGNING_IDENTITY / APPLE_ID are left
+          # *unset* on purpose. tauri-action imports a certificate only when
+          # APPLE_CERTIFICATE is present, and tauri-bundler signs only when it
+          # gets an identity — setting them to "" would make it try to sign with
+          # an empty identity and fail. Absent means "build unsigned".
+        with:
+          # No tagName: tauri-action then only builds. The release itself is
+          # assembled once, in the `release` job, so every artifact lands on one
+          # release instead of three racing to create it.
+          projectPath: app
+          args: --target universal-apple-darwin
+
+      - name: Collect dmg
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          mkdir -p dist
+          # The finished dmg is target/<triple>/release/bundle/dmg/*.dmg.
+          # Anchoring on that directory matters: while bundle_dmg.sh runs there
+          # is also a scratch read-write image at bundle/macos/rw.<pid>.*.dmg,
+          # and picking that one up would ship a half-written disk image.
+          found=0
+          while IFS= read -r dmg; do
+            cp "$dmg" "dist/patchbay-$tag-universal-apple-darwin.dmg"
+            found=1
+          done < <(find app/src-tauri/target -type f -name '*.dmg' -path '*/bundle/dmg/*')
+          if [ "$found" -eq 0 ]; then
+            echo "::error::tauri produced no .dmg under app/src-tauri/target"
+            find app/src-tauri/target -maxdepth 5 -type d -name bundle || true
+            exit 1
+          fi
+          (cd dist && shasum -a 256 ./*.dmg > SHA256SUMS-dmg.txt)
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: panel-dmg
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: [verify, binaries, app]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Release notes
+        id: notes
+        run: |
+          set -euo pipefail
+          {
+            echo 'body<<PATCHBAY_EOF'
+            bash scripts/changelog-section.sh "${{ needs.verify.outputs.version }}"
+            echo
+            echo 'PATCHBAY_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          name: patchbay ${{ github.ref_name }}
+          body: ${{ steps.notes.outputs.body }}
+          # Appends the commit/PR list under whatever body we supplied.
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.dmg
+            artifacts/SHA256SUMS-*.txt

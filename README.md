@@ -1,5 +1,8 @@
 # patchbay
 
+[![CI](https://github.com/pathorsAI/patchbay/actions/workflows/ci.yml/badge.svg)](https://github.com/pathorsAI/patchbay/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 **One panel for every CLI login on your machine — built for humans *and* AI agents.**
 
 Your dev machine is a tangle of authenticated CLIs: `gcloud` with five accounts, `gh`, `aws`, `az`, `infisical` across two orgs, `kubectl`, `wrangler`, `rclone`… Each one stores its auth state somewhere different, expires on its own schedule, and has its own switching incantation. Nothing shows you the whole board.
@@ -11,6 +14,41 @@ patchbay is the patch panel:
 - **Switch** — change profile/context for any tool from the panel, including the traps (looking at you, `gcloud` ADC).
 - **MCP server** — AI agents are first-class operators: `list_connections`, `switch_profile`, `get_permissions`, `verify`, `plan_setup`. "Switch to the cerana gcloud account and deploy" becomes one sentence.
 - **Migrate** — export a bundle: portable credentials travel encrypted, device-bound ones (Keychain-backed `gh`, `infisical`) become a manifest entry. On the new machine, your AI reads the gap list and walks you through re-auth until the diff is zero.
+
+## Install
+
+macOS, from [Releases](https://github.com/pathorsAI/patchbay/releases). Every
+tag ships per-arch tarballs of the two binaries plus a universal `.dmg` of the
+panel.
+
+The CLI and the MCP server — pick the tarball for your arch
+(`aarch64-apple-darwin` for Apple silicon, `x86_64-apple-darwin` for Intel):
+
+```sh
+tag=v0.1.0
+arch=aarch64-apple-darwin
+tmp=$(mktemp -d)
+curl -fsSL "https://github.com/pathorsAI/patchbay/releases/download/$tag/pb-$tag-$arch.tar.gz" | tar xz -C "$tmp"
+sudo mv "$tmp/pb" /usr/local/bin/
+pb status
+```
+
+Swap `pb` for `patchbay-mcp` to get the MCP server, then point your agent at it:
+
+```json
+{ "mcpServers": { "patchbay": { "command": "/usr/local/bin/patchbay-mcp" } } }
+```
+
+The panel: download `patchbay-<tag>-universal-apple-darwin.dmg` and drag it to
+Applications.
+
+> The release builds are **unsigned and un-notarized** — patchbay has no Apple
+> Developer identity yet. macOS will refuse the first launch; right-click the
+> app and choose *Open*, or run `xattr -dr com.apple.quarantine
+> /Applications/patchbay.app`. Downloaded binaries need the same treatment.
+> Building from source (below) avoids all of this.
+
+Each release also carries `SHA256SUMS-*.txt`; verify with `shasum -a 256 -c`.
 
 ## Layout
 
@@ -54,6 +92,13 @@ cd app && bun run build   # typecheck + production bundle into app/dist
 > `bun run tauri dev`, or `bun run tauri build --debug` for a binary with the
 > front end embedded. In debug builds the app prints the URL it loaded and
 > whether the load finished, which is the first thing to check on a blank panel.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the checks CI runs, the commit
+message convention, and the two review rules that are not negotiable (probes
+never touch token *values*; tests never read the real `$HOME`). Release history
+is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Status
 
