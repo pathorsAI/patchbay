@@ -23,3 +23,7 @@ tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread"] }
+
+# Standalone: keeps cargo from adopting an outer checkout's workspace when this
+# app is built from a nested git worktree (.claude/worktrees/...).
+[workspace]
