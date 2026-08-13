@@ -57,6 +57,9 @@ impl Probe for InfisicalProbe {
         let path = self.paths.infisical_config();
         let installed = self.paths.has_binary("infisical") || path.is_file();
         let mut status = ToolStatus::empty(Self::TOOL, installed);
+        for note in self.paths.path_notes("infisical") {
+            status.note(note);
+        }
 
         let text = match read_text(&path) {
             Ok(Some(text)) => text,

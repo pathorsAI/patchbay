@@ -139,6 +139,9 @@ impl Probe for GcloudProbe {
         let dir = self.paths.gcloud_dir();
         let installed = self.paths.has_binary("gcloud") || dir.is_dir();
         let mut status = ToolStatus::empty(Self::TOOL, installed);
+        for note in self.paths.path_notes("gcloud") {
+            status.note(note);
+        }
 
         let active = match read_text(&dir.join("active_config")) {
             Ok(Some(text)) => {

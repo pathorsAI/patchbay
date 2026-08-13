@@ -118,6 +118,12 @@ impl Probe for AwsProbe {
         let installed =
             self.paths.has_binary("aws") || config_path.is_file() || credentials_path.is_file();
         let mut status = ToolStatus::empty(Self::TOOL, installed);
+        for note in self.paths.path_notes("aws_config") {
+            status.note(note);
+        }
+        for note in self.paths.path_notes("aws_credentials") {
+            status.note(note);
+        }
 
         // BTreeMap so the board is stable across runs.
         let mut entries: BTreeMap<String, Entry> = BTreeMap::new();
