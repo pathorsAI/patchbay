@@ -1,0 +1,25 @@
+[package]
+name = "patchbay-mcp"
+description = "MCP stdio server exposing patchbay to AI agents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "patchbay-mcp"
+path = "src/main.rs"
+
+[dependencies]
+patchbay-core.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# Official Rust MCP SDK. `server` + `macros` give the #[tool_router] /
+# #[tool_handler] pattern; `transport-io` gives the stdio transport.
+rmcp = { version = "3.1.2", features = ["server", "macros", "transport-io"] }
+# Tool input schemas are generated from `#[derive(JsonSchema)]`. Version must
+# track the one rmcp itself depends on.
+schemars = "1.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std"] }
