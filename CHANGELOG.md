@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Grafana key verification** — `pb key verify` and the MCP `verify_key` now
+  understand `--provider grafana`, asking `{endpoint}/api/org` and reporting the
+  org the token belongs to. Grafana tokens are only meaningful against the
+  instance that issued them, so `KeyEntry` gains an optional `endpoint`
+  (`pb key add --endpoint https://<you>.grafana.net`, and the same field on the
+  MCP `store_key`); a `keys.json` written before it existed keeps parsing, and
+  keys without one never grow the field. A `grafana` key deliberately maps to no
+  probe — there is no Grafana CLI for it to sit beside.
+
 - **`pb use infisical <email>`** — the Infisical CLI's `user switch` is an
   arrow-key picker with no non-interactive form, so patchbay makes the same
   change itself: it repoints `loggedInUserEmail` and `LoggedInUserDomain` at one

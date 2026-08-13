@@ -54,6 +54,10 @@ pub enum Command {
         /// Expiry: `2027-01-01`, or a full RFC 3339 timestamp.
         #[arg(long, value_name = "DATE")]
         expires: Option<String>,
+        /// Instance URL, for providers with more than one address —
+        /// `https://<you>.grafana.net`. Grafana needs it to verify.
+        #[arg(long, value_name = "URL")]
+        endpoint: Option<String>,
         /// Replace an existing entry with the same id (a rotation).
         #[arg(long)]
         overwrite: bool,
@@ -102,6 +106,7 @@ pub fn run(command: Command, styles: &Styles) -> Result<i32> {
             purpose,
             scopes,
             expires,
+            endpoint,
             overwrite,
         } => {
             let expires_at = expires.as_deref().map(parse_expiry).transpose()?;
@@ -110,13 +115,17 @@ pub fn run(command: Command, styles: &Styles) -> Result<i32> {
                 .label(label.unwrap_or_else(|| id.clone()))
                 .purpose(purpose)
                 .scopes(scopes)
-                .expires_at(expires_at);
+                .expires_at(expires_at)
+                .endpoint(endpoint);
 
             let secret = read_secret(&id)?;
             let entry = registry.add(new, &secret, overwrite)?;
             drop(secret);
 
             println!("registered {} (…{})", entry.id, entry.last4);
+            if let Some(endpoint) = &entry.endpoint {
+                println!("  instance: {endpoint}");
+            }
             println!("  value:    {}", registry.store_name());
             println!("  metadata: {}", registry.path().display());
             if provider.is_none() {
@@ -284,6 +293,12 @@ fn print_verify(entry: &KeyEntry, outcome: &KeyVerifyOutcome, updated: &[String]
         println!(
             "  updated the registry from the provider: {}",
             updated.join(", ")
+        );
+    }
+    if outcome.status == KeyVerifyStatus::Unsupported && entry.endpoint.is_none() {
+        println!(
+            "  set one with: pb key add {} --provider {} --endpoint <url> --overwrite",
+            entry.id, entry.provider
         );
     }
     if outcome.status == KeyVerifyStatus::Unreachable {
@@ -507,6 +522,7 @@ mod tests {
             expires_at: expires,
             last4: "1234".into(),
             source: "cli".into(),
+            endpoint: None,
         }
     }
 

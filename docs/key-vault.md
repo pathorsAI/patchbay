@@ -36,10 +36,27 @@ cf-gh-actions-deploy (…4f0a) — valid
   updated the registry from the provider: expires_at
 ```
 
-Cloudflare and GitHub in v1; every other provider answers `unsupported`, which
-is a normal answer and not a failure. A successful check writes what the issuer
-said — expiry, and GitHub's scopes — back into the registry, so the vault
-converges on the truth instead of drifting from it.
+A successful check writes what the issuer said — expiry, and GitHub's scopes —
+back into the registry, so the vault converges on the truth instead of drifting
+from it. Every other provider answers `unsupported`, which is a normal answer
+and not a failure.
+
+| `--provider` | What patchbay asks | What comes back |
+|---|---|---|
+| `cloudflare` (`cf`) | `GET /client/v4/user/tokens/verify` | The token's own status — `active`, `expired` or `disabled` — plus `expires_on` when the token has one, and Cloudflare's own message. The endpoint reports liveness, not policies, so scopes stay empty: an account API token's *reach* is not something this call will tell you, which is exactly why it is worth registering next to `wrangler`. |
+| `github` (`gh`) | `GET /user` | The login it authenticates as, the classic-PAT scope list from `X-OAuth-Scopes`, and the expiry from `github-authentication-token-expiration`. A fine-grained PAT sends an empty scope header — that is a real answer, not a missing one; its permissions are per-repository and not enumerable here. |
+| `grafana` | `GET {endpoint}/api/org` | The org the token belongs to. **Needs `--endpoint`** — a Grafana token is only meaningful against the instance that issued it, and there is no one address to ask. Service-account tokens carry a role rather than a scope list, so scopes stay empty. |
+
+```sh
+pb key add grafana-pathors --provider grafana \
+  --endpoint https://pathors.grafana.net \
+  --label "Grafana service account (pathors)"
+```
+
+The endpoint must be the instance root, with no path. Point it at a dashboard
+URL and Grafana Cloud answers `/api/org` with its single-page app — HTML, HTTP
+200 — which patchbay reports as `unreachable` rather than reading a dead token
+as live.
 
 The verdicts are deliberately more than a boolean. `unreachable` (DNS, timeout,
 rate limit, 5xx) means patchbay could not ask; it says **nothing** about the
@@ -57,7 +74,12 @@ row — `cloudflare` beside `wrangler`, `github` beside `gh`, `gcp`/`google`
 beside `gcloud`, plus `aws`, `azure` and `infisical`. That is the point of the
 vault for a machine that already has the CLI logged in: a Cloudflare API token
 used for direct API calls is broader than wrangler's own OAuth session, and
-nothing else on the machine knew it existed.
+nothing else on the machine knew it existed. The `wrangler` row says so when you
+have one registered.
+
+Providers with no CLI on the board — `grafana`, `openai`, `stripe`, anything
+free-form — link to nothing and live in the vault view alone. That is not a gap;
+there is no login for them to sit beside.
 
 ```console
 $ pb status

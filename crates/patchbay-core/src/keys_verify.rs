@@ -281,11 +281,12 @@ pub fn verify_key_with(entry: &KeyEntry, secret: &str, http: &dyn HttpClient) ->
     match normalize_provider(&entry.provider) {
         Some(Provider::Cloudflare) => cloudflare(secret, http),
         Some(Provider::Github) => github(secret, http),
+        Some(Provider::Grafana) => grafana(entry, secret, http),
         None => KeyVerifyOutcome::new(
             KeyVerifyStatus::Unsupported,
             format!(
-                "patchbay cannot verify `{}` keys yet — it knows how to ask Cloudflare and \
-                 GitHub, and nothing else. Check this one in the provider's dashboard.",
+                "patchbay cannot verify `{}` keys yet — it knows how to ask Cloudflare, GitHub \
+                 and Grafana, and nothing else. Check this one in the provider's dashboard.",
                 entry.provider
             ),
         ),
@@ -297,6 +298,7 @@ pub fn verify_key_with(entry: &KeyEntry, secret: &str, http: &dyn HttpClient) ->
 enum Provider {
     Cloudflare,
     Github,
+    Grafana,
 }
 
 /// Accept the spellings people actually type.
@@ -304,6 +306,7 @@ fn normalize_provider(provider: &str) -> Option<Provider> {
     match provider.trim().to_ascii_lowercase().as_str() {
         "cloudflare" | "cf" => Some(Provider::Cloudflare),
         "github" | "gh" => Some(Provider::Github),
+        "grafana" => Some(Provider::Grafana),
         _ => None,
     }
 }
@@ -507,6 +510,122 @@ fn parse_github_expiry(raw: &str) -> Option<DateTime<Utc>> {
     crate::util::parse_timestamp(trimmed.trim_end_matches(" UTC"))
 }
 
+// ---------------------------------------------------------------------------
+// grafana
+// ---------------------------------------------------------------------------
+
+/// Cheapest authenticated endpoint that proves a token belongs to an org.
+/// `/api/org` needs no permissions beyond being a valid token for the instance,
+/// and its response names the org, which is what a human needs to tell two
+/// instances apart.
+const GRAFANA_ORG_PATH: &str = "/api/org";
+
+#[derive(Debug, Deserialize)]
+struct GrafanaOrg {
+    #[serde(default)]
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GrafanaError {
+    #[serde(default)]
+    message: String,
+}
+
+/// Unlike Cloudflare and GitHub, there is no one address to ask: a Grafana
+/// token is only meaningful against the instance that issued it, which is why
+/// [`KeyEntry::endpoint`] exists.
+fn grafana(entry: &KeyEntry, secret: &str, http: &dyn HttpClient) -> KeyVerifyOutcome {
+    let Some(endpoint) = entry
+        .endpoint
+        .as_deref()
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+    else {
+        return KeyVerifyOutcome::new(
+            KeyVerifyStatus::Unsupported,
+            "grafana verification needs --endpoint: a token is only valid against the instance \
+             that issued it, and patchbay has no address to ask. Re-register this key with \
+             `pb key add <id> --provider grafana --endpoint https://<your>.grafana.net \
+             --overwrite`, or set it on the existing entry."
+                .to_string(),
+        );
+    };
+    // A bare hostname would be sent as a relative URL; refuse rather than
+    // guess a scheme, and never echo a secret in the message.
+    if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
+        return KeyVerifyOutcome::new(
+            KeyVerifyStatus::Unsupported,
+            format!(
+                "`{endpoint}` is not a URL patchbay can call; the endpoint needs a scheme, \
+                 e.g. https://{endpoint}"
+            ),
+        );
+    }
+
+    let url = format!("{}{GRAFANA_ORG_PATH}", endpoint.trim_end_matches('/'));
+    let bearer = format!("Bearer {secret}");
+    let response = match http.get(
+        &url,
+        &[("Authorization", &bearer), ("Accept", "application/json")],
+    ) {
+        Ok(response) => response,
+        Err(detail) => return unreachable_outcome("Grafana", &detail),
+    };
+
+    match response.status {
+        200 => {
+            // A 200 is NOT enough on its own. Point the endpoint at a dashboard
+            // URL instead of the instance root and Grafana Cloud serves its
+            // single-page app — HTML, HTTP 200 — for `/api/org` too. Treating
+            // that as success reports a dead token as live, which is the single
+            // worst answer this function can give. Verified against a real
+            // instance; the body has to parse as the object we asked for.
+            let Ok(org) = serde_json::from_str::<GrafanaOrg>(&response.body) else {
+                return KeyVerifyOutcome::new(
+                    KeyVerifyStatus::Unreachable,
+                    format!(
+                        "{url} returned HTTP 200 but not the JSON a Grafana API returns — \
+                         the endpoint is probably not the instance root. It should be the \
+                         bare origin, e.g. https://<you>.grafana.net, with no path."
+                    ),
+                );
+            };
+            let detail = if org.name.trim().is_empty() {
+                format!("{endpoint} accepted the token")
+            } else {
+                format!("{endpoint} accepts it for org `{}`", org.name.trim())
+            };
+            // Grafana's service-account tokens carry a role, not a scope list,
+            // and /api/org does not report it; leaving scopes empty is honest.
+            KeyVerifyOutcome::new(KeyVerifyStatus::Valid, detail)
+        }
+        401 | 403 => {
+            let detail = serde_json::from_str::<GrafanaError>(&response.body)
+                .map(|e| e.message)
+                .ok()
+                .filter(|m| !m.trim().is_empty())
+                .unwrap_or_else(|| format!("{endpoint} rejected the token"));
+            KeyVerifyOutcome::new(KeyVerifyStatus::Invalid, detail)
+        }
+        404 => KeyVerifyOutcome::new(
+            KeyVerifyStatus::Unreachable,
+            format!(
+                "{url} returned 404 — that address does not look like a Grafana API. \
+                 Check the endpoint is the instance root, not a dashboard URL."
+            ),
+        ),
+        429 => KeyVerifyOutcome::new(
+            KeyVerifyStatus::Unreachable,
+            format!("{endpoint} rate-limited the check; try again shortly"),
+        ),
+        status => KeyVerifyOutcome::new(
+            KeyVerifyStatus::Unreachable,
+            format!("{endpoint} returned an unexpected HTTP {status}"),
+        ),
+    }
+}
+
 /// A transport failure. Phrased so nobody reads it as "your key is dead".
 fn unreachable_outcome(provider: &str, detail: &str) -> KeyVerifyOutcome {
     KeyVerifyOutcome::new(
@@ -533,6 +652,14 @@ mod tests {
             expires_at: None,
             last4: "1234".into(),
             source: "cli".into(),
+            endpoint: None,
+        }
+    }
+
+    fn entry_at(provider: &str, endpoint: &str) -> KeyEntry {
+        KeyEntry {
+            endpoint: Some(endpoint.to_string()),
+            ..entry(provider)
         }
     }
 
@@ -738,12 +865,177 @@ mod tests {
         assert_eq!(http.call_count(), 0, "unsupported must not make a request");
     }
 
+    // --- grafana ------------------------------------------------------------
+
+    #[test]
+    fn test_grafana_valid_token_names_the_org_and_asks_the_right_url() {
+        let http = StubHttp::responding(HttpResponse::new(
+            200,
+            r#"{"id":1,"name":"Pathors","address":{}}"#,
+        ));
+        let out = verify_key_with(
+            &entry_at("grafana", "https://pathors.grafana.net"),
+            "glsa_xxx",
+            &http,
+        );
+
+        assert_eq!(out.status, KeyVerifyStatus::Valid);
+        assert_eq!(
+            out.detail,
+            "https://pathors.grafana.net accepts it for org `Pathors`"
+        );
+        assert_eq!(
+            http.last_url().unwrap(),
+            "https://pathors.grafana.net/api/org"
+        );
+        let headers = http.last_headers();
+        let auth = headers.iter().find(|(k, _)| k == "Authorization").unwrap();
+        assert_eq!(auth.1, "Bearer glsa_xxx");
+        assert!(!http.last_url().unwrap().contains("glsa_xxx"));
+    }
+
+    #[test]
+    fn test_grafana_endpoint_slashes_do_not_double_up() {
+        let http = StubHttp::responding(HttpResponse::new(200, r#"{"name":"Main Org."}"#));
+        verify_key_with(
+            &entry_at("grafana", "https://self.hosted.example/grafana/"),
+            "t",
+            &http,
+        );
+        assert_eq!(
+            http.last_url().unwrap(),
+            "https://self.hosted.example/grafana/api/org"
+        );
+    }
+
+    #[test]
+    fn test_grafana_without_an_endpoint_is_unsupported_and_says_what_to_do() {
+        let http = StubHttp::failing("should not be called");
+        let out = verify_key_with(&entry("grafana"), "glsa_xxx", &http);
+
+        assert_eq!(out.status, KeyVerifyStatus::Unsupported);
+        assert!(out.detail.contains("--endpoint"), "{}", out.detail);
+        assert_eq!(http.call_count(), 0, "no endpoint means no request");
+
+        // An endpoint that is only whitespace is no endpoint at all.
+        let out = verify_key_with(&entry_at("grafana", "   "), "t", &http);
+        assert_eq!(out.status, KeyVerifyStatus::Unsupported);
+        assert_eq!(http.call_count(), 0);
+    }
+
+    #[test]
+    fn test_grafana_endpoint_without_a_scheme_is_refused_not_guessed() {
+        let http = StubHttp::failing("should not be called");
+        let out = verify_key_with(&entry_at("grafana", "pathors.grafana.net"), "t", &http);
+        assert_eq!(out.status, KeyVerifyStatus::Unsupported);
+        assert!(
+            out.detail.contains("https://pathors.grafana.net"),
+            "{}",
+            out.detail
+        );
+        assert_eq!(http.call_count(), 0);
+    }
+
+    #[test]
+    fn test_grafana_401_and_403_are_invalid_with_grafanas_message() {
+        for status in [401, 403] {
+            let out = verify_key_with(
+                &entry_at("grafana", "https://x.grafana.net"),
+                "bad",
+                &StubHttp::responding(HttpResponse::new(
+                    status,
+                    r#"{"message":"invalid API key"}"#,
+                )),
+            );
+            assert_eq!(out.status, KeyVerifyStatus::Invalid, "HTTP {status}");
+            assert_eq!(out.detail, "invalid API key");
+        }
+    }
+
+    #[test]
+    fn test_grafana_404_points_at_the_endpoint_not_the_key() {
+        let out = verify_key_with(
+            &entry_at("grafana", "https://x.example/dashboards/foo"),
+            "t",
+            &StubHttp::responding(HttpResponse::new(404, "<html>")),
+        );
+        assert_eq!(out.status, KeyVerifyStatus::Unreachable);
+        assert!(!out.status.is_bad_news());
+        assert!(
+            out.detail.contains("does not look like a Grafana API"),
+            "{}",
+            out.detail
+        );
+    }
+
+    #[test]
+    fn test_grafana_html_on_a_200_is_not_a_valid_token() {
+        // Found on a real instance: point the endpoint at a dashboard URL and
+        // Grafana Cloud serves its SPA for /api/org — HTML, HTTP 200. Reading
+        // that as success reports a dead token as live.
+        let out = verify_key_with(
+            &entry_at("grafana", "https://x.grafana.net/d/some-dashboard"),
+            "definitely-not-a-real-token",
+            &StubHttp::responding(HttpResponse::new(
+                200,
+                "<!DOCTYPE html><html><head><title>Grafana</title></head></html>",
+            )),
+        );
+        assert_eq!(out.status, KeyVerifyStatus::Unreachable);
+        assert!(!out.status.is_bad_news());
+        assert!(out.detail.contains("instance root"), "{}", out.detail);
+    }
+
+    #[test]
+    fn test_grafana_transport_failure_is_unreachable() {
+        let out = verify_key_with(
+            &entry_at("grafana", "https://x.grafana.net"),
+            "t",
+            &StubHttp::failing("connection refused"),
+        );
+        assert_eq!(out.status, KeyVerifyStatus::Unreachable);
+        assert!(
+            out.detail.contains("could not reach Grafana"),
+            "{}",
+            out.detail
+        );
+    }
+
+    #[test]
+    fn test_grafana_outcomes_never_carry_the_secret() {
+        let secret = "glsa_super_secret_value";
+        let cases = [
+            verify_key_with(
+                &entry_at("grafana", "https://x.grafana.net"),
+                secret,
+                &StubHttp::responding(HttpResponse::new(200, r#"{"name":"Org"}"#)),
+            ),
+            verify_key_with(
+                &entry_at("grafana", "https://x.grafana.net"),
+                secret,
+                &StubHttp::responding(HttpResponse::new(401, r#"{"message":"nope"}"#)),
+            ),
+            verify_key_with(&entry("grafana"), secret, &StubHttp::failing("boom")),
+            verify_key_with(
+                &entry_at("grafana", "no-scheme"),
+                secret,
+                &StubHttp::failing("x"),
+            ),
+        ];
+        for out in cases {
+            let json = serde_json::to_string(&out).unwrap();
+            assert!(!json.contains(secret), "secret leaked into {json}");
+        }
+    }
+
     #[test]
     fn test_provider_spellings_are_normalized() {
         assert_eq!(normalize_provider("Cloudflare"), Some(Provider::Cloudflare));
         assert_eq!(normalize_provider(" CF "), Some(Provider::Cloudflare));
         assert_eq!(normalize_provider("GitHub"), Some(Provider::Github));
         assert_eq!(normalize_provider("gh"), Some(Provider::Github));
+        assert_eq!(normalize_provider("Grafana"), Some(Provider::Grafana));
+        assert_eq!(normalize_provider(" grafana "), Some(Provider::Grafana));
         assert_eq!(normalize_provider("openai"), None);
     }
 

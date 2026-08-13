@@ -116,6 +116,15 @@ pub struct KeyEntry {
     pub last4: String,
     /// Who registered it: `"cli"`, `"mcp:<client>"`, `"gui"`.
     pub source: String,
+    /// Base URL of the instance this key is for, when the provider is not a
+    /// single global service: `https://pathors.grafana.net` for a Grafana
+    /// service-account token. Verification needs it — there is no one address
+    /// to ask about a self-hosted instance.
+    ///
+    /// Omitted from the JSON when absent, and defaulted on the way in, so a
+    /// `keys.json` written before this field existed keeps parsing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
 }
 
 impl KeyEntry {
@@ -170,6 +179,8 @@ pub struct NewKey {
     pub scopes: Vec<String>,
     pub expires_at: Option<DateTime<Utc>>,
     pub source: String,
+    /// Instance URL, for providers that have more than one address.
+    pub endpoint: Option<String>,
 }
 
 impl NewKey {
@@ -185,6 +196,7 @@ impl NewKey {
             scopes: Vec::new(),
             expires_at: None,
             source: source.into(),
+            endpoint: None,
         }
     }
 
@@ -212,6 +224,19 @@ impl NewKey {
         self.expires_at = at;
         self
     }
+
+    /// The instance this key belongs to. Trailing slashes are trimmed so
+    /// `https://x.grafana.net/` and `https://x.grafana.net` are one endpoint.
+    pub fn endpoint(mut self, endpoint: Option<String>) -> Self {
+        self.endpoint = endpoint.map(|e| normalize_endpoint(&e));
+        self
+    }
+}
+
+/// Trim trailing slashes and surrounding whitespace so an endpoint can be
+/// joined to an API path without producing a double slash.
+pub fn normalize_endpoint(endpoint: &str) -> String {
+    endpoint.trim().trim_end_matches('/').to_string()
 }
 
 /// A partial metadata update. `None` leaves a field alone; `Some(None)` on the
@@ -223,6 +248,7 @@ pub struct KeyPatch {
     pub purpose: Option<Option<String>>,
     pub scopes: Option<Vec<String>>,
     pub expires_at: Option<Option<DateTime<Utc>>>,
+    pub endpoint: Option<Option<String>>,
 }
 
 impl KeyPatch {
@@ -232,6 +258,7 @@ impl KeyPatch {
             && self.purpose.is_none()
             && self.scopes.is_none()
             && self.expires_at.is_none()
+            && self.endpoint.is_none()
     }
 }
 
@@ -366,6 +393,7 @@ impl KeyRegistry {
             expires_at: new.expires_at,
             last4: last4(secret),
             source: new.source,
+            endpoint: new.endpoint.as_deref().map(normalize_endpoint),
         };
 
         match existing {
@@ -422,6 +450,9 @@ impl KeyRegistry {
         }
         if let Some(expires_at) = patch.expires_at {
             entry.expires_at = expires_at;
+        }
+        if let Some(endpoint) = patch.endpoint {
+            entry.endpoint = endpoint.as_deref().map(normalize_endpoint);
         }
         let updated = entry.clone();
         self.save(&file)?;
@@ -895,6 +926,7 @@ mod tests {
             expires_at: expires,
             last4: "0000".into(),
             source: "cli".into(),
+            endpoint: None,
         };
 
         let entries = vec![
@@ -931,6 +963,7 @@ mod tests {
             expires_at: None,
             last4: "0000".into(),
             source: "cli".into(),
+            endpoint: None,
         };
         assert!(e.time_to_expiry(now).is_none());
         assert!(!e.is_expired(now));
@@ -938,6 +971,122 @@ mod tests {
         e.expires_at = Some(now - Duration::hours(1));
         assert!(e.is_expired(now));
         assert!(e.time_to_expiry(now).unwrap() < Duration::zero());
+    }
+
+    #[test]
+    fn test_a_keys_json_written_before_endpoints_existed_still_parses() {
+        // The exact shape v0.1.0 wrote: no `endpoint` key anywhere. This is the
+        // regression guard for adding a field to a file format users already
+        // have on disk.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keys.json");
+        std::fs::write(
+            &path,
+            r#"{
+  "version": 1,
+  "keys": [
+    {
+      "id": "cf-gh-actions-deploy",
+      "provider": "cloudflare",
+      "label": "CF deploy token",
+      "purpose": "deploy from GitHub Actions",
+      "scopes": ["workers:edit"],
+      "created_at": "2026-08-13T09:56:53.467618Z",
+      "expires_at": "2027-01-01T00:00:00Z",
+      "last4": "1234",
+      "source": "cli"
+    }
+  ]
+}"#,
+        )
+        .unwrap();
+
+        let registry = KeyRegistry::new(&path, Box::new(MemoryKeystore::new()));
+        let entries = registry.list().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "cf-gh-actions-deploy");
+        assert_eq!(entries[0].endpoint, None);
+
+        // And a key with no endpoint does not grow one in the file on rewrite.
+        registry
+            .update_metadata(
+                "cf-gh-actions-deploy",
+                KeyPatch {
+                    label: Some("renamed".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let rewritten = std::fs::read_to_string(&path).unwrap();
+        assert!(!rewritten.contains("endpoint"), "{rewritten}");
+    }
+
+    #[test]
+    fn test_an_endpoint_round_trips_and_is_normalized() {
+        let v = vault();
+        let entry = v
+            .registry
+            .add(
+                NewKey::new("grafana-pathors", "cli")
+                    .provider("grafana")
+                    // Trailing slash and stray whitespace are what people paste.
+                    .endpoint(Some("  https://pathors.grafana.net/  ".into())),
+                "glsa-1234",
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            entry.endpoint.as_deref(),
+            Some("https://pathors.grafana.net")
+        );
+
+        let reopened = KeyRegistry::new(v.registry.path(), Box::new(MemoryKeystore::new()));
+        assert_eq!(
+            reopened.list().unwrap()[0].endpoint.as_deref(),
+            Some("https://pathors.grafana.net")
+        );
+        // It is in the JSON only because this key has one.
+        let raw = std::fs::read_to_string(v.registry.path()).unwrap();
+        assert!(
+            raw.contains("\"endpoint\": \"https://pathors.grafana.net\""),
+            "{raw}"
+        );
+    }
+
+    #[test]
+    fn test_endpoint_can_be_patched_and_cleared() {
+        let v = vault();
+        v.registry
+            .add(
+                NewKey::new("g", "cli").provider("grafana"),
+                "glsa-1234",
+                false,
+            )
+            .unwrap();
+
+        let updated = v
+            .registry
+            .update_metadata(
+                "g",
+                KeyPatch {
+                    endpoint: Some(Some("https://x.grafana.net/".into())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.endpoint.as_deref(), Some("https://x.grafana.net"));
+
+        let cleared = v
+            .registry
+            .update_metadata(
+                "g",
+                KeyPatch {
+                    endpoint: Some(None),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(cleared.endpoint, None);
     }
 
     #[test]
@@ -959,6 +1108,9 @@ mod tests {
             // Free-form providers are normal, and simply do not link.
             ("openai", None),
             ("stripe", None),
+            // Grafana has no CLI patchbay probes, so its keys deliberately
+            // link to nothing and live in the vault view alone.
+            ("grafana", None),
             ("unknown", None),
             ("", None),
         ];
@@ -1014,6 +1166,7 @@ mod tests {
             expires_at: expires,
             last4: "1234".into(),
             source: "cli".into(),
+            endpoint: None,
         };
 
         assert_eq!(with(None).expiry_state(now), KeyExpiryState::NoExpiry);

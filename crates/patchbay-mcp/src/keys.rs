@@ -94,6 +94,12 @@ pub struct StoreKeyParams {
     pub purpose: Option<String>,
     /// Granted scopes / permissions, as the issuer names them.
     pub scopes: Option<Vec<String>>,
+    /// Base URL of the instance this key is for, when the provider is not one
+    /// global service: "https://pathors.grafana.net" for a Grafana
+    /// service-account token. REQUIRED for grafana keys — verify_key has no
+    /// address to ask without it. Omit for cloudflare and github, which have
+    /// one API each.
+    pub endpoint: Option<String>,
     /// When it expires, RFC 3339 ("2027-01-01T00:00:00Z") or "2027-01-01".
     /// Omit only when the key genuinely never expires — this is what lets
     /// patchbay warn the user before something breaks.
@@ -152,6 +158,10 @@ patchbay, register it here) or to one application/deployment (-> route app env t
 secret manager, Infisical or equivalent)? patchbay's vault is for the user's own machine-level \
 credentials, not application config.
 
+For a key tied to a specific instance rather than a global service — a Grafana service-account \
+token, anything self-hosted — set `endpoint` to the instance root. Without it patchbay can store \
+the key but can never verify it.
+
 Register: long-lived API keys, personal access tokens, deploy tokens, service-account keys, \
 webhook signing secrets, machine-level credentials the user reuses across projects. Do NOT \
 register: per-app `.env` contents, service configuration or deploy-time secrets scoped to one \
@@ -192,7 +202,8 @@ last4, source). The secret is never echoed back.")]
             .label(params.label)
             .purpose(params.purpose)
             .scopes(params.scopes.unwrap_or_default())
-            .expires_at(expires_at);
+            .expires_at(expires_at)
+            .endpoint(params.endpoint);
         let secret = params.secret;
         let overwrite = params.overwrite.unwrap_or(false);
 
@@ -413,6 +424,7 @@ mod tests {
             expires_at: expires,
             last4: "1234".into(),
             source: "mcp:test".into(),
+            endpoint: None,
         };
         let state = |e: KeyEntry| {
             describe(&e, now).unwrap()["expiry_state"]
@@ -449,6 +461,7 @@ mod tests {
             expires_at: None,
             last4: "1234".into(),
             source: "mcp:test".into(),
+            endpoint: None,
         };
         assert_eq!(
             describe(&entry("cloudflare"), now).unwrap()["linked_tool"],
@@ -518,6 +531,7 @@ mod tests {
             expires_at: None,
             last4: "1234".into(),
             source: "mcp:test".into(),
+            endpoint: None,
         };
         let value = describe(&entry, now).unwrap();
         let map = value.as_object().unwrap();
