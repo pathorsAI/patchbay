@@ -70,7 +70,30 @@ written to disk. Never echo a secret anywhere else.
 
 8. Reading a stored value back (`get_key`) and deleting one (`remove_key`) are refused unless \
 the user started this server with PATCHBAY_ALLOW_SECRET_READ=1. That refusal is final: relay it \
-and stop, and point the user at `pb key copy <id>` if they want the value themselves.";
+and stop, and point the user at `pb key copy <id>` if they want the value themselves. \
+`verify_key` is NOT gated: it returns a verdict, never a value, so use it whenever you need to \
+know whether a key still works.
+
+9. WHERE DOES THIS CREDENTIAL GO? Apply this rule every time you meet, create or rotate one, \
+without being asked:
+
+   Does the value belong to the HUMAN, across projects? -> patchbay. Cloudflare API tokens, \
+provider API keys, personal access tokens, machine-level credentials, anything the user would \
+reuse on their next project or paste into a second repo. Register it with `store_key`. If an \
+entry with that id already exists, update it rather than inventing a second one, and when you \
+ROTATE a credential re-store it under the SAME id with overwrite: true and a fresh expires_at. \
+patchbay is the machine's source of truth for these; an unregistered one is a key the user will \
+find in two years with no idea what it opens.
+
+   Does it belong to ONE application or deployment? -> NOT patchbay. Route app env to the \
+project's secret manager (Infisical or equivalent): per-app `.env` contents, service \
+configuration, database URLs, deploy-time secrets for a specific codebase. Those belong with the \
+codebase and its environments, not in the user's personal vault. Do not dump a `.env` file into \
+`store_key` — it will bury the handful of credentials that actually matter under a pile of \
+application config, which is the failure mode this rule exists to prevent.
+
+   Unsure? Ask which project the value is scoped to. If the answer is 'all of them' or 'it is \
+mine', it is a patchbay key.";
 
 /// `{ "tool": "gcloud" }` — identifies one supported CLI.
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -184,6 +207,10 @@ or when the tool has no notion of an active profile.
 - `expires_at: null` means UNKNOWN, not expired — usually the token lives in the OS keychain \
 where patchbay cannot read the expiry without running the tool. Never report a null expiry as an \
 expired credential; call `verify` if you need certainty.
+- `registered_keys` lists standalone vault keys filed against this tool — a Cloudflare API \
+token used for direct API calls shows up on the `wrangler` row even though no CLI tracks it. \
+Each carries { id, label, last4, expires_at, expiry_state }; anything `expired` or \
+`expiring_soon` is worth surfacing, and `verify_key` can confirm it against the issuer.
 - `notes` carries the real caveats (malformed config, mismatched Application Default \
 Credentials, missing directory). Read them; they explain surprises.
 - A probe that fails degrades to `installed: false` plus an explanatory note, so one broken tool \
@@ -204,7 +231,8 @@ Use this before any operation whose result depends on the active account, projec
 instead of assuming the login is still what it was earlier.
 
 Returns one ToolStatus: { tool, installed, category, profiles: [{ id, label, expires_at, meta }], \
-active, notes, connection_state }. `connection_state` is the quickest read: `connected`, \
+active, notes, registered_keys, connection_state }. `registered_keys` is the vault's standalone \
+keys for this tool (id, label, last4, expires_at, expiry_state). `connection_state` is the quickest read: `connected`, \
 `attention` (expired or expiring within 24h), `disconnected`, `not_installed`. Remember that \
 `expires_at: null` means the expiry is unknown (token held in the OS keychain), which is not the \
 same as expired — use `verify` if the difference matters.

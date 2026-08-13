@@ -20,3 +20,7 @@ anstyle = "1"
 # Hidden prompt for `pb key add` when nothing is piped in. The secret must
 # never reach the terminal, the scrollback or the shell history.
 rpassword = "7"
+
+[dev-dependencies]
+# `absorb` is registry logic; its tests need a tempdir vault.
+tempfile = "3"

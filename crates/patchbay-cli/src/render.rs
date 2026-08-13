@@ -199,6 +199,10 @@ pub struct StatusRow {
     pub expires: Option<ExpiryCell>,
     /// First note, condensed to one line. `None` when the tool has no notes.
     pub note: Option<String>,
+    /// Standalone vault keys filed against this tool.
+    pub keys: usize,
+    /// How many of those have expired or are about to.
+    pub keys_attention: usize,
 }
 
 /// Build the row for one tool. `now` is injected so this stays testable.
@@ -223,7 +227,24 @@ pub fn build_row(status: &ToolStatus, now: DateTime<Utc>) -> StatusRow {
         profiles: status.profiles.len(),
         expires,
         note: status.notes.first().map(|n| one_line(n)),
+        keys: status.registered_keys.len(),
+        keys_attention: status.keys_needing_attention().len(),
     }
+}
+
+/// The `+2 keys` marker for a row, with a `!` when one of them needs looking
+/// at. `None` when the tool has no registered keys — the overwhelmingly common
+/// case, and the board must not grow noise for it.
+pub fn keys_marker(row: &StatusRow) -> Option<String> {
+    if row.keys == 0 {
+        return None;
+    }
+    let bang = if row.keys_attention > 0 { "!" } else { "" };
+    Some(format!(
+        "+{} key{}{bang}",
+        row.keys,
+        if row.keys == 1 { "" } else { "s" }
+    ))
 }
 
 /// Render the whole board: header, rows, and a notes section when needed.
@@ -282,6 +303,13 @@ pub fn render_status(statuses: &[ToolStatus], now: DateTime<Utc>, styles: &Style
             "not installed".to_string()
         } else {
             row.note.clone().unwrap_or_default()
+        };
+        // The vault marker leads the notes cell, so a tool with registered
+        // keys reads as "+1 key · <the usual caveat>".
+        let note_text = match keys_marker(row) {
+            Some(marker) if note_text.is_empty() => marker,
+            Some(marker) => format!("{marker} · {note_text}"),
+            None => note_text,
         };
         let note = truncate(&note_text, notes_w);
 
@@ -538,6 +566,63 @@ mod tests {
         // Every column starts at the same offset on every row.
         let col = lines[0].find("ACTIVE").unwrap();
         assert!(lines[1][col..].starts_with("me@example.com"));
+    }
+
+    #[test]
+    fn test_registered_keys_show_as_a_marker_in_the_notes_cell() {
+        use patchbay_core::keys::KeyExpiryState;
+        use patchbay_core::KeyRef;
+
+        let key = |id: &str, state: KeyExpiryState| KeyRef {
+            id: id.into(),
+            label: id.into(),
+            last4: "1234".into(),
+            expires_at: None,
+            expiry_state: state,
+        };
+
+        let mut healthy = ToolStatus::empty("wrangler", true);
+        healthy.active = Some("default".into());
+        healthy.profiles = vec![Profile::new("default")];
+        healthy.registered_keys = vec![key("cf-api", KeyExpiryState::Valid)];
+
+        let row = build_row(&healthy, now());
+        assert_eq!(row.keys, 1);
+        assert_eq!(row.keys_attention, 0);
+        assert_eq!(keys_marker(&row).as_deref(), Some("+1 key"));
+
+        let out = render_status(&[healthy.clone()], now(), &Styles::new(false));
+        assert!(out.contains("+1 key"), "{out}");
+
+        // Plural, and a bang when one of them needs attention.
+        let mut urgent = healthy.clone();
+        urgent.registered_keys = vec![
+            key("cf-api", KeyExpiryState::Valid),
+            key("cf-old", KeyExpiryState::Expired),
+        ];
+        let row = build_row(&urgent, now());
+        assert_eq!(row.keys_attention, 1);
+        assert_eq!(keys_marker(&row).as_deref(), Some("+2 keys!"));
+
+        // The marker leads the cell and the real note follows it.
+        let mut noted = urgent.clone();
+        noted.note("two wrangler configs exist");
+        let out = render_status(&[noted], now(), &Styles::new(false));
+        assert!(out.contains("+2 keys! · two wrangler configs"), "{out}");
+    }
+
+    #[test]
+    fn test_a_tool_without_keys_gets_no_marker_and_no_extra_noise() {
+        let mut status = ToolStatus::empty("gh", true);
+        status.active = Some("octocat".into());
+        status.profiles = vec![Profile::new("octocat")];
+
+        let row = build_row(&status, now());
+        assert_eq!(row.keys, 0);
+        assert_eq!(keys_marker(&row), None);
+
+        let out = render_status(&[status], now(), &Styles::new(false));
+        assert!(!out.contains("key"), "{out}");
     }
 
     #[test]

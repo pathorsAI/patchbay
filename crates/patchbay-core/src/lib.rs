@@ -28,6 +28,7 @@
 //! [`KeyRegistry::get_secret`] is the single, gated way back out.
 
 pub mod keys;
+pub mod keys_verify;
 pub mod keystore;
 pub mod paths;
 pub mod probe;
@@ -36,12 +37,13 @@ pub mod registry;
 pub mod types;
 pub mod util;
 
-pub use keys::{KeyEntry, KeyPatch, KeyRegistry, NewKey};
+pub use keys::{KeyEntry, KeyExpiryState, KeyPatch, KeyRegistry, NewKey};
+pub use keys_verify::{verify_key, KeyVerifyOutcome, KeyVerifyStatus};
 pub use keystore::Keystore;
 pub use paths::Paths;
 pub use probe::Probe;
 pub use registry::Registry;
 pub use types::{
-    ConnectionState, PermissionsReport, Profile, SwitchOutcome, ToolCategory, ToolStatus,
+    ConnectionState, KeyRef, PermissionsReport, Profile, SwitchOutcome, ToolCategory, ToolStatus,
     VerifyOutcome,
 };

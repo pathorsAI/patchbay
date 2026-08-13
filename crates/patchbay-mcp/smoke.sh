@@ -6,7 +6,7 @@
 #
 #   1. initialize                 -> serverInfo + instructions + capabilities
 #   2. notifications/initialized  -> (no response; completes the handshake)
-#   3. tools/list                 -> the nine patchbay tools + their schemas
+#   3. tools/list                 -> the ten patchbay tools + their schemas
 #   4. tools/call list_connections-> tier-1 board for this machine
 #   5. tools/call get_status(nope)-> tool error listing the valid tool names
 #   6. tools/call list_keys       -> the key vault, metadata only
@@ -100,13 +100,18 @@ need("tools" in r["capabilities"], "server did not advertise tools capability")
 need("tier 1" in r["instructions"], "instructions missing the tier-1/tier-2 guidance")
 need("PATCHBAY_ALLOW_SECRET_READ" in r["instructions"],
      "instructions never mention the key vault's read gate")
+# The env/credential routing rule: every client must see it on connect.
+need("WHERE DOES THIS CREDENTIAL GO?" in r["instructions"],
+     "instructions lost the credential routing rule")
+need("secret manager" in r["instructions"] and "Infisical" in r["instructions"],
+     "routing rule does not send app env to the project's secret manager")
 
 # 2. tools/list
 tl = msgs.get(2)
 need(tl and "result" in tl, "no tools/list result")
 names = {t["name"] for t in tl["result"]["tools"]}
 expected = {"list_connections", "get_status", "switch_profile", "verify", "get_permissions",
-            "store_key", "list_keys", "get_key", "remove_key"}
+            "store_key", "list_keys", "get_key", "remove_key", "verify_key"}
 need(names == expected, f"tool set mismatch: {sorted(names)}")
 for t in tl["result"]["tools"]:
     need(t.get("description"), f"{t['name']} has no description")
@@ -117,7 +122,8 @@ need(lc and "result" in lc, "no list_connections result")
 need(not lc["result"].get("isError"), "list_connections returned isError")
 board = json.loads(lc["result"]["content"][0]["text"])
 need(isinstance(board, list), "list_connections did not return a JSON array")
-need(all({"tool", "installed", "profiles", "active", "notes"} <= set(s) for s in board),
+need(all({"tool", "installed", "profiles", "active", "notes", "registered_keys"} <= set(s)
+         for s in board),
      "ToolStatus shape mismatch")
 
 # 4. unknown tool -> tool error whose message names the valid tools
@@ -135,7 +141,7 @@ need(not lk["result"].get("isError"), f"list_keys returned isError: {lk['result'
 vault = json.loads(lk["result"]["content"][0]["text"])
 need(isinstance(vault, list), "list_keys did not return a JSON array")
 for entry in vault:
-    need({"id", "provider", "label", "last4", "expiry_state"} <= set(entry),
+    need({"id", "provider", "label", "last4", "expiry_state", "linked_tool"} <= set(entry),
          f"key entry shape mismatch: {sorted(entry)}")
     need("secret" not in entry, f"list_keys leaked a secret field for {entry['id']!r}")
 

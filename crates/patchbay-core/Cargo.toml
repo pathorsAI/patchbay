@@ -15,6 +15,10 @@ serde_yaml_ng = "0.10"
 toml = "0.9"
 which = "8"
 rusqlite = { version = "0.40", features = ["bundled"] }
+# Key verification talks to provider APIs. ureq is blocking (patchbay-core is
+# sync throughout) and pulls no async runtime; rustls + webpki-roots keep
+# OpenSSL off the dependency graph entirely.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -33,9 +33,66 @@ const FILE_VERSION: u32 = 1;
 /// stays sane.
 const MAX_ID_LEN: usize = 64;
 
+/// A key inside this window is close enough to expiry to be worth saying out
+/// loud, on the board and in every MCP answer.
+const EXPIRING_SOON_DAYS: i64 = 30;
+
 // ---------------------------------------------------------------------------
 // model
 // ---------------------------------------------------------------------------
+
+/// How healthy a key's lifetime looks. Derived from `expires_at` and the clock
+/// in one place, so the CLI, the MCP server and the panel never disagree about
+/// what "expiring soon" means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyExpiryState {
+    /// Past its expiry.
+    Expired,
+    /// Expires within [`EXPIRING_SOON_DAYS`] days.
+    ExpiringSoon,
+    /// Has an expiry, comfortably far out.
+    Valid,
+    /// No expiry recorded — either it never expires, or nobody said.
+    NoExpiry,
+}
+
+impl KeyExpiryState {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Expired => "expired",
+            Self::ExpiringSoon => "expiring soon",
+            Self::Valid => "valid",
+            Self::NoExpiry => "no expiry",
+        }
+    }
+
+    /// Whether this state deserves the user's attention.
+    pub fn needs_attention(&self) -> bool {
+        matches!(self, Self::Expired | Self::ExpiringSoon)
+    }
+}
+
+/// The tool whose login a key of this provider sits alongside.
+///
+/// The single source of truth for provider↔tool linking: the board uses it to
+/// show registered keys next to the CLI they belong with, so a Cloudflare token
+/// used for direct API calls appears on the same row as `wrangler`'s login even
+/// though no CLI has ever heard of it.
+///
+/// Unknown providers map to `None` and simply do not appear on the board — the
+/// vault is free-form on purpose, and an unrecognised provider is not an error.
+pub fn tool_for_provider(provider: &str) -> Option<&'static str> {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "cloudflare" | "cf" => Some("wrangler"),
+        "github" | "gh" => Some("gh"),
+        "gcp" | "google" | "google-cloud" | "gcloud" => Some("gcloud"),
+        "aws" | "amazon" => Some("aws"),
+        "azure" | "az" => Some("az"),
+        "infisical" => Some("infisical"),
+        _ => None,
+    }
+}
 
 /// One registered key. **Metadata only** — this struct never carries the secret
 /// value, and `last4` is the only thing derived from it.
@@ -70,6 +127,34 @@ impl KeyEntry {
 
     pub fn is_expired(&self, now: DateTime<Utc>) -> bool {
         matches!(self.expires_at, Some(at) if at <= now)
+    }
+
+    /// How this key's lifetime looks right now.
+    pub fn expiry_state(&self, now: DateTime<Utc>) -> KeyExpiryState {
+        match self.expires_at {
+            None => KeyExpiryState::NoExpiry,
+            Some(at) if at <= now => KeyExpiryState::Expired,
+            Some(at) if at - now <= Duration::days(EXPIRING_SOON_DAYS) => {
+                KeyExpiryState::ExpiringSoon
+            }
+            Some(_) => KeyExpiryState::Valid,
+        }
+    }
+
+    /// The compact form that rides along on a [`crate::types::ToolStatus`].
+    pub fn as_ref_at(&self, now: DateTime<Utc>) -> crate::types::KeyRef {
+        crate::types::KeyRef {
+            id: self.id.clone(),
+            label: self.label.clone(),
+            last4: self.last4.clone(),
+            expires_at: self.expires_at,
+            expiry_state: self.expiry_state(now),
+        }
+    }
+
+    /// The tool this key belongs beside on the board, if any.
+    pub fn linked_tool(&self) -> Option<&'static str> {
+        tool_for_provider(&self.provider)
     }
 }
 
@@ -853,6 +938,126 @@ mod tests {
         e.expires_at = Some(now - Duration::hours(1));
         assert!(e.is_expired(now));
         assert!(e.time_to_expiry(now).unwrap() < Duration::zero());
+    }
+
+    #[test]
+    fn test_provider_to_tool_mapping_is_the_single_source_of_truth() {
+        let expected = [
+            ("cloudflare", Some("wrangler")),
+            ("cf", Some("wrangler")),
+            ("github", Some("gh")),
+            ("gh", Some("gh")),
+            ("gcp", Some("gcloud")),
+            ("google", Some("gcloud")),
+            ("google-cloud", Some("gcloud")),
+            ("gcloud", Some("gcloud")),
+            ("aws", Some("aws")),
+            ("amazon", Some("aws")),
+            ("azure", Some("az")),
+            ("az", Some("az")),
+            ("infisical", Some("infisical")),
+            // Free-form providers are normal, and simply do not link.
+            ("openai", None),
+            ("stripe", None),
+            ("unknown", None),
+            ("", None),
+        ];
+        for (provider, tool) in expected {
+            assert_eq!(tool_for_provider(provider), tool, "provider `{provider}`");
+        }
+
+        // Case and stray whitespace are what people actually type.
+        assert_eq!(tool_for_provider("CloudFlare"), Some("wrangler"));
+        assert_eq!(tool_for_provider("  GitHub  "), Some("gh"));
+
+        // Every tool named here must be a real probe key, or the key would be
+        // filed against a row that does not exist.
+        let dir = tempfile::tempdir().unwrap();
+        let board = crate::Registry::all(Paths::for_test(dir.path()));
+        let known = board.tool_names();
+        for (provider, tool) in expected {
+            if let Some(tool) = tool {
+                assert!(
+                    known.contains(&tool),
+                    "`{provider}` maps to unknown `{tool}`"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_linked_tool_reads_the_entrys_own_provider() {
+        let v = vault();
+        let entry = v
+            .registry
+            .add(sample("cf-api"), "value-1234", false)
+            .unwrap();
+        assert_eq!(entry.linked_tool(), Some("wrangler"));
+
+        let other = v
+            .registry
+            .add(NewKey::new("o", "cli").provider("openai"), "v-1234", false)
+            .unwrap();
+        assert_eq!(other.linked_tool(), None);
+    }
+
+    #[test]
+    fn test_expiry_state_buckets() {
+        let now = Utc::now();
+        let with = |expires: Option<DateTime<Utc>>| KeyEntry {
+            id: "k".into(),
+            provider: "cloudflare".into(),
+            label: "k".into(),
+            purpose: None,
+            scopes: vec![],
+            created_at: now,
+            expires_at: expires,
+            last4: "1234".into(),
+            source: "cli".into(),
+        };
+
+        assert_eq!(with(None).expiry_state(now), KeyExpiryState::NoExpiry);
+        assert_eq!(
+            with(Some(now - Duration::minutes(1))).expiry_state(now),
+            KeyExpiryState::Expired
+        );
+        assert_eq!(
+            with(Some(now + Duration::days(3))).expiry_state(now),
+            KeyExpiryState::ExpiringSoon
+        );
+        // The boundary belongs to the warning, not to the all-clear.
+        assert_eq!(
+            with(Some(now + Duration::days(EXPIRING_SOON_DAYS))).expiry_state(now),
+            KeyExpiryState::ExpiringSoon
+        );
+        assert_eq!(
+            with(Some(now + Duration::days(EXPIRING_SOON_DAYS + 1))).expiry_state(now),
+            KeyExpiryState::Valid
+        );
+
+        assert!(KeyExpiryState::Expired.needs_attention());
+        assert!(KeyExpiryState::ExpiringSoon.needs_attention());
+        assert!(!KeyExpiryState::Valid.needs_attention());
+        assert!(!KeyExpiryState::NoExpiry.needs_attention());
+        assert_eq!(KeyExpiryState::ExpiringSoon.label(), "expiring soon");
+    }
+
+    #[test]
+    fn test_key_ref_is_metadata_only() {
+        let v = vault();
+        let entry = v
+            .registry
+            .add(sample("cf-api"), "super-secret-9876", false)
+            .unwrap();
+        let key_ref = entry.as_ref_at(Utc::now());
+
+        assert_eq!(key_ref.id, "cf-api");
+        assert_eq!(key_ref.last4, "9876");
+        let json = serde_json::to_string(&key_ref).unwrap();
+        assert!(!json.contains("super-secret"), "{json}");
+        // The projection carries no purpose/scopes/source: it is a board chip,
+        // not a second copy of the entry.
+        assert!(!json.contains("purpose"), "{json}");
     }
 
     #[test]

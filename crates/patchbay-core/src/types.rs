@@ -80,6 +80,22 @@ impl ConnectionState {
 /// A credential this close to expiry needs a human before it bites.
 const ATTENTION_WINDOW_HOURS: i64 = 24;
 
+/// A key from the vault, shown next to the tool it belongs with.
+///
+/// The compact projection of a [`crate::keys::KeyEntry`] — enough to identify
+/// and triage it on the board, and nothing more. Like everything in this
+/// module: metadata only, never the value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KeyRef {
+    pub id: String,
+    pub label: String,
+    /// Last 4 characters of the secret.
+    pub last4: String,
+    pub expires_at: Option<DateTime<Utc>>,
+    /// Derived from `expires_at` and the clock at the moment of the read.
+    pub expiry_state: crate::keys::KeyExpiryState,
+}
+
 /// The state of one developer CLI on this machine.
 ///
 /// `Serialize` is written by hand so the derived [`ToolStatus::connection_state`]
@@ -99,6 +115,11 @@ pub struct ToolStatus {
     /// What the tool is for. Derived from `tool`; see [`ToolCategory::for_tool`].
     #[serde(default = "ToolCategory::unknown")]
     pub category: ToolCategory,
+    /// Standalone keys from the vault whose provider maps to this tool — the
+    /// Cloudflare API token that sits beside `wrangler`'s own login. Populated
+    /// by [`crate::Registry`] when a key registry is attached; empty otherwise.
+    #[serde(default)]
+    pub registered_keys: Vec<KeyRef>,
 }
 
 impl ToolCategory {
@@ -119,14 +140,16 @@ impl Serialize for ToolStatus {
             active,
             notes,
             category,
+            registered_keys,
         } = self;
-        let mut out = serializer.serialize_struct("ToolStatus", 7)?;
+        let mut out = serializer.serialize_struct("ToolStatus", 8)?;
         out.serialize_field("tool", tool)?;
         out.serialize_field("installed", installed)?;
         out.serialize_field("category", category)?;
         out.serialize_field("profiles", profiles)?;
         out.serialize_field("active", active)?;
         out.serialize_field("notes", notes)?;
+        out.serialize_field("registered_keys", registered_keys)?;
         out.serialize_field("connection_state", &self.connection_state())?;
         out.end()
     }
@@ -142,7 +165,16 @@ impl ToolStatus {
             profiles: Vec::new(),
             active: None,
             notes: Vec::new(),
+            registered_keys: Vec::new(),
         }
+    }
+
+    /// Keys on this row that have expired or are about to.
+    pub fn keys_needing_attention(&self) -> Vec<&KeyRef> {
+        self.registered_keys
+            .iter()
+            .filter(|k| k.expiry_state.needs_attention())
+            .collect()
     }
 
     /// Whether this tool is usable right now.
@@ -414,6 +446,38 @@ mod tests {
         // The derived field is not an input: reading it back is lossless.
         let back: ToolStatus = serde_json::from_value(json).unwrap();
         assert_eq!(back, status);
+    }
+
+    #[test]
+    fn test_registered_keys_travel_in_the_json_and_survive_a_round_trip() {
+        let mut status = status_with(Some("default"), vec![Profile::new("default")]);
+        status.tool = "wrangler".into();
+        status.registered_keys = vec![KeyRef {
+            id: "cf-api".into(),
+            label: "CF API token".into(),
+            last4: "1234".into(),
+            expires_at: at(48),
+            expiry_state: crate::keys::KeyExpiryState::ExpiringSoon,
+        }];
+
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["registered_keys"][0]["id"], "cf-api");
+        assert_eq!(json["registered_keys"][0]["last4"], "1234");
+        assert_eq!(json["registered_keys"][0]["expiry_state"], "expiring_soon");
+        assert_eq!(status.keys_needing_attention().len(), 1);
+
+        let back: ToolStatus = serde_json::from_value(json).unwrap();
+        assert_eq!(back, status);
+    }
+
+    #[test]
+    fn test_json_written_before_registered_keys_existed_still_reads() {
+        let legacy = serde_json::json!({
+            "tool": "gh", "installed": true, "profiles": [], "active": null,
+            "notes": [], "category": "code"
+        });
+        let back: ToolStatus = serde_json::from_value(legacy).unwrap();
+        assert!(back.registered_keys.is_empty());
     }
 
     #[test]

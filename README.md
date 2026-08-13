@@ -134,9 +134,56 @@ pbpaste | pb key add cf-gh-actions-deploy \
 pb key list                 # id, provider, label, last4, expiry, purpose
 pb key list --expiring 30   # what dies in the next month
 pb key list --json          # what the MCP server and the panel see
-pb key copy cf-gh-actions-deploy   # to the clipboard, never to your terminal
-pb key rm  cf-gh-actions-deploy    # metadata and Keychain item, both
+pb key copy cf-gh-actions-deploy    # to the clipboard, never to your terminal
+pb key verify cf-gh-actions-deploy  # ask Cloudflare whether it still works
+pb key rm  cf-gh-actions-deploy     # metadata and Keychain item, both
 ```
+
+### Verification
+
+`pb key list` can only repeat what you told it. `pb key verify` asks the issuer:
+
+```console
+$ pb key verify cf-gh-actions-deploy
+cf-gh-actions-deploy (…4f0a) — valid
+  This API Token is valid and active
+  expires: in 141d (2027-01-01)
+  updated the registry from the provider: expires_at
+```
+
+Cloudflare and GitHub in v1; every other provider answers `unsupported`, which
+is a normal answer and not a failure. A successful check writes what the issuer
+said — expiry, and GitHub's scopes — back into the registry, so the vault
+converges on the truth instead of drifting from it.
+
+The verdicts are deliberately more than a boolean. `unreachable` (DNS, timeout,
+rate limit, 5xx) means patchbay could not ask; it says **nothing** about the
+key, and it never overwrites what you already had. Exit codes follow: `0`
+verified or unsupported, `1` the provider says the key is dead, `2` the provider
+could not be reached.
+
+Agents get the same check over MCP as `verify_key`, and it is **not** gated
+behind `PATCHBAY_ALLOW_SECRET_READ` — a verdict carries nothing to leak.
+
+### Keys on the board
+
+A key whose `provider` maps to a tool patchbay probes shows up on that tool's
+row — `cloudflare` beside `wrangler`, `github` beside `gh`, `gcp`/`google`
+beside `gcloud`, plus `aws`, `azure` and `infisical`. That is the point of the
+vault for a machine that already has the CLI logged in: a Cloudflare API token
+used for direct API calls is broader than wrangler's own OAuth session, and
+nothing else on the machine knew it existed.
+
+```console
+$ pb status
+TOOL       ACTIVE                PROFILES  EXPIRES        NOTES
+wrangler   default               1         in 21d         +1 key · two wrangler configs exist
+```
+
+`+2 keys!` means one of them has expired or is about to. Unmapped providers
+(`openai`, `stripe`, anything free-form) simply do not appear on the board.
+`pb status --json` and the MCP `list_connections` carry the same thing as
+`registered_keys`.
 
 ### The security model
 

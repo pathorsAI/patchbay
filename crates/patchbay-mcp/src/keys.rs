@@ -13,6 +13,7 @@
 
 use chrono::{DateTime, Utc};
 use patchbay_core::keys::NewKey;
+use patchbay_core::keys_verify::verify_key;
 use patchbay_core::KeyEntry;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
@@ -116,13 +117,16 @@ pub struct KeyIdParams {
 fn describe(entry: &KeyEntry, now: DateTime<Utc>) -> Result<serde_json::Value, ErrorData> {
     let mut value = encode(entry)?;
     if let Some(map) = value.as_object_mut() {
-        let state = match entry.expires_at {
-            None => "no_expiry",
-            Some(at) if at <= now => "expired",
-            Some(at) if (at - now).num_days() <= 30 => "expiring_soon",
-            Some(_) => "valid",
-        };
-        map.insert("expiry_state".into(), state.into());
+        // Bucketed by the core, so the MCP answer, `pb status` and the panel
+        // can never disagree about what "expiring soon" means.
+        map.insert("expiry_state".into(), encode(&entry.expiry_state(now))?);
+        map.insert(
+            "linked_tool".into(),
+            match entry.linked_tool() {
+                Some(tool) => tool.into(),
+                None => serde_json::Value::Null,
+            },
+        );
     }
     Ok(value)
 }
@@ -143,9 +147,20 @@ the user's patchbay stays the source of truth. Do it as part of the task, not as
 afterthought — an unregistered key is one the user will find in two years with no idea what it \
 opens, or will never find at all when it silently expires.
 
+THE ROUTING RULE, in one line: does this value belong to the human across projects (-> \
+patchbay, register it here) or to one application/deployment (-> route app env to the project's \
+secret manager, Infisical or equivalent)? patchbay's vault is for the user's own machine-level \
+credentials, not application config.
+
 Register: long-lived API keys, personal access tokens, deploy tokens, service-account keys, \
-webhook signing secrets. Do NOT register: short-lived session tokens a CLI already manages \
-(use list_connections for those), OAuth refresh flows the tool owns, or passwords.
+webhook signing secrets, machine-level credentials the user reuses across projects. Do NOT \
+register: per-app `.env` contents, service configuration or deploy-time secrets scoped to one \
+codebase (those go to the project's secret manager); short-lived session tokens a CLI already \
+manages (use list_connections for those); OAuth refresh flows the tool owns; or passwords.
+
+Rotating a credential you already registered? Re-store it under the SAME id with \
+overwrite: true and a fresh expires_at, rather than creating a second entry. If the id exists \
+but only its metadata is wrong, the key is already tracked — leave the value alone.
 
 Where the secret goes: the OS keychain, immediately. The metadata file on disk gets the last 4 \
 characters and nothing else. NEVER echo the secret anywhere else — not into your reply, not into \
@@ -214,6 +229,79 @@ in a provider's dashboard. It is the only thing here derived from the value.
                 let described: Result<Vec<_>, ErrorData> =
                     entries.iter().map(|e| describe(e, now)).collect();
                 Ok(json_ok(serde_json::Value::Array(described?)))
+            }
+            Err(err) => Ok(tool_error(err)),
+        }
+    }
+
+    #[tool(description = "\
+ASK THE ISSUER whether a registered key still works. NOT gated: this returns a verdict, never \
+the value, so it is safe to call whenever the answer would change what you do.
+
+Makes one outbound HTTPS request to the provider using the stored secret, which patchbay reads \
+internally and never returns to you. Seconds, not milliseconds. Providers patchbay can \
+interrogate today: cloudflare and github. Anything else comes back 'unsupported'.
+
+Call it when the user asks whether a key is still good, before relying on a key for something \
+expensive or destructive, or when an operation failed with something that smells like a bad \
+credential. Do not call it on every key in a loop just to build a report — verify the one you \
+care about.
+
+Returns { status, detail, expires_at, scopes }:
+
+- 'valid' — the issuer confirms it works. If `expires_at` came back and the registry did not \
+have it, patchbay has already written it back for you; if you registered this key earlier \
+WITHOUT an expiry and this call reveals one, that is the fix landing automatically. Mention the \
+expiry to the user when it is close.
+- 'invalid' — the issuer rejected it: revoked, deleted, disabled, or never real. Say so \
+plainly; the user needs to rotate it, and then re-register with store_key + overwrite.
+- 'expired' — the issuer knows it, its lifetime is over. Same action: rotate and re-store.
+- 'unsupported' — patchbay has no verification path for this provider. A normal answer, not a \
+failure. Do not retry; point the user at the provider's dashboard.
+- 'unreachable' — the provider could not be reached (DNS, timeout, rate limit, 5xx). This says \
+NOTHING about the key. Never report it as a dead credential, and do not advise rotating on the \
+strength of it.")]
+    async fn verify_key(
+        &self,
+        Parameters(KeyIdParams { id }): Parameters<KeyIdParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let keys = self.keys.clone();
+        let outcome = offload(move || {
+            let entry = keys
+                .get(&id)?
+                .ok_or_else(|| anyhow::anyhow!("no key registered as `{id}`"))?;
+            // The secret exists only inside this closure, for one request.
+            let secret = keys.get_secret(&id)?;
+            let outcome = verify_key(&entry, &secret);
+            drop(secret);
+
+            // The issuer is the authority on its own token: absorb what it
+            // said, so the next list_keys is right without another round trip.
+            if outcome.status == patchbay_core::KeyVerifyStatus::Valid {
+                let mut patch = patchbay_core::KeyPatch::default();
+                if let Some(at) = outcome.expires_at {
+                    if entry.expires_at != Some(at) {
+                        patch.expires_at = Some(Some(at));
+                    }
+                }
+                if !outcome.scopes.is_empty() && outcome.scopes != entry.scopes {
+                    patch.scopes = Some(outcome.scopes.clone());
+                }
+                if !patch.is_empty() {
+                    keys.update_metadata(&entry.id, patch)?;
+                }
+            }
+            Ok::<_, anyhow::Error>((entry.id, outcome))
+        })
+        .await?;
+
+        match outcome {
+            Ok((id, outcome)) => {
+                let mut value = encode(&outcome)?;
+                if let Some(map) = value.as_object_mut() {
+                    map.insert("id".into(), id.into());
+                }
+                Ok(json_ok(value))
             }
             Err(err) => Ok(tool_error(err)),
         }
@@ -346,6 +434,75 @@ mod tests {
             state(entry(Some(now + chrono::Duration::days(365)))),
             "valid"
         );
+    }
+
+    #[test]
+    fn test_described_entry_carries_the_tool_it_links_to() {
+        let now = Utc::now();
+        let entry = |provider: &str| KeyEntry {
+            id: "k".into(),
+            provider: provider.into(),
+            label: "l".into(),
+            purpose: None,
+            scopes: vec![],
+            created_at: now,
+            expires_at: None,
+            last4: "1234".into(),
+            source: "mcp:test".into(),
+        };
+        assert_eq!(
+            describe(&entry("cloudflare"), now).unwrap()["linked_tool"],
+            "wrangler"
+        );
+        assert_eq!(
+            describe(&entry("github"), now).unwrap()["linked_tool"],
+            "gh"
+        );
+        assert!(describe(&entry("openai"), now).unwrap()["linked_tool"].is_null());
+    }
+
+    #[test]
+    fn test_store_key_teaches_the_routing_rule() {
+        // The description is the only thing an agent reads before deciding
+        // where a credential goes, so the rule has to survive edits to it.
+        let tools = PatchbayServer::keys_router().list_all();
+        let store = tools
+            .iter()
+            .find(|t| t.name == "store_key")
+            .expect("store_key is missing from the router");
+        let text = store.description.as_deref().unwrap_or_default().to_string();
+
+        assert!(
+            text.contains("belong to the human across projects"),
+            "{text}"
+        );
+        assert!(text.contains("secret manager"), "{text}");
+        assert!(text.contains("Infisical"), "{text}");
+        assert!(text.contains(".env"), "{text}");
+        assert!(text.contains("overwrite: true"), "{text}");
+    }
+
+    #[test]
+    fn test_verify_key_is_advertised_as_ungated() {
+        let tools = PatchbayServer::keys_router().list_all();
+        let verify = tools
+            .iter()
+            .find(|t| t.name == "verify_key")
+            .expect("verify_key is missing from the router");
+        let text = verify
+            .description
+            .as_deref()
+            .unwrap_or_default()
+            .to_string();
+
+        assert!(text.contains("NOT gated"), "{text}");
+        assert!(
+            text.contains("never \nthe value") || text.contains("never the value"),
+            "{text}"
+        );
+        // The distinction that matters most: unreachable is not a dead key.
+        assert!(text.contains("unreachable"), "{text}");
+        assert!(text.contains("NOTHING about the key"), "{text}");
     }
 
     #[test]
