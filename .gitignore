@@ -1,0 +1,7 @@
+/target
+node_modules/
+dist/
+*.log
+.DS_Store
+app/src-tauri/target
+patchbay.manifest.json
