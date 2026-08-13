@@ -82,6 +82,12 @@ impl Registry {
         Ok(Self::all(paths).with_keys(keys))
     }
 
+    /// The locations these probes read through. [`crate::migrate`] needs it to
+    /// resolve the same files the board was built from.
+    pub fn paths(&self) -> &Paths {
+        &self.paths
+    }
+
     pub fn tool_names(&self) -> Vec<&'static str> {
         self.probes.iter().map(|p| p.tool()).collect()
     }
