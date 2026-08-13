@@ -10,12 +10,40 @@ export interface Profile {
   meta: Meta;
 }
 
+/** Mirrors `patchbay_core::ToolCategory` (serde snake_case). */
+export type ToolCategory = "cloud" | "code" | "secrets" | "cluster" | "edge" | "storage" | "other";
+
+/** Mirrors `patchbay_core::ConnectionState`. Derived in core, not here. */
+export type ConnectionState = "connected" | "attention" | "disconnected" | "not_installed";
+
+export const CATEGORY_LABEL: Record<ToolCategory, string> = {
+  cloud: "Cloud",
+  code: "Code",
+  secrets: "Secrets",
+  cluster: "Cluster",
+  edge: "Edge",
+  storage: "Storage",
+  other: "Other",
+};
+
+/** Listed in the order the sidebar shows them: worst news first. */
+export const STATES: ConnectionState[] = ["connected", "attention", "disconnected", "not_installed"];
+
+export const STATE_LABEL: Record<ConnectionState, string> = {
+  connected: "Connected",
+  attention: "Attention",
+  disconnected: "Disconnected",
+  not_installed: "Not installed",
+};
+
 export interface ToolStatus {
   tool: string;
   installed: boolean;
+  category: ToolCategory;
   profiles: Profile[];
   active: string | null;
   notes: string[];
+  connection_state: ConnectionState;
 }
 
 export type SwitchOutcome =

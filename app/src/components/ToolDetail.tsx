@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { countdown, levelOf } from "../expiry";
+import { profileMatches } from "../filters";
 import { metaEntries, verdictText, type Panel } from "../panel";
 import { PERMISSIONS_TOOLS, type Profile, type ToolStatus } from "../types";
 import { Copyable } from "./Copyable";
@@ -13,11 +14,14 @@ import { ToolLogo } from "./ToolLogo";
 export function ToolDetail({
   status,
   panel,
+  query,
   wantPermissions,
   onClose,
 }: {
   status: ToolStatus;
   panel: Panel;
+  /** The board's search text; matching profiles are marked here too. */
+  query: string;
   wantPermissions: boolean;
   onClose: () => void;
 }) {
@@ -68,6 +72,7 @@ export function ToolDetail({
                   key={p.id}
                   profile={p}
                   active={p.id === status.active}
+                  matched={profileMatches(p, query)}
                   tool={status.tool}
                   panel={panel}
                 />
@@ -182,11 +187,13 @@ export function ToolDetail({
 function ProfileRow({
   profile,
   active,
+  matched,
   tool,
   panel,
 }: {
   profile: Profile;
   active: boolean;
+  matched: boolean;
   tool: string;
   panel: Panel;
 }) {
@@ -195,11 +202,12 @@ function ProfileRow({
   const busy = panel.switching === `${tool}:${profile.id}`;
 
   return (
-    <li className={`dprofile${active ? " is-active" : ""}`}>
+    <li className={`dprofile${active ? " is-active" : ""}${matched ? " is-match" : ""}`}>
       <div className="dprofile-head">
         <span className="dprofile-label" title={profile.id}>
           {profile.label}
         </span>
+        {matched && <span className="match-tag">match</span>}
         <span className={`chip chip-${level}`}>{countdown(profile.expires_at, panel.now)}</span>
         {active ? (
           <span className="active-tag">active</span>

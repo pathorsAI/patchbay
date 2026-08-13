@@ -2,8 +2,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { permissions as fetchPerms, statusAll, switchProfile, verify as runVerify } from "./api";
 import { clockTime, summarize, summaryLine } from "./expiry";
+import { apply, isFiltered, NO_FILTERS, type Filters } from "./filters";
 import { switchMessage, type Panel, type SwitchNote } from "./panel";
-import type { PermissionsReport, ToolStatus, VerifyOutcome } from "./types";
+import { CATEGORY_LABEL, STATE_LABEL, type PermissionsReport, type ToolStatus, type VerifyOutcome } from "./types";
+import { Sidebar } from "./components/Sidebar";
 import { ToolCard } from "./components/ToolCard";
 import { ToolDetail } from "./components/ToolDetail";
 
@@ -18,12 +20,15 @@ export default function App() {
   const [refreshedAt, setRefreshedAt] = useState<number | null>(null);
   const [now, setNow] = useState(() => Date.now());
   const [version, setVersion] = useState("");
+  const [filters, setFilters] = useState<Filters>(NO_FILTERS);
 
   const [detail, setDetail] = useState<{ tool: string; permissions: boolean } | null>(null);
   const [verdicts, setVerdicts] = useState<Record<string, VerifyOutcome | null>>({});
   const [perms, setPerms] = useState<Record<string, PermissionsReport | null>>({});
   const [switching, setSwitching] = useState<string | null>(null);
   const [switchNotes, setSwitchNotes] = useState<Record<string, SwitchNote>>({});
+
+  const searchRef = useRef<HTMLInputElement>(null);
 
   const refresh = useCallback(async () => {
     setRefreshing(true);
@@ -55,8 +60,27 @@ export default function App() {
       .catch(() => setVersion(""));
   }, []);
 
-  // `refresh` is stable, but the panel object below must not be rebuilt on
-  // every tick or the whole board re-renders for a countdown.
+  const detailOpen = detail !== null;
+
+  // `/` jumps to search, Esc clears the filters. Esc belongs to the detail
+  // view while one is open, so it only reaches the board when nothing is.
+  useEffect(() => {
+    const onKey = (e: globalThis.KeyboardEvent) => {
+      const el = e.target as HTMLElement | null;
+      const typing = el?.tagName === "INPUT" || el?.tagName === "TEXTAREA";
+      if (e.key === "/" && !typing) {
+        e.preventDefault();
+        searchRef.current?.focus();
+        searchRef.current?.select();
+      } else if (e.key === "Escape" && !detailOpen) {
+        setFilters(NO_FILTERS);
+        searchRef.current?.blur();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [detailOpen]);
+
   const refreshRef = useRef(refresh);
   refreshRef.current = refresh;
 
@@ -112,8 +136,24 @@ export default function App() {
 
   const panel: Panel = { now, verdicts, perms, switching, switchNotes, ...actions };
 
-  const summary = statuses ? summaryLine(summarize(statuses, now)) : "reading local state…";
-  const detailStatus = detail ? statuses?.find((s) => s.tool === detail.tool) : undefined;
+  const all = statuses ?? [];
+  const shown = useMemo(() => apply(all, filters), [all, filters]);
+  const filtered = isFiltered(filters);
+
+  let summary: string;
+  if (!statuses) {
+    summary = "reading local state…";
+  } else if (!filtered) {
+    summary = summaryLine(summarize(all, now));
+  } else {
+    const parts = [`${shown.length} of ${all.length}`];
+    if (filters.category) parts.push(CATEGORY_LABEL[filters.category]);
+    if (filters.state) parts.push(STATE_LABEL[filters.state]);
+    if (filters.query.trim()) parts.push(`“${filters.query.trim()}”`);
+    summary = parts.join(" · ");
+  }
+
+  const detailStatus = detail ? all.find((s) => s.tool === detail.tool) : undefined;
 
   return (
     <div className="shell">
@@ -135,28 +175,41 @@ export default function App() {
         </span>
       </header>
 
-      <main className="board">
-        {error && (
-          <div className="banner">
-            <span className="glyph">△</span>
-            <span>{error}</span>
-          </div>
-        )}
+      <div className="body">
+        <Sidebar ref={searchRef} statuses={all} filters={filters} onChange={setFilters} />
 
-        {!statuses && !error && <p className="placeholder">probing…</p>}
+        <main className="board">
+          {error && (
+            <div className="banner">
+              <span className="glyph">△</span>
+              <span>{error}</span>
+            </div>
+          )}
 
-        {statuses && statuses.length === 0 && (
-          <p className="placeholder">no probes registered — nothing to show</p>
-        )}
+          {!statuses && !error && <p className="placeholder">probing…</p>}
 
-        {statuses && statuses.length > 0 && (
-          <div className="grid">
-            {statuses.map((s) => (
-              <ToolCard key={s.tool} status={s} panel={panel} />
-            ))}
-          </div>
-        )}
-      </main>
+          {statuses && all.length === 0 && (
+            <p className="placeholder">no probes registered — nothing to show</p>
+          )}
+
+          {statuses && all.length > 0 && shown.length === 0 && (
+            <div className="empty">
+              <p className="empty-line">no tools match</p>
+              <button className="action" onClick={() => setFilters(NO_FILTERS)}>
+                clear filters
+              </button>
+            </div>
+          )}
+
+          {shown.length > 0 && (
+            <div className="grid">
+              {shown.map((s) => (
+                <ToolCard key={s.tool} status={s} panel={panel} />
+              ))}
+            </div>
+          )}
+        </main>
+      </div>
 
       <footer className="footer">
         <span>{version ? `v${version}` : "patchbay"}</span>
@@ -167,6 +220,7 @@ export default function App() {
         <ToolDetail
           status={detailStatus}
           panel={panel}
+          query={filters.query}
           wantPermissions={detail.permissions}
           onClose={() => setDetail(null)}
         />

@@ -148,16 +148,175 @@ button {
   color: var(--muted);
 }
 
+.body {
+  display: flex;
+  min-height: 0;
+}
+
 .board {
+  flex: 1 1 auto;
+  min-width: 0;
   overflow-y: auto;
   padding: 16px 18px 22px;
 }
 
+/* Fixed rows: the board is a status surface, so every cell is the same size
+   and the eye can sweep it. Cards never grow to fit their content. */
 .grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  grid-auto-rows: 116px;
   gap: 12px;
-  align-items: start;
+}
+
+/* ---------- sidebar ---------- */
+
+.sidebar {
+  flex: none;
+  width: 178px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 14px 12px 18px;
+  border-right: 1px solid var(--line);
+  overflow-y: auto;
+}
+
+.search {
+  width: 100%;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 11px;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.search::placeholder {
+  color: var(--muted);
+}
+
+.search:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.side-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.side-label {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--muted);
+  padding: 0 6px;
+}
+
+.side-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.side-item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 6px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--ink-2);
+  font-size: 11.5px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.side-item:hover:not(:disabled) {
+  background: var(--panel);
+  color: var(--ink);
+}
+
+.side-item.is-on {
+  background: var(--panel);
+  color: var(--ink);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.side-item.is-void {
+  color: var(--muted);
+  cursor: default;
+  opacity: 0.55;
+}
+
+.side-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.side-count {
+  flex: none;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--muted);
+}
+
+/* ---------- connection state ---------- */
+
+.state-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+
+.state-connected {
+  background: var(--ok);
+}
+
+.state-attention {
+  background: var(--warn);
+}
+
+.state-disconnected {
+  background: var(--muted);
+}
+
+.state-not_installed {
+  background: transparent;
+  border: 1px solid var(--muted);
+}
+
+/* ---------- empty result ---------- */
+
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 28px 2px;
+}
+
+.empty-line {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--muted);
 }
 
 .footer {
@@ -191,22 +350,25 @@ button {
 
 /* ---------- card ---------- */
 
+/* Three rows, one height, identical padding — see .grid. */
 .card {
-  display: flex;
-  flex-direction: column;
-  gap: 9px;
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  align-content: space-between;
   min-width: 0;
-  padding: 12px 13px 11px;
+  padding: 12px 13px;
   border: 1px solid var(--line);
   border-radius: 10px;
   background: var(--panel);
   cursor: pointer;
-  transition: border-color 90ms linear;
+  overflow: hidden;
+  transition: border-color 90ms linear, background 90ms linear;
 }
 
 .card:hover,
 .card:focus-visible {
-  border-color: color-mix(in srgb, var(--accent) 45%, var(--line));
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
+  background: var(--panel-2);
 }
 
 .card-absent {
@@ -228,57 +390,15 @@ button {
   letter-spacing: 0.01em;
 }
 
-.installed {
+.card-head .state-dot {
   margin-left: auto;
-  font-family: var(--mono);
-  font-size: 10px;
-  color: var(--muted);
+}
+
+/* The one line that says which login is in force. Never wraps: a second line
+   would change the card's height and break the grid. */
+.card-active {
   display: flex;
   align-items: center;
-}
-
-.installed .dot {
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: var(--ok);
-  display: block;
-}
-
-/* active profile */
-
-.active {
-  position: relative;
-  padding-left: 10px;
-  min-width: 0;
-}
-
-.active::before {
-  content: "";
-  position: absolute;
-  left: 0;
-  top: 2px;
-  bottom: 2px;
-  width: 2px;
-  border-radius: 1px;
-  background: var(--accent);
-}
-
-.active-none {
-  color: var(--muted);
-  font-family: var(--mono);
-  font-size: 11.5px;
-  padding-top: 1px;
-}
-
-.active-none::before {
-  background: var(--line);
-}
-
-.active-top {
-  display: flex;
-  align-items: center;
-  gap: 8px;
   min-width: 0;
 }
 
@@ -291,47 +411,35 @@ button {
   white-space: nowrap;
 }
 
-.active-meta {
-  margin-top: 1px;
+.active-id.muted {
   color: var(--muted);
-  font-size: 11px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
-/* other profiles */
-
-.profiles {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  border-top: 1px solid var(--line-soft);
-}
-
-.prow {
+.card-foot {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 5px 0 4px;
   min-width: 0;
-  border-bottom: 1px solid var(--line-soft);
 }
 
-.prow:last-child {
-  border-bottom: 0;
-  padding-bottom: 1px;
-}
-
-.prow-label {
-  font-family: var(--mono);
-  font-size: 11.5px;
-  color: var(--ink-2);
+.card-count {
+  font-size: 10.5px;
+  color: var(--muted);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  flex: 1 1 auto;
-  min-width: 0;
+}
+
+/* Count only — the note text itself belongs to the detail view. */
+.warn-badge {
+  flex: none;
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--warn);
 }
 
 .switch {
@@ -348,7 +456,7 @@ button {
   transition: opacity 90ms linear, color 90ms linear, border-color 90ms linear;
 }
 
-.prow:hover .switch,
+.switch:hover,
 .switch:focus-visible {
   opacity: 1;
   color: var(--ink);
@@ -483,16 +591,6 @@ button {
 
 /* actions */
 
-.actions {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
-  margin-top: auto;
-  padding-top: 8px;
-  border-top: 1px solid var(--line-soft);
-}
-
 .action {
   display: inline-flex;
   align-items: center;
@@ -518,20 +616,7 @@ button {
   color: var(--muted);
 }
 
-.verdict {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  min-width: 0;
-  flex: 1 1 100%;
-  font-size: 11px;
-  color: var(--muted);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.verdict .mark {
+.mark {
   font-family: var(--mono);
   flex: none;
 }
@@ -678,6 +763,21 @@ button {
 
 .dprofile.is-active {
   border-color: color-mix(in srgb, var(--accent) 50%, var(--line));
+}
+
+/* Profiles the board's search matched, so a search for an account name shows
+   you which login inside the tool it meant. */
+.dprofile.is-match {
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.match-tag {
+  flex: none;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--accent);
 }
 
 .dprofile-head {
