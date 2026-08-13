@@ -348,7 +348,9 @@ fn print_plan(items: &[&SetupItem], styles: &Styles) {
             };
             println!("       {}{browser}", item.command);
         }
-        if item.status != SetupStatus::Done {
+        // `indent_lines` on an empty slice is an empty string, which `println!`
+        // would still turn into a blank line between every item.
+        if item.status != SetupStatus::Done && !item.detail.is_empty() {
             println!("{}", render::indent_lines(&item.detail));
         }
         let _ = std::io::stdout().flush();

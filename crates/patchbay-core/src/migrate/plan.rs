@@ -107,15 +107,44 @@ fn tool_items(status: &ToolStatus, expected: Option<&ToolRecord>) -> Vec<SetupIt
     }
 
     // 2. Is it logged in?
+    //
+    // Two deliberate departures from the status board here, both because a
+    // checklist is a different thing from a warning light:
+    //
+    //  * `Attention` is Open only when the credential has ACTUALLY expired. The
+    //    board is right to flag a gcloud access token with 40 minutes left —
+    //    but gcloud refreshes that itself, and a setup list that can never
+    //    reach zero is a setup list people stop working.
+    //  * a `concurrent` tool with profiles is Done. docker, rclone, ssh and npm
+    //    have no active profile by design, so `Disconnected` there means
+    //    "healthy", not "logged out".
+    let now = chrono::Utc::now();
+    let expired = status
+        .active_expiry()
+        .or_else(|| status.soonest_expiry())
+        .is_some_and(|at| at <= now);
+
     let (login_status, what) = match state {
         ConnectionState::Connected => {
             (SetupStatus::Done, format!("`{}` is logged in", status.tool))
         }
-        ConnectionState::Attention => (
+        ConnectionState::Attention if expired => (
             SetupStatus::Open,
+            format!("`{}`'s credential has expired", status.tool),
+        ),
+        ConnectionState::Attention => (
+            SetupStatus::Done,
             format!(
-                "`{}` has an active login whose credential has expired or expires within 24h",
+                "`{}` is logged in (its credential expires within 24h; the tool refreshes it)",
                 status.tool
+            ),
+        ),
+        ConnectionState::Disconnected if policy.concurrent && !status.profiles.is_empty() => (
+            SetupStatus::Done,
+            format!(
+                "`{}` has {} credential(s); it has no active profile by design",
+                status.tool,
+                status.profiles.len()
             ),
         ),
         ConnectionState::Disconnected => (
@@ -509,6 +538,83 @@ mod tests {
         // Names, never values, even here.
         let json = serde_json::to_string(&items).unwrap();
         assert!(!json.contains("glsa_x"), "{json}");
+    }
+
+    /// docker, rclone, ssh and npm use every credential they have at once.
+    /// Reporting them as "logged out" forever would make the plan unfinishable.
+    #[test]
+    fn test_a_tool_with_no_active_profile_by_design_is_not_a_gap() {
+        let m = Machine::new(&[
+            (
+                ".docker/config.json",
+                r#"{"auths":{"https://index.docker.io/v1/":{}},"credsStore":"desktop"}"#,
+            ),
+            (".ssh/config", "Host prod\n  HostName 10.0.0.1\n"),
+            (
+                ".npmrc",
+                "//registry.npmjs.org/:_authToken=npm_x\n//other/:_authToken=npm_y\n",
+            ),
+        ]);
+        let items = m.plan(None);
+        for tool in ["docker", "ssh", "npm"] {
+            let login = item(&items, &format!("tool:{tool}"));
+            assert_eq!(login.status, SetupStatus::Done, "{login:?}");
+            assert!(login.what.contains("by design"), "{login:?}");
+        }
+        // kubectl is not concurrent: an empty kubeconfig really is a gap.
+        let m = Machine::new(&[(".kube/config", "apiVersion: v1\nclusters: []\n")]);
+        assert_eq!(
+            item(&m.plan(None), "tool:kubectl").status,
+            SetupStatus::Open
+        );
+    }
+
+    /// A credential that expires in an hour is not a setup task; one that
+    /// expired yesterday is.
+    #[test]
+    fn test_expiring_soon_is_done_and_actually_expired_is_open() {
+        // gcloud dates its access token, so it is the one that can show both.
+        let soon = (Utc::now() + chrono::Duration::hours(1))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let past = (Utc::now() - chrono::Duration::days(2))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+
+        for (stamp, expected) in [(soon, SetupStatus::Done), (past, SetupStatus::Open)] {
+            let m = Machine::new(&[
+                (".config/gcloud/active_config", "work"),
+                (
+                    ".config/gcloud/configurations/config_work",
+                    "[core]\naccount = me@work.com\nproject = p\n",
+                ),
+            ]);
+            gcloud_token_db(&m.home, "me@work.com", &stamp);
+            let items = m.plan(None);
+            assert_eq!(
+                item(&items, "tool:gcloud").status,
+                expected,
+                "{:?}",
+                item(&items, "tool:gcloud")
+            );
+        }
+    }
+
+    /// The shape the gcloud probe reads its expiry from.
+    fn gcloud_token_db(home: &std::path::Path, account: &str, expiry: &str) {
+        let path = home.join(".config/gcloud/access_tokens.db");
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute(
+            "CREATE TABLE access_tokens (account_id TEXT PRIMARY KEY, access_token TEXT, \
+             token_expiry TIMESTAMP)",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO access_tokens VALUES (?1, 'redacted', ?2)",
+            rusqlite::params![account, expiry],
+        )
+        .unwrap();
     }
 
     #[test]

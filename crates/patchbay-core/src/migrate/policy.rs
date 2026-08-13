@@ -460,6 +460,16 @@ pub struct ToolPolicy {
     /// credential is allowed to do. Only where a probe implements it *and* the
     /// answer is worth re-creating by hand on the far side.
     pub record_permissions: bool,
+    /// This tool uses every credential it has at once and picks one per
+    /// command, so it has no active profile and `active: null` is the healthy
+    /// state — docker (per registry), rclone (per remote), ssh (per host), npm
+    /// (per registry).
+    ///
+    /// [`crate::migrate::plan`] needs to know, or it reports four permanently
+    /// "disconnected" tools on a machine where nothing is wrong, and a
+    /// checklist that can never be finished is a checklist people stop
+    /// reading.
+    pub concurrent: bool,
 }
 
 const fn tool(
@@ -476,6 +486,7 @@ const fn tool(
         needs_browser,
         install,
         record_permissions: false,
+        concurrent: false,
     }
 }
 
@@ -527,15 +538,18 @@ pub const POLICIES: &[ToolPolicy] = &[
     // rclone.conf holds every remote, with secrets obscured (not encrypted)
     // unless the user set a config password. Either way it is designed to be
     // copied — rclone's own docs tell you to.
-    tool(
-        "rclone",
-        Portability::Portable {
-            locations: &[Location::Rclone],
-        },
-        "rclone config",
-        false,
-        "brew install rclone",
-    ),
+    ToolPolicy {
+        concurrent: true,
+        ..tool(
+            "rclone",
+            Portability::Portable {
+                locations: &[Location::Rclone],
+            },
+            "rclone config",
+            false,
+            "brew install rclone",
+        )
+    },
     // A kubeconfig is a portable document by design: certs and tokens inline,
     // or an exec plugin that re-auths on the new machine.
     tool(
@@ -599,42 +613,51 @@ pub const POLICIES: &[ToolPolicy] = &[
     ),
     // npm has no keychain integration at all: `_authToken` lines are the
     // credential, and npm reads them on any machine.
-    tool(
-        "npm",
-        Portability::Portable {
-            locations: &[Location::Npmrc],
-        },
-        "npm login",
-        true,
-        "brew install node",
-    ),
+    ToolPolicy {
+        concurrent: true,
+        ..tool(
+            "npm",
+            Portability::Portable {
+                locations: &[Location::Npmrc],
+            },
+            "npm login",
+            true,
+            "brew install node",
+        )
+    },
     // ONLY `~/.ssh/config`. The Host blocks are configuration and worth having
     // on the new machine; the private keys beside them are exactly what
     // patchbay refuses to touch, here and in the probe. Move those yourself,
     // or better, generate new ones.
-    tool(
-        "ssh",
-        Portability::Portable {
-            locations: &[Location::SshConfig],
-        },
-        "ssh-keygen -t ed25519",
-        false,
-        "(preinstalled)",
-    ),
+    ToolPolicy {
+        concurrent: true,
+        ..tool(
+            "ssh",
+            Portability::Portable {
+                locations: &[Location::SshConfig],
+            },
+            "ssh-keygen -t ed25519",
+            false,
+            "(preinstalled)",
+        )
+    },
     // `~/.docker/config.json` is the registry list plus the name of the
     // credential helper. When a helper owns the secret — the normal case on
     // macOS — the secret stays in the keychain and does NOT travel, so a
     // `docker login` may still be needed. That is a note, not a reason to skip
     // the file: the registry list is worth having.
-    tool(
-        "docker",
-        Portability::Portable {
-            locations: &[Location::Docker],
-        },
-        "docker login",
-        false,
-        "brew install --cask docker",
-    ),
+    ToolPolicy {
+        concurrent: true,
+        ..tool(
+            "docker",
+            Portability::Portable {
+                locations: &[Location::Docker],
+            },
+            "docker login",
+            false,
+            "brew install --cask docker",
+        )
+    },
     // ngrok's `ngrok.yml` is a YAML file whose `authtoken` is the credential,
     // read on any machine. Portable, and worth carrying: without it every
     // `ngrok http` on the new box is anonymous and rate-limited.
