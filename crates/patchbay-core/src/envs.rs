@@ -25,8 +25,9 @@
 //! work. See [`EnvRegistry::find_by_dir`] for the precedence rule and the
 //! tradeoff that buys.
 //!
-//! **Taking your environment to a new machine** is therefore: copy
-//! `projects.json` over and `pb env pull` to rebuild every synced layer from the
+//! **Taking your environment to a new machine** is therefore: get
+//! `projects.json` over — `pb export` carries it inside the bundle, or copy the
+//! file by hand — and `pb env pull` to rebuild every synced layer from the
 //! remote. Checkouts carrying a marker resolve on their own; anything else takes
 //! one `pb env attach <id>`. The local layer deliberately does *not* travel.
 //! `.env.local` semantics are per-machine overrides, and a `DATABASE_URL`
@@ -667,6 +668,58 @@ impl EnvRegistry {
             environments: BTreeMap::new(),
             sync: None,
         };
+        file.projects.push(entry.clone());
+        self.save(&file)?;
+        Ok(entry)
+    }
+
+    /// Take a project entry exactly as another machine had it — the write path
+    /// [`crate::migrate::import`] uses, and the only one that sets
+    /// `environments` and `sync` wholesale.
+    ///
+    /// [`EnvRegistry::register`] is the interactive route and is deliberately
+    /// narrow: an id and a default environment, because everything else is
+    /// earned by a later command. A migration bundle carries a project as a
+    /// *record* instead, so restoring one is a single write rather than a
+    /// replay of the commands that built it.
+    ///
+    /// **An id that already exists is refused**, and the caller reports the
+    /// skip. The destination may be the newer machine, and quietly replacing
+    /// its sync pin or its environment list with a copy from a bundle is not
+    /// something an import gets to do behind the user's back.
+    ///
+    /// **Every environment's `local_names` is cleared on the way in**, whatever
+    /// the caller passed. No local *value* can travel — the local layer is
+    /// per-machine overrides by definition — and a name list with no values
+    /// behind it would make `pb env list` claim variables `pb env run` could
+    /// never inject. The exporter drops them too; this is the half that holds
+    /// even for a bundle patchbay did not write.
+    ///
+    /// No keychain item is created either. An environment's values arrive from
+    /// `pb env pull`, or they do not arrive.
+    pub fn adopt(&self, entry: &ProjectEntry) -> anyhow::Result<ProjectEntry> {
+        validate_project_id(&entry.id)?;
+        validate_env_name(&entry.default_env)?;
+        for (name, meta) in &entry.environments {
+            validate_env_name(name)?;
+            for var in &meta.synced_names {
+                validate_var_name(var)?;
+            }
+        }
+
+        let mut file = self.load()?;
+        if file.projects.iter().any(|p| p.id == entry.id) {
+            anyhow::bail!(
+                "a project is already registered as `{}` on this machine; it was left exactly as \
+                 it is",
+                entry.id
+            );
+        }
+
+        let mut entry = entry.clone();
+        for meta in entry.environments.values_mut() {
+            meta.local_names.clear();
+        }
         file.projects.push(entry.clone());
         self.save(&file)?;
         Ok(entry)
@@ -1530,6 +1583,43 @@ mod tests {
         assert!(err.contains("pb env attach pathors"), "{err}");
 
         assert_eq!(v.registry.projects().unwrap().len(), 1);
+    }
+
+    /// `adopt` is `pb import`'s way in. It takes the whole entry, and it takes
+    /// no values with it — including the local layer's *names*, which a bundle
+    /// should never have carried in the first place.
+    #[test]
+    fn test_adopt_takes_the_whole_entry_and_drops_the_local_layer() {
+        let source = seeded();
+        let carried = source.registry.get("pathors").unwrap().unwrap();
+        assert!(!carried.env("dev").unwrap().local_names.is_empty());
+
+        let dest = vault();
+        let landed = dest.registry.adopt(&carried).unwrap();
+
+        let dev = landed.env("dev").unwrap();
+        assert_eq!(dev.synced_names, vec!["API_KEY", "DATABASE_URL"]);
+        assert_eq!(dev.synced_at, carried.env("dev").unwrap().synced_at);
+        assert!(dev.local_names.is_empty(), "{dev:?}");
+        assert_eq!(dest.registry.get("pathors").unwrap().unwrap(), landed);
+        // Metadata only: no value is invented, and no path is adopted either.
+        assert!(dest.store.is_empty());
+        assert!(dest.registry.attachments().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_adopt_refuses_an_id_this_machine_already_has() {
+        let source = seeded();
+        let carried = source.registry.get("pathors").unwrap().unwrap();
+
+        let dest = vault();
+        dest.registry.register("pathors", "staging").unwrap();
+        let before = dest.registry.get("pathors").unwrap().unwrap();
+
+        let err = dest.registry.adopt(&carried).unwrap_err().to_string();
+        assert!(err.contains("already registered as `pathors`"), "{err}");
+        // Untouched, not merged, not half-written: this machine may be newer.
+        assert_eq!(dest.registry.get("pathors").unwrap().unwrap(), before);
     }
 
     #[test]

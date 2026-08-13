@@ -13,6 +13,11 @@
 //! 4. **`SETUP.md`** — written at export time so a machine with no patchbay on
 //!    it yet still has instructions.
 //!
+//! And one thing that travels as *metadata only, by construction*: the env
+//! vault's project manifest ([`crate::envs`]). Ids, environments, sync pins —
+//! never a value, and never this machine's `attachments.json`, whose paths mean
+//! nothing on the next laptop. See [`Exporter::collect_env_projects`].
+//!
 //! # Where the bundle is allowed to land
 //!
 //! Not in a cloud-sync folder, unless the user insists. Copying credential
@@ -27,10 +32,12 @@ use chrono::{DateTime, Utc};
 
 use super::bundle::{self, BundleFile, BundleMcpServer, BundleSecret, Payload};
 use super::manifest::{
-    KeyRecord, Manifest, McpRecord, SetupItem, Source, ToolRecord, BUNDLE_VERSION,
+    EnvEnvironmentRecord, EnvProjectRecord, EnvSyncRecord, KeyRecord, Manifest, McpRecord,
+    SetupItem, Source, ToolRecord, BUNDLE_VERSION,
 };
 use super::policy::{policy_for, Portability};
 use super::setup;
+use crate::envs::{EnvRegistry, ProjectEntry};
 use crate::keys::KeyRegistry;
 use crate::mcp_clients::{McpClientRegistry, TransportSpec};
 use crate::paths::Paths;
@@ -80,6 +87,9 @@ pub struct ExportReport {
     /// Names — never values — of the MCP env vars and headers whose values are
     /// inside the bundle. The caller must say these out loud.
     pub mcp_values_carried: Vec<String>,
+    /// Env vault projects whose metadata travelled. Their values did not, in
+    /// either layer.
+    pub env_projects: Vec<String>,
     pub gaps: usize,
     pub warnings: Vec<String>,
 }
@@ -159,6 +169,7 @@ pub struct Exporter<'a> {
     pub registry: &'a Registry,
     pub vault: &'a KeyRegistry,
     pub clients: &'a McpClientRegistry,
+    pub envs: &'a EnvRegistry,
 }
 
 impl Exporter<'_> {
@@ -246,6 +257,8 @@ impl Exporter<'_> {
         let (key_records, secrets, key_gaps) = self.collect_keys(keys)?;
         gaps.extend(key_gaps);
         let (mcp_records, mcp_servers) = self.collect_mcp();
+        let (env_records, env_entries, env_gaps) = self.collect_env_projects();
+        gaps.extend(env_gaps);
 
         let manifest = Manifest {
             version: BUNDLE_VERSION,
@@ -257,6 +270,7 @@ impl Exporter<'_> {
             tools,
             keys: key_records,
             mcp: mcp_records,
+            env_projects: env_records,
             gaps,
         };
 
@@ -268,6 +282,7 @@ impl Exporter<'_> {
             files,
             secrets,
             mcp: mcp_servers,
+            env_projects: env_entries,
         })
     }
 
@@ -345,6 +360,98 @@ impl Exporter<'_> {
         Ok((records, secrets, gaps))
     }
 
+    /// The env vault's portable project manifest, and nothing else it owns.
+    ///
+    /// Three exclusions, all deliberate and all load-bearing:
+    ///
+    /// * **`attachments.json` never travels.** It is a list of directories on
+    ///   *this* machine, and a path from the old laptop is at best noise and at
+    ///   worst a directory that exists on the new one and means something else.
+    ///   Nothing here reads it. `pb env attach` is the new machine's own job.
+    /// * **No value travels, in either layer.** Not the synced one — a pull
+    ///   rebuilds it from the remote, which is authoritative in a way a
+    ///   week-old bundle is not — and emphatically not the local one, which is
+    ///   `.env.local` semantics: the `DATABASE_URL` pointing at a container on
+    ///   the old machine is the exact thing that must not follow you.
+    /// * **Every `local_names` list is cleared** from the entries that are
+    ///   carried, because names without values would make `pb env list` on the
+    ///   new machine promise variables `pb env run` could not produce.
+    ///   `synced_names` and `synced_at` stay: those are an honest statement of
+    ///   what a pull will restore and when it last happened.
+    ///
+    /// A registry that cannot be read is a note, not a failed export — the same
+    /// tolerance [`Exporter::collect_keys`] has, for the same reason: the
+    /// credential files are the half worth saving.
+    fn collect_env_projects(&self) -> (Vec<EnvProjectRecord>, Vec<ProjectEntry>, Vec<SetupItem>) {
+        let Ok(projects) = self.envs.projects() else {
+            return (Vec::new(), Vec::new(), Vec::new());
+        };
+
+        let mut records = Vec::new();
+        let mut entries = Vec::new();
+        let mut gaps = Vec::new();
+        for project in projects {
+            records.push(EnvProjectRecord {
+                id: project.id.clone(),
+                default_env: project.default_env.clone(),
+                environments: project
+                    .environments
+                    .iter()
+                    .map(|(name, meta)| EnvEnvironmentRecord {
+                        name: name.clone(),
+                        synced_vars: meta.synced_names.len(),
+                        synced_at: meta.synced_at,
+                    })
+                    .collect(),
+                sync: project.sync.as_ref().map(|sync| EnvSyncRecord {
+                    provider: sync.provider.clone(),
+                    project_id: sync.project_id.clone(),
+                    account: sync.account.clone(),
+                }),
+            });
+
+            // A linked project is no gap at all: `pb env pull` rebuilds it, and
+            // the plan says so. An unlinked one with a synced layer is the case
+            // worth a line — something pulled those variables once, and nothing
+            // on the new machine knows from where.
+            if project.sync.is_none() {
+                let synced: usize = project
+                    .environments
+                    .values()
+                    .map(|meta| meta.synced_names.len())
+                    .sum();
+                if synced > 0 {
+                    gaps.push(
+                        SetupItem::new(
+                            format!("env:{}", project.id),
+                            "env vault",
+                            format!(
+                                "`{}` has {synced} synced variable(s) but no sync config, so its \
+                                 synced layer cannot be rebuilt by `pb env pull` on the new \
+                                 machine — values are not in the bundle",
+                                project.id
+                            ),
+                        )
+                        .command(
+                            format!(
+                                "pb env link --project {} --project-id <infisical project id>",
+                                project.id
+                            ),
+                            false,
+                        )
+                        .detail(
+                            "or set the values by hand there (`pb env set`) / load a `.env` with \
+                             `pb env import`",
+                        ),
+                    );
+                }
+            }
+
+            entries.push(carried_entry(&project));
+        }
+        (records, entries, gaps)
+    }
+
     /// Every user-scope MCP registration, by name in the manifest and with
     /// values in the payload. Project scopes are read but never carried: they
     /// belong to a repository, not to the machine.
@@ -390,6 +497,18 @@ impl Exporter<'_> {
         }
         (records, servers)
     }
+}
+
+/// One project entry as it is allowed to leave the machine: the local layer's
+/// name lists dropped, everything else verbatim. See
+/// [`Exporter::collect_env_projects`] for why, and
+/// [`crate::envs::EnvRegistry::adopt`] for the other half of the same rule.
+fn carried_entry(project: &ProjectEntry) -> ProjectEntry {
+    let mut entry = project.clone();
+    for meta in entry.environments.values_mut() {
+        meta.local_names.clear();
+    }
+    entry
 }
 
 /// The gap a non-portable tool leaves behind. `None` when there is nothing to
@@ -481,13 +600,14 @@ pub fn write(
             .collect(),
         mcp_carried: payload.mcp.len(),
         mcp_values_carried: mcp_values,
+        env_projects: payload.env_projects.iter().map(|p| p.id.clone()).collect(),
         gaps: payload.manifest.gaps.len(),
         warnings,
     })
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::keystore::MemoryKeystore;
     use crate::migrate::policy::Location;
@@ -568,23 +688,31 @@ mod tests {
         ])
     }
 
-    pub(crate) fn exporter_parts(home: &Path) -> (Paths, Registry, KeyRegistry, McpClientRegistry) {
+    pub(crate) fn exporter_parts(
+        home: &Path,
+    ) -> (Paths, Registry, KeyRegistry, McpClientRegistry, EnvRegistry) {
         let paths = Paths::for_test(home);
         let registry = Registry::all(paths.clone());
         let vault = KeyRegistry::new(home.join("keys.json"), Box::new(MemoryKeystore::new()));
         let clients = McpClientRegistry::with_paths(paths.clone());
-        (paths, registry, vault, clients)
+        let envs = EnvRegistry::new(
+            home.join("projects.json"),
+            home.join("attachments.json"),
+            Box::new(MemoryKeystore::new()),
+        );
+        (paths, registry, vault, clients, envs)
     }
 
     #[test]
     fn test_the_payload_carries_the_portable_files_and_nothing_else() {
         let home = machine();
-        let (paths, registry, vault, clients) = exporter_parts(home.path());
+        let (paths, registry, vault, clients, envs) = exporter_parts(home.path());
         let exporter = Exporter {
             paths: &paths,
             registry: &registry,
             vault: &vault,
             clients: &clients,
+            envs: &envs,
         };
         let payload = exporter.payload(&KeySelection::None, Utc::now()).unwrap();
 
@@ -628,12 +756,13 @@ mod tests {
             ".config/gh/hosts.yml",
             "github.com:\n    user: octocat\n    users:\n        octocat:\n",
         )]);
-        let (paths, registry, vault, clients) = exporter_parts(home.path());
+        let (paths, registry, vault, clients, envs) = exporter_parts(home.path());
         let payload = Exporter {
             paths: &paths,
             registry: &registry,
             vault: &vault,
             clients: &clients,
+            envs: &envs,
         }
         .payload(&KeySelection::None, Utc::now())
         .unwrap();
@@ -658,7 +787,7 @@ mod tests {
     #[test]
     fn test_keys_are_metadata_only_until_asked_for() {
         let home = fake_home(&[]);
-        let (paths, registry, vault, clients) = exporter_parts(home.path());
+        let (paths, registry, vault, clients, envs) = exporter_parts(home.path());
         vault
             .add(
                 crate::keys::NewKey::new("cf-api", "cli").provider("cloudflare"),
@@ -678,6 +807,7 @@ mod tests {
             registry: &registry,
             vault: &vault,
             clients: &clients,
+            envs: &envs,
         };
 
         // Default: metadata travels, values do not, and each becomes a gap.
@@ -719,12 +849,13 @@ mod tests {
             ".cursor/mcp.json",
             r#"{"mcpServers":{"grafana":{"command":"uvx","args":["mcp-grafana"],"env":{"GRAFANA_TOKEN":"glsa_secret"}}}}"#,
         )]);
-        let (paths, registry, vault, clients) = exporter_parts(home.path());
+        let (paths, registry, vault, clients, envs) = exporter_parts(home.path());
         let payload = Exporter {
             paths: &paths,
             registry: &registry,
             vault: &vault,
             clients: &clients,
+            envs: &envs,
         }
         .payload(&KeySelection::None, Utc::now())
         .unwrap();
@@ -739,16 +870,202 @@ mod tests {
         assert!(!manifest.contains("glsa_secret"), "{manifest}");
     }
 
+    /// Two projects, one of each shape, with values in the keystore and an
+    /// attachment on this machine — everything the exclusions are about.
+    ///
+    /// `pathors` is linked and has both layers. `legacy` has a synced layer and
+    /// no link, which is the only case that becomes a gap.
+    pub(crate) fn seed_env_vault(envs: &EnvRegistry, attached: &Path) -> DateTime<Utc> {
+        let pulled = DateTime::parse_from_rfc3339("2026-08-01T09:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        envs.register("pathors", "dev").unwrap();
+        envs.replace_synced(
+            "pathors",
+            "dev",
+            [(
+                "DATABASE_URL".to_string(),
+                "postgres://remote/db".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+            pulled,
+        )
+        .unwrap();
+        envs.set_local(
+            "pathors",
+            "dev",
+            "DATABASE_URL",
+            "postgres://localhost:5432/dev",
+        )
+        .unwrap();
+        envs.set_local("pathors", "dev", "LOCAL_ONLY_TOKEN", "local-value-1234")
+            .unwrap();
+        envs.set_sync(
+            "pathors",
+            crate::envs::SyncConfig {
+                provider: "infisical".into(),
+                project_id: "9f2c-uuid".into(),
+                account: "me@work.com".into(),
+                domain: None,
+                env_map: Default::default(),
+            },
+        )
+        .unwrap();
+        // A directory on THIS machine. Its path must not appear in a bundle.
+        envs.attach(attached, "pathors").unwrap();
+
+        envs.register("legacy", "dev").unwrap();
+        envs.replace_synced(
+            "legacy",
+            "dev",
+            [("OLD_KEY".to_string(), "old-value-5678".to_string())]
+                .into_iter()
+                .collect(),
+            pulled,
+        )
+        .unwrap();
+        pulled
+    }
+
     #[test]
-    fn test_write_reports_what_went_in() {
-        let home = machine();
-        let out = tempfile::tempdir().unwrap();
-        let (paths, registry, vault, clients) = exporter_parts(home.path());
+    fn test_the_env_vault_travels_as_names_and_pins_only() {
+        let home = fake_home(&[]);
+        let (paths, registry, vault, clients, envs) = exporter_parts(home.path());
+        let pulled = seed_env_vault(&envs, &home.path().join("repos/pathors"));
+
         let payload = Exporter {
             paths: &paths,
             registry: &registry,
             vault: &vault,
             clients: &clients,
+            envs: &envs,
+        }
+        .payload(&KeySelection::None, Utc::now())
+        .unwrap();
+
+        let carried = &payload.env_projects;
+        assert_eq!(carried.len(), 2, "{carried:?}");
+        let pathors = carried.iter().find(|p| p.id == "pathors").unwrap();
+        let dev = pathors.env("dev").unwrap();
+        // What a pull will restore, and when it last ran: honest, and useful.
+        assert_eq!(dev.synced_names, vec!["DATABASE_URL"]);
+        assert_eq!(dev.synced_at, Some(pulled));
+        // The local layer's NAMES are dropped with its values. A name list
+        // without values would make `pb env list` promise what it cannot give.
+        assert!(dev.local_names.is_empty(), "{dev:?}");
+        assert_eq!(pathors.sync.as_ref().unwrap().account, "me@work.com");
+
+        // The manifest half: counts and the pin, no names, no local anything.
+        let record = payload
+            .manifest
+            .env_projects
+            .iter()
+            .find(|p| p.id == "pathors")
+            .unwrap();
+        assert_eq!(record.environments[0].name, "dev");
+        assert_eq!(record.environments[0].synced_vars, 1);
+        assert_eq!(record.sync.as_ref().unwrap().project_id, "9f2c-uuid");
+
+        // A linked project is no gap — `pb env pull` rebuilds it. An unlinked
+        // one with a synced layer is, because nothing here can.
+        assert!(!payload.manifest.gaps.iter().any(|g| g.id == "env:pathors"));
+        let gap = payload
+            .manifest
+            .gaps
+            .iter()
+            .find(|g| g.id == "env:legacy")
+            .expect("a synced layer with no sync config cannot be rebuilt");
+        assert!(gap.what.contains("cannot be rebuilt"), "{gap:?}");
+        assert!(
+            gap.command.contains("pb env link --project legacy"),
+            "{gap:?}"
+        );
+    }
+
+    #[test]
+    fn test_no_env_value_and_no_attachment_path_is_anywhere_in_a_bundle() {
+        let home = fake_home(&[]);
+        let out = tempfile::tempdir().unwrap();
+        let (paths, registry, vault, clients, envs) = exporter_parts(home.path());
+        let attached = home.path().join("repos/pathors");
+        seed_env_vault(&envs, &attached);
+
+        let payload = Exporter {
+            paths: &paths,
+            registry: &registry,
+            vault: &vault,
+            clients: &clients,
+            envs: &envs,
+        }
+        .payload(&KeySelection::None, Utc::now())
+        .unwrap();
+
+        // The decrypted payload is the real test: the encryption is not what
+        // keeps these out, the collection rules are.
+        let json = serde_json::to_string(&payload).unwrap();
+        for forbidden in [
+            // synced values: rebuilt by a pull, never carried
+            "postgres://remote/db",
+            "old-value-5678",
+            // local values: per-machine overrides, carried by nothing, ever
+            "postgres://localhost:5432/dev",
+            "local-value-1234",
+            "LOCAL_ONLY_TOKEN",
+            // this machine's attachment root
+            "repos/pathors",
+        ] {
+            assert!(!json.contains(forbidden), "`{forbidden}` is in the payload");
+        }
+        assert!(!json.contains(&attached.display().to_string()));
+        // Names of the synced layer DO travel: that is the honest part.
+        assert!(json.contains("DATABASE_URL"), "{json}");
+
+        let path = out.path().join("b.pbx");
+        let report = write(&path, &payload, "pass", false, Some(10)).unwrap();
+        assert_eq!(report.env_projects, vec!["pathors", "legacy"]);
+        let raw = String::from_utf8_lossy(&std::fs::read(&path).unwrap()).into_owned();
+        for forbidden in ["local-value-1234", "postgres://", "repos/pathors"] {
+            assert!(!raw.contains(forbidden), "`{forbidden}` is in the .pbx");
+        }
+    }
+
+    #[test]
+    fn test_an_unreadable_env_registry_does_not_take_the_export_down() {
+        let home = fake_home(&[]);
+        let (paths, registry, vault, clients, _) = exporter_parts(home.path());
+        std::fs::write(home.path().join("projects.json"), "{not json").unwrap();
+        let envs = EnvRegistry::new(
+            home.path().join("projects.json"),
+            home.path().join("attachments.json"),
+            Box::new(MemoryKeystore::new()),
+        );
+
+        let payload = Exporter {
+            paths: &paths,
+            registry: &registry,
+            vault: &vault,
+            clients: &clients,
+            envs: &envs,
+        }
+        .payload(&KeySelection::None, Utc::now())
+        .expect("the credential files are the half worth saving");
+        assert!(payload.env_projects.is_empty());
+        assert!(payload.manifest.env_projects.is_empty());
+    }
+
+    #[test]
+    fn test_write_reports_what_went_in() {
+        let home = machine();
+        let out = tempfile::tempdir().unwrap();
+        let (paths, registry, vault, clients, envs) = exporter_parts(home.path());
+        let payload = Exporter {
+            paths: &paths,
+            registry: &registry,
+            vault: &vault,
+            clients: &clients,
+            envs: &envs,
         }
         .payload(&KeySelection::None, Utc::now())
         .unwrap();

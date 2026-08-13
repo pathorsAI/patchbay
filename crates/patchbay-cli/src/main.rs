@@ -155,10 +155,12 @@ fn run() -> Result<i32> {
             if let Some(manifest) = diff {
                 let vault = KeyRegistry::detect()?;
                 let clients = McpClientRegistry::with_paths(registry.paths().clone());
+                let envs = patchbay_core::EnvRegistry::detect()?;
                 return migrate::print_status_diff(
                     &registry,
                     &vault,
                     &clients,
+                    &envs,
                     &manifest,
                     &styles(),
                 );

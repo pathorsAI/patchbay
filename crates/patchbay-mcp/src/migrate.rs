@@ -40,7 +40,8 @@ pub struct PlanParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct MarkDoneParams {
     /// The `id` of the item, exactly as `plan_setup` returned it — for example
-    /// "tool:gh", "install:kubectl", "switch:gcloud", "key:cf-api".
+    /// "tool:gh", "install:kubectl", "switch:gcloud", "key:cf-api",
+    /// "env:pathors".
     pub item_id: String,
     /// Path to the same `manifest.json` you passed to `plan_setup`, if any.
     /// Leaving it out when the plan used one will report the item as unknown.
@@ -129,12 +130,14 @@ about the key vault.")]
         let registry = self.registry.clone();
         let keys = self.keys.clone();
         let clients = self.clients.clone();
+        let envs = self.envs.clone();
         let items = offload(move || {
             migrate::plan(
                 registry.paths(),
                 &registry,
                 &keys,
                 &clients,
+                &envs,
                 manifest.as_ref(),
             )
         })
@@ -174,6 +177,7 @@ That is the tool working, not a bug: wait for them, then re-check.")]
         let registry = self.registry.clone();
         let keys = self.keys.clone();
         let clients = self.clients.clone();
+        let envs = self.envs.clone();
         let id = item_id.clone();
         let found = offload(move || {
             migrate::recheck(
@@ -181,6 +185,7 @@ That is the tool working, not a bug: wait for them, then re-check.")]
                 &registry,
                 &keys,
                 &clients,
+                &envs,
                 manifest.as_ref(),
                 &id,
             )

@@ -19,7 +19,7 @@ use patchbay_core::migrate::{
     self, export, import, manifest::SetupStatus, Exporter, ImportOptions, Importer, KeySelection,
     Manifest, SetupItem,
 };
-use patchbay_core::{KeyRegistry, McpClientRegistry, Registry};
+use patchbay_core::{EnvRegistry, KeyRegistry, McpClientRegistry, Registry};
 
 use crate::render::{self, Styles};
 
@@ -69,6 +69,7 @@ pub fn run(command: Command, styles: &Styles) -> Result<i32> {
     let paths = registry.paths().clone();
     let vault = KeyRegistry::detect()?;
     let clients = McpClientRegistry::with_paths(paths.clone());
+    let envs = EnvRegistry::detect()?;
 
     match command {
         Command::Export {
@@ -88,6 +89,7 @@ pub fn run(command: Command, styles: &Styles) -> Result<i32> {
                 registry: &registry,
                 vault: &vault,
                 clients: &clients,
+                envs: &envs,
             }
             .payload(&selection, Utc::now())?;
 
@@ -120,6 +122,7 @@ pub fn run(command: Command, styles: &Styles) -> Result<i32> {
                 registry: &registry,
                 vault: &vault,
                 clients: &clients,
+                envs: &envs,
             }
             .run(&payload, &ImportOptions { dry_run })?;
 
@@ -137,7 +140,14 @@ pub fn run(command: Command, styles: &Styles) -> Result<i32> {
             json,
         } => {
             let manifest = manifest.as_deref().map(read_manifest).transpose()?;
-            let items = migrate::plan(&paths, &registry, &vault, &clients, manifest.as_ref());
+            let items = migrate::plan(
+                &paths,
+                &registry,
+                &vault,
+                &clients,
+                &envs,
+                manifest.as_ref(),
+            );
             let shown: Vec<&SetupItem> = items
                 .iter()
                 .filter(|i| all || i.status != SetupStatus::Done)
@@ -160,11 +170,19 @@ pub fn print_status_diff(
     registry: &Registry,
     vault: &KeyRegistry,
     clients: &McpClientRegistry,
+    envs: &EnvRegistry,
     manifest: &std::path::Path,
     styles: &Styles,
 ) -> Result<i32> {
     let manifest = read_manifest(manifest)?;
-    let items = migrate::plan(registry.paths(), registry, vault, clients, Some(&manifest));
+    let items = migrate::plan(
+        registry.paths(),
+        registry,
+        vault,
+        clients,
+        envs,
+        Some(&manifest),
+    );
     let open: Vec<&SetupItem> = items.iter().filter(|i| i.is_open()).collect();
     println!(
         "{} of {} things the other machine had are not true here",
@@ -266,6 +284,15 @@ fn print_export(report: &export::ExportReport, styles: &Styles) {
             );
         }
     }
+    if !report.env_projects.is_empty() {
+        // Metadata only, and saying so here is the point: an env project in a
+        // bundle is a name, not a set of variables.
+        println!(
+            "  env:       {} project(s), names only ({})",
+            report.env_projects.len(),
+            report.env_projects.join(", ")
+        );
+    }
     println!(
         "  {} item(s) will need doing on the new machine",
         report.gaps
@@ -312,6 +339,16 @@ fn print_import(report: &import::ImportReport, styles: &Styles) {
             server.client,
             server.name
         );
+    }
+    for project in &report.env_projects {
+        println!(
+            "  {:<10} env project {}",
+            project.outcome.label(),
+            project.id
+        );
+        if let import::FileOutcome::Skipped { reason } = &project.outcome {
+            println!("             {reason}");
+        }
     }
     println!();
     for note in &report.notes {
@@ -397,6 +434,7 @@ fn export_json(report: &export::ExportReport) -> serde_json::Value {
         "keys_listed_only": report.keys_listed,
         "mcp_servers": report.mcp_carried,
         "mcp_value_names_carried": report.mcp_values_carried,
+        "env_projects": report.env_projects,
         "gaps": report.gaps,
         "warnings": report.warnings,
     })
@@ -426,6 +464,9 @@ fn import_json(report: &import::ImportReport) -> serde_json::Value {
             "name": m.name,
             "action": m.outcome.label(),
             "value_names_carried": m.values_carried,
+        })).collect::<Vec<_>>(),
+        "env_projects": report.env_projects.iter().map(|p| serde_json::json!({
+            "id": p.id, "action": p.outcome.label(),
         })).collect::<Vec<_>>(),
         "notes": report.notes,
         "remaining": report.remaining,
