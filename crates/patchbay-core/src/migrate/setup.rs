@@ -138,6 +138,52 @@ pub fn render(manifest: &Manifest) -> String {
         out.push('\n');
     }
 
+    // --- env vault ---------------------------------------------------------
+    if !manifest.env_projects.is_empty() {
+        out.push_str(
+            "## 7. Project env vault\n\n\
+             The projects themselves travelled — ids, environments and sync pins. **No variable \
+             value did**, in either layer: the synced layer comes back from the remote, and the \
+             local layer is per-machine overrides that deliberately stay behind. Which \
+             directories on this machine belong to a project is also local: attach them here.\n\n\
+             | project | environments | synced vars | pull with |\n|---|---|---|---|\n",
+        );
+        for project in &manifest.env_projects {
+            let synced: usize = project.environments.iter().map(|e| e.synced_vars).sum();
+            let envs: Vec<&str> = project
+                .environments
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect();
+            let pull = match &project.sync {
+                Some(sync) => format!(
+                    "`pb env pull --project {}` (as {})",
+                    project.id, sync.account
+                ),
+                None => "not linked — set the values by hand".to_string(),
+            };
+            out.push_str(&format!(
+                "| `{}` | {} | {synced} | {pull} |\n",
+                project.id,
+                if envs.is_empty() {
+                    "—".to_string()
+                } else {
+                    envs.join(", ")
+                },
+            ));
+        }
+        out.push_str(
+            "\n```sh\n\
+             pb env projects                  # what arrived\n\
+             pb env pull --project <id>       # rebuild a synced layer\n\
+             pb env attach <id>               # bind a directory here (a committed\n\
+             \x20                                # .patchbay.toml does it on its own)\n\
+             ```\n\n\
+             A pull runs the infisical CLI, whose active login is machine-global: if the project \
+             is pinned to another account, run `pb use infisical <email>` first.\n\n",
+        );
+    }
+
     out.push_str(
         "---\n\n\
          patchbay never copies an SSH private key, and never moves a credential the OS keychain \
@@ -159,7 +205,8 @@ pub fn portability_label(kind: PortabilityKind) -> &'static str {
 mod tests {
     use super::*;
     use crate::migrate::manifest::{
-        KeyRecord, McpRecord, SetupItem, Source, ToolRecord, BUNDLE_VERSION,
+        EnvEnvironmentRecord, EnvProjectRecord, EnvSyncRecord, KeyRecord, McpRecord, SetupItem,
+        Source, ToolRecord, BUNDLE_VERSION,
     };
     use crate::migrate::policy::Location;
     use crate::types::{Profile, ToolCategory};
@@ -219,6 +266,20 @@ mod tests {
                 header_keys: vec![],
                 carried: true,
             }],
+            env_projects: vec![EnvProjectRecord {
+                id: "pathors".into(),
+                default_env: "dev".into(),
+                environments: vec![EnvEnvironmentRecord {
+                    name: "dev".into(),
+                    synced_vars: 12,
+                    synced_at: None,
+                }],
+                sync: Some(EnvSyncRecord {
+                    provider: "infisical".into(),
+                    project_id: "3f0b-uuid".into(),
+                    account: "me@work.com".into(),
+                }),
+            }],
             gaps: vec![SetupItem::new("tool:gh", "gh", "log in to gh as `octocat`")
                 .command("gh auth login", true)
                 .detail("the OAuth token lives in the OS keychain")],
@@ -258,10 +319,22 @@ mod tests {
     }
 
     #[test]
+    fn test_setup_md_names_the_pull_each_carried_env_project_needs() {
+        let md = render(&manifest());
+        assert!(md.contains("pb env pull --project pathors"), "{md}");
+        assert!(md.contains("me@work.com"), "{md}");
+        assert!(md.contains("pb use infisical"), "{md}");
+        // The exclusions, stated where the person doing the move will read them.
+        assert!(md.contains("**No variable value did**"), "{md}");
+        assert!(md.contains("pb env attach"), "{md}");
+    }
+
+    #[test]
     fn test_an_empty_machine_still_renders() {
         let mut manifest = manifest();
         manifest.tools.clear();
         manifest.keys.clear();
+        manifest.env_projects.clear();
         manifest.gaps.clear();
         let md = render(&manifest);
         assert!(md.contains("Nothing outstanding"), "{md}");

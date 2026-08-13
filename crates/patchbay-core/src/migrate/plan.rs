@@ -21,6 +21,7 @@
 
 use super::manifest::{Manifest, SetupItem, SetupStatus, ToolRecord};
 use super::policy::{policy_for, Portability};
+use crate::envs::EnvRegistry;
 use crate::keys::KeyRegistry;
 use crate::mcp_clients::McpClientRegistry;
 use crate::paths::Paths;
@@ -36,6 +37,7 @@ pub fn plan(
     registry: &Registry,
     vault: &KeyRegistry,
     clients: &McpClientRegistry,
+    envs: &EnvRegistry,
     manifest: Option<&Manifest>,
 ) -> Vec<SetupItem> {
     let _ = paths;
@@ -48,6 +50,7 @@ pub fn plan(
     }
     items.extend(key_items(vault, manifest));
     items.extend(mcp_items(clients, manifest));
+    items.extend(env_items(envs, manifest));
     items
 }
 
@@ -58,10 +61,11 @@ pub fn recheck(
     registry: &Registry,
     vault: &KeyRegistry,
     clients: &McpClientRegistry,
+    envs: &EnvRegistry,
     manifest: Option<&Manifest>,
     id: &str,
 ) -> Option<SetupItem> {
-    plan(paths, registry, vault, clients, manifest)
+    plan(paths, registry, vault, clients, envs, manifest)
         .into_iter()
         .find(|item| item.id == id)
 }
@@ -330,6 +334,89 @@ fn mcp_items(clients: &McpClientRegistry, manifest: Option<&Manifest>) -> Vec<Se
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// env vault
+// ---------------------------------------------------------------------------
+
+/// One item per carried project that a pull can rebuild.
+///
+/// **`auto` is false, deliberately**, even though `pb env pull` is a patchbay
+/// command and every other patchbay-can-do-it-itself item is `true`. A pull
+/// runs the infisical CLI, whose active login is machine-global: unless this
+/// machine happens to be logged in as the account the project is pinned to, the
+/// pull refuses and tells the user to run `pb use infisical <email>` first. An
+/// agent firing these blind would collect a row of confusing failures, so the
+/// account goes in the detail and the human decides.
+///
+/// Without a manifest there is nothing to say: a project registered here with
+/// no pull yet is a normal state, not an outstanding move.
+fn env_items(envs: &EnvRegistry, manifest: Option<&Manifest>) -> Vec<SetupItem> {
+    let Some(manifest) = manifest else {
+        return Vec::new();
+    };
+    let here = envs.projects().unwrap_or_default();
+
+    let mut items = Vec::new();
+    for record in &manifest.env_projects {
+        let Some(sync) = &record.sync else {
+            // Not linked: `collect_env_projects` already made a gap for the
+            // ones that had a synced layer, and there is no pull to suggest.
+            continue;
+        };
+        let local = here.iter().find(|p| p.id == record.id);
+        // Done only when this machine has pulled SINCE the bundle was written.
+        // `synced_at` travels with the entry, so its mere presence proves
+        // nothing — a restored project looks pulled the moment it lands.
+        let pulled_here = local.is_some_and(|project| {
+            record.environments.iter().any(|env| {
+                let before = env.synced_at;
+                let now = project.env(&env.name).and_then(|meta| meta.synced_at);
+                match (now, before) {
+                    (Some(now), Some(before)) => now > before,
+                    (Some(_), None) => true,
+                    _ => false,
+                }
+            })
+        });
+
+        let mut item = SetupItem::new(
+            format!("env:{}", record.id),
+            "env vault",
+            if pulled_here {
+                format!("`{}`'s synced layer has been pulled here", record.id)
+            } else {
+                format!(
+                    "`{}`'s variables are not on this machine; no value travels in a bundle, so \
+                     the synced layer is rebuilt by pulling it",
+                    record.id
+                )
+            },
+        )
+        .command(format!("pb env pull --project {}", record.id), false)
+        .auto(false)
+        .status(if pulled_here {
+            SetupStatus::Done
+        } else {
+            SetupStatus::Open
+        })
+        .detail(format!(
+            "it is pinned to the {} account `{}`; the CLI's active login is machine-global, so \
+             `pb use infisical {}` may have to come first",
+            sync.provider, sync.account, sync.account
+        ));
+
+        if local.is_none() {
+            item = item.detail(format!(
+                "no project `{}` is registered here yet — `pb import` registers it, or `pb env \
+                 init --id {}` does",
+                record.id, record.id
+            ));
+        }
+        items.push(item);
+    }
+    items
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,6 +434,7 @@ mod tests {
         registry: Registry,
         vault: KeyRegistry,
         clients: McpClientRegistry,
+        envs: EnvRegistry,
     }
 
     impl Machine {
@@ -363,6 +451,11 @@ mod tests {
                 registry: Registry::all(paths.clone()),
                 vault: KeyRegistry::new(home.join("keys.json"), Box::new(MemoryKeystore::new())),
                 clients: McpClientRegistry::with_paths(paths.clone()),
+                envs: EnvRegistry::new(
+                    home.join("projects.json"),
+                    home.join("attachments.json"),
+                    Box::new(MemoryKeystore::new()),
+                ),
                 paths,
                 home,
                 _dir: dir,
@@ -375,6 +468,7 @@ mod tests {
                 registry: &self.registry,
                 vault: &self.vault,
                 clients: &self.clients,
+                envs: &self.envs,
             }
             .payload(&KeySelection::None, Utc::now())
             .unwrap()
@@ -387,6 +481,7 @@ mod tests {
                 &self.registry,
                 &self.vault,
                 &self.clients,
+                &self.envs,
                 manifest,
             )
         }
@@ -540,6 +635,82 @@ mod tests {
         assert!(!json.contains("glsa_x"), "{json}");
     }
 
+    /// The env vault's item is the one patchbay deliberately will NOT run
+    /// itself: a pull is only valid under the account the project is pinned to,
+    /// and that login is machine-global.
+    #[test]
+    fn test_a_carried_env_project_asks_for_a_pull_and_names_the_account() {
+        let source = Machine::new(&[]);
+        crate::migrate::export::tests::seed_env_vault(
+            &source.envs,
+            &source.home.join("repos/pathors"),
+        );
+        let manifest = source.manifest();
+
+        let dest = Machine::new(&[]);
+        let items = dest.plan(Some(&manifest));
+        let pull = item(&items, "env:pathors");
+        assert_eq!(pull.command, "pb env pull --project pathors");
+        assert!(!pull.auto, "a pull can fail on the wrong login: {pull:?}");
+        assert!(!pull.needs_browser);
+        assert_eq!(pull.status, SetupStatus::Open);
+        assert!(
+            pull.detail.iter().any(|d| d.contains("me@work.com")),
+            "the pinned account has to be on the item: {pull:?}"
+        );
+        assert!(
+            pull.detail.iter().any(|d| d.contains("pb use infisical")),
+            "{pull:?}"
+        );
+        // `legacy` has no sync config, so there is no pull to suggest — the
+        // export already made that a gap of its own.
+        assert!(
+            !items.iter().any(|i| i.id == "env:legacy"),
+            "{:?}",
+            ids(&items)
+        );
+        // Names, never values, here as everywhere.
+        let json = serde_json::to_string(&items).unwrap();
+        assert!(!json.contains("postgres://"), "{json}");
+    }
+
+    #[test]
+    fn test_an_env_project_closes_once_it_has_actually_been_pulled_here() {
+        let source = Machine::new(&[]);
+        crate::migrate::export::tests::seed_env_vault(
+            &source.envs,
+            &source.home.join("repos/pathors"),
+        );
+        let manifest = source.manifest();
+
+        // Import-shaped destination: the entry is here, `synced_at` and all,
+        // which must NOT read as done — it is the source's timestamp.
+        let dest = Machine::new(&[]);
+        for project in &source.envs.projects().unwrap() {
+            dest.envs.adopt(project).unwrap();
+        }
+        assert_eq!(
+            item(&dest.plan(Some(&manifest)), "env:pathors").status,
+            SetupStatus::Open
+        );
+
+        // A pull on THIS machine moves the timestamp, and only then.
+        dest.envs
+            .replace_synced(
+                "pathors",
+                "dev",
+                [("DATABASE_URL".to_string(), "postgres://here/db".to_string())]
+                    .into_iter()
+                    .collect(),
+                Utc::now(),
+            )
+            .unwrap();
+        assert_eq!(
+            item(&dest.plan(Some(&manifest)), "env:pathors").status,
+            SetupStatus::Done
+        );
+    }
+
     /// docker, rclone, ssh and npm use every credential they have at once.
     /// Reporting them as "logged out" forever would make the plan unfinishable.
     #[test]
@@ -661,6 +832,7 @@ mod tests {
             &dest.registry,
             &dest.vault,
             &dest.clients,
+            &dest.envs,
             Some(&manifest),
             "tool:gh",
         )
@@ -676,6 +848,7 @@ mod tests {
             &dest.registry,
             &dest.vault,
             &dest.clients,
+            &dest.envs,
             Some(&manifest),
             "tool:gh",
         )
@@ -688,6 +861,7 @@ mod tests {
             &dest.registry,
             &dest.vault,
             &dest.clients,
+            &dest.envs,
             Some(&manifest),
             "tool:invented",
         )

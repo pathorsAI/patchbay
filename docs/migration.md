@@ -31,8 +31,46 @@ One encrypted file, four parts:
    key metadata, MCP registrations by name, and the gap list.
 4. **`SETUP.md`** — generated at export time, including how to install patchbay
    on a machine that does not have it yet.
+5. **The env vault's project manifest** — names and sync pins, never values.
+   See [below](#the-project-env-vault).
 
 Parts 3 and 4 live *inside* the encrypted payload and are written out on import.
+
+## The project env vault
+
+[`pb env`](env-vault.md) rides along, as metadata. The bundle carries the
+**portable project manifest** — ids, environments, `synced_at`, and each
+project's sync pin — so the new machine knows your projects exist and where
+their variables come from.
+
+Three things deliberately do not travel:
+
+| not carried | why |
+|---|---|
+| every variable **value**, synced or local | the synced layer is rebuilt from the remote, which is more current than a bundle from last Tuesday; the local layer is `.env.local` semantics, and a `DATABASE_URL` pointing at a container on the old laptop is exactly what must not follow you |
+| the local layer's variable **names** | names without values would make `pb env list` on the new machine promise variables `pb env run` could not produce |
+| `attachments.json` | which directories belong to a project is a list of paths on *this* machine, and meaningless on the next one |
+
+So on the new machine:
+
+```sh
+pb env projects                # the projects arrived, with no values
+pb env pull --project <id>     # rebuild each linked project's synced layer
+pb env attach <id>             # bind a directory — a committed .patchbay.toml
+                               # does this on its own for a fresh clone
+```
+
+`pb plan` lists one `pb env pull --project <id>` per linked project, marked
+`auto: false` on purpose: a pull only works under the account the project is
+pinned to, and the infisical CLI's active login is machine-global, so the item
+names that account and lets you (or `pb use infisical <email>`) sort it out
+first. A project the old machine had *unlinked* but with a synced layer becomes
+a gap instead — nothing here can rebuild it.
+
+Importing never overwrites a project this machine already has, even if the
+bundle's copy is different. It is skipped with a note naming it: the machine in
+front of you may be the newer one, and a stale sync pin written over a live one
+is not recoverable the way a backed-up file is.
 
 ## The portability table
 

@@ -91,22 +91,37 @@ and attach by hand instead.
 This is the whole point of the split. A new laptop is three steps:
 
 ```sh
-cp projects.json ~/.config/patchbay/   # from the old machine
+pb import patchbay-*.pbx               # projects.json rides inside the bundle
 git clone git@github.com:you/pathors   # the marker comes with the checkout
 cd pathors && pb env pull              # rebuild the synced layer from Infisical
 ```
+
+[`pb export`](migration.md#the-project-env-vault) carries the project manifest —
+ids, environments and sync pins — so the migration bundle is the normal route.
+Copying the file by hand still works and is the fallback when you are not moving
+a whole machine:
+
+```sh
+cp projects.json ~/.config/patchbay/   # from the old machine
+```
+
+Either way, an id that already exists here is left alone: an import skips it
+with a note rather than overwriting what may be the newer entry.
 
 A checkout carrying a marker resolves on its own; anything else takes one
 `pb env attach <id>`. Attachments deliberately do not travel — they are paths
 from a machine that is not this one — so `attachments.json` is excluded from
 every migration, copy and export story patchbay has. A project that arrived in a
-copied `projects.json` and has no attachment here shows `—` under ROOTS in
-`pb env projects`, which is normal, not broken.
+bundle or a copied `projects.json` and has no attachment here shows `—` under
+ROOTS in `pb env projects`, which is normal, not broken.
 
 The **local layer deliberately does not travel either**. `.env.local` semantics
 are per-machine overrides, and a `DATABASE_URL` pointing at a container on the
 old laptop is exactly the thing that must not follow you. What the remote holds
 comes back with `pb env pull`; what you set by hand you set again, on purpose.
+Not even its variable *names* are carried, in a bundle or in a copied
+`projects.json`: a name with no value behind it would make `pb env list` on the
+new machine promise something `pb env run` could not deliver.
 
 ### Environments and names
 

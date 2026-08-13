@@ -41,6 +41,7 @@ use serde::{Deserialize, Serialize};
 
 use super::manifest::{Manifest, BUNDLE_VERSION};
 use super::policy::Location;
+use crate::envs::ProjectEntry;
 
 /// Cleartext header, terminated by a newline.
 const HEADER_PREFIX: &str = "patchbay-bundle/";
@@ -132,6 +133,23 @@ pub struct Payload {
     pub secrets: Vec<BundleSecret>,
     #[serde(default)]
     pub mcp: Vec<BundleMcpServer>,
+    /// The env vault's portable project manifest: ids, environments and sync
+    /// pins. [`ProjectEntry`] is portable by construction — no absolute path,
+    /// no value — and the entries carried here have had every `local_names`
+    /// list cleared as well, because the local layer's *values* cannot travel
+    /// and names without values would make `pb env list` lie on arrival.
+    ///
+    /// `#[serde(default)]` rather than a [`BUNDLE_VERSION`] bump: a bundle
+    /// written before this field existed imports with an empty section, and a
+    /// bundle written *after* it, opened by an older patchbay, loses the
+    /// section silently — serde ignores unknown fields. That asymmetry is
+    /// acceptable here and would not be for a credential file: nothing else in
+    /// the payload depends on this list, and everything it points at is
+    /// rebuildable by `pb env pull`. Bumping the version instead would make an
+    /// older build refuse the whole bundle, which trades a recoverable omission
+    /// for an unrecoverable one.
+    #[serde(default)]
+    pub env_projects: Vec<ProjectEntry>,
 }
 
 impl Payload {
@@ -184,6 +202,7 @@ impl std::fmt::Debug for Payload {
             .field("bytes_carried", &self.bytes_carried())
             .field("secrets", &self.secrets.len())
             .field("mcp", &self.mcp.len())
+            .field("env_projects", &self.env_projects.len())
             .finish_non_exhaustive()
     }
 }
@@ -333,6 +352,7 @@ mod tests {
                 tools: vec![],
                 keys: vec![],
                 mcp: vec![],
+                env_projects: vec![],
                 gaps: vec![],
             },
             setup_md: "# Setting up\n".into(),
@@ -348,6 +368,7 @@ mod tests {
                 secret: "cf-token-value-9876".into(),
             }],
             mcp: vec![],
+            env_projects: vec![],
         }
     }
 

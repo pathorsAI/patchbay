@@ -159,6 +159,52 @@ pub struct KeyRecord {
     pub included: bool,
 }
 
+/// One project from the env vault, readable without decrypting anything —
+/// [`KeyRecord`]'s role for [`crate::envs`].
+///
+/// Names and counts only. A variable name is not a secret, but a *list* of
+/// them is noise in a document meant to be read, so an environment reports how
+/// many variables its synced layer holds rather than which; the payload's own
+/// [`crate::envs::ProjectEntry`] has the names for the code that restores them.
+///
+/// **No local-layer count.** The local layer does not travel at all, and a
+/// number next to it in a manifest would imply that something of it did.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EnvProjectRecord {
+    pub id: String,
+    pub default_env: String,
+    #[serde(default)]
+    pub environments: Vec<EnvEnvironmentRecord>,
+    /// Where the synced layer is pulled from, if the project is linked. Absent
+    /// means nothing on the new machine can rebuild it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<EnvSyncRecord>,
+}
+
+/// One environment of one carried project.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EnvEnvironmentRecord {
+    pub name: String,
+    /// How many variables a `pb env pull` is expected to restore here.
+    pub synced_vars: usize,
+    /// When the source machine last pulled. `null` if it never did.
+    #[serde(default)]
+    pub synced_at: Option<DateTime<Utc>>,
+}
+
+/// A project's sync pin, as the manifest reports it: enough to see which
+/// remote and which login a pull will need, and nothing that could authorize
+/// one. The API base URL and the environment-name mapping stay in the payload's
+/// own entry — they are configuration, not something a reader needs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EnvSyncRecord {
+    pub provider: String,
+    /// The remote's own project identifier.
+    pub project_id: String,
+    /// The account the pull has to run as.
+    pub account: String,
+}
+
 /// One MCP server as one client had it registered. Same value-free contract as
 /// [`crate::mcp_clients::McpServerEntry`]: names of environment variables and
 /// headers, never their values.
@@ -196,6 +242,10 @@ pub struct Manifest {
     pub keys: Vec<KeyRecord>,
     #[serde(default)]
     pub mcp: Vec<McpRecord>,
+    /// The env vault's projects, by id. Their *values* are not in the bundle at
+    /// all; `pb env pull` rebuilds each synced layer on the new machine.
+    #[serde(default)]
+    pub env_projects: Vec<EnvProjectRecord>,
     /// What will not have travelled, with the command for each.
     #[serde(default)]
     pub gaps: Vec<SetupItem>,
@@ -272,6 +322,20 @@ mod tests {
                 header_keys: vec!["Authorization".into()],
                 carried: true,
             }],
+            env_projects: vec![EnvProjectRecord {
+                id: "pathors".into(),
+                default_env: "dev".into(),
+                environments: vec![EnvEnvironmentRecord {
+                    name: "dev".into(),
+                    synced_vars: 12,
+                    synced_at: None,
+                }],
+                sync: Some(EnvSyncRecord {
+                    provider: "infisical".into(),
+                    project_id: "3f0b-uuid".into(),
+                    account: "me@work.com".into(),
+                }),
+            }],
             gaps: vec![
                 SetupItem::new("tool:gh", "gh", "re-authenticate").command("gh auth login", true)
             ],
@@ -302,6 +366,19 @@ mod tests {
         // last4 is the only thing derived from a value, and four characters is
         // the whole point.
         assert!(json.contains("\"last4\": \"9876\""), "{json}");
+    }
+
+    /// The env vault's half of the same contract: what a pull will restore, in
+    /// counts, and not one word about the layer that does not travel.
+    #[test]
+    fn test_an_env_project_record_counts_the_synced_layer_and_never_the_local_one() {
+        let json = manifest_with_secret_shaped_everything().to_json();
+        assert!(json.contains("\"synced_vars\": 12"), "{json}");
+        assert!(json.contains("me@work.com"), "{json}");
+        // No `local_names`, no local count, no attachment root: a number beside
+        // the local layer would imply something of it had moved.
+        assert!(!json.contains("local"), "{json}");
+        assert!(!json.contains("Users"), "{json}");
     }
 
     #[test]

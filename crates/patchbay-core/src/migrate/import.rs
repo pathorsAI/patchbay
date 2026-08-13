@@ -22,6 +22,13 @@
 //! no write, no backup, and [`FileOutcome::Unchanged`] in the report. So the
 //! second run of an import is a no-op that says so, which is what makes it safe
 //! to re-run after fixing one item in the plan.
+//!
+//! # The one thing that is never replaced
+//!
+//! An env vault project ([`crate::envs`]) that already exists here is skipped
+//! rather than overwritten, with a note naming it — see
+//! [`Importer::restore_env_projects`]. Files get a backup and can be put back;
+//! a project entry that lost its sync pin to a stale copy cannot.
 
 use std::path::PathBuf;
 
@@ -29,6 +36,7 @@ use super::bundle::{BundleMcpServer, Payload};
 use super::manifest::SetupItem;
 use super::plan;
 use super::policy::Location;
+use crate::envs::EnvRegistry;
 use crate::keys::{KeyRegistry, NewKey};
 use crate::mcp_clients::{McpClientRegistry, ServerSpec, TransportSpec};
 use crate::paths::Paths;
@@ -90,6 +98,13 @@ pub struct McpResult {
     pub values_carried: Vec<String>,
 }
 
+/// One env vault project the bundle carried.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnvProjectResult {
+    pub id: String,
+    pub outcome: FileOutcome,
+}
+
 /// Everything an import did, or would do.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImportReport {
@@ -97,6 +112,7 @@ pub struct ImportReport {
     pub files: Vec<FileResult>,
     pub keys: Vec<KeyResult>,
     pub mcp: Vec<McpResult>,
+    pub env_projects: Vec<EnvProjectResult>,
     /// The gap list, re-evaluated against this machine after the restore.
     pub remaining: Vec<SetupItem>,
     pub notes: Vec<String>,
@@ -126,6 +142,7 @@ pub struct Importer<'a> {
     pub registry: &'a Registry,
     pub vault: &'a KeyRegistry,
     pub clients: &'a McpClientRegistry,
+    pub envs: &'a EnvRegistry,
 }
 
 impl Importer<'_> {
@@ -135,6 +152,7 @@ impl Importer<'_> {
             files: Vec::new(),
             keys: Vec::new(),
             mcp: Vec::new(),
+            env_projects: Vec::new(),
             remaining: Vec::new(),
             notes: Vec::new(),
         };
@@ -142,6 +160,7 @@ impl Importer<'_> {
         self.restore_files(payload, options, &mut report)?;
         self.restore_keys(payload, options, &mut report);
         self.restore_mcp(payload, options, &mut report);
+        self.restore_env_projects(payload, options, &mut report);
 
         // The gaps are recomputed here rather than copied out of the manifest:
         // the manifest's list is what the *source* predicted, and by now some
@@ -151,6 +170,7 @@ impl Importer<'_> {
             self.registry,
             self.vault,
             self.clients,
+            self.envs,
             Some(&payload.manifest),
         );
         Ok(report)
@@ -354,6 +374,67 @@ impl Importer<'_> {
             );
         }
     }
+
+    /// Register the env vault projects the bundle carried, through
+    /// [`EnvRegistry::adopt`].
+    ///
+    /// **A project id this machine already has is skipped, by name.** The
+    /// destination may well be the newer of the two machines — it may have
+    /// pulled since the bundle was written, or been re-linked to a different
+    /// remote — and an import that overwrote its entry would replace a live
+    /// sync pin with a stale one, silently. Skipping is recoverable (`pb env
+    /// forget` then re-import); overwriting is not.
+    ///
+    /// Neither `attachments.json` nor the keychain is touched. The values come
+    /// back from `pb env pull`, and which directories here belong to a project
+    /// is this machine's own business — see the plan items in [`super::plan`].
+    fn restore_env_projects(
+        &self,
+        payload: &Payload,
+        options: &ImportOptions,
+        report: &mut ImportReport,
+    ) {
+        for project in &payload.env_projects {
+            let existing = self.envs.get(&project.id).ok().flatten();
+            let outcome = match (existing, options.dry_run) {
+                (Some(_), _) => {
+                    report.notes.push(format!(
+                        "env project `{}` is already registered here and was left exactly as it \
+                         is; the bundle's copy was not applied (`pb env projects` shows what this \
+                         machine has)",
+                        project.id
+                    ));
+                    FileOutcome::Skipped {
+                        reason: "already registered on this machine".to_string(),
+                    }
+                }
+                (None, true) => FileOutcome::Created,
+                (None, false) => match self.envs.adopt(project) {
+                    Ok(_) => FileOutcome::Created,
+                    // One unusable entry must not abort the rest of the import.
+                    Err(e) => FileOutcome::Skipped {
+                        reason: format!("{e:#}"),
+                    },
+                },
+            };
+            report.env_projects.push(EnvProjectResult {
+                id: project.id.clone(),
+                outcome,
+            });
+        }
+        if report
+            .env_projects
+            .iter()
+            .any(|p| p.outcome == FileOutcome::Created)
+        {
+            report.notes.push(
+                "env projects arrived as metadata only — no variable value is ever in a bundle. \
+                 Run `pb env pull --project <id>` for each linked project to rebuild its synced \
+                 layer, and `pb env attach <id>` in the directories that belong to them"
+                    .to_string(),
+            );
+        }
+    }
 }
 
 fn to_spec(server: &BundleMcpServer) -> ServerSpec {
@@ -391,6 +472,7 @@ mod tests {
         registry: Registry,
         vault: KeyRegistry,
         clients: McpClientRegistry,
+        envs: EnvRegistry,
     }
 
     impl Machine {
@@ -407,6 +489,11 @@ mod tests {
                 registry: Registry::all(paths.clone()),
                 vault: KeyRegistry::new(home.join("keys.json"), Box::new(MemoryKeystore::new())),
                 clients: McpClientRegistry::with_paths(paths.clone()),
+                envs: EnvRegistry::new(
+                    home.join("projects.json"),
+                    home.join("attachments.json"),
+                    Box::new(MemoryKeystore::new()),
+                ),
                 paths,
                 home,
                 _dir: dir,
@@ -419,6 +506,7 @@ mod tests {
                 registry: &self.registry,
                 vault: &self.vault,
                 clients: &self.clients,
+                envs: &self.envs,
             }
             .payload(&keys, Utc::now())
             .unwrap()
@@ -430,6 +518,7 @@ mod tests {
                 registry: &self.registry,
                 vault: &self.vault,
                 clients: &self.clients,
+                envs: &self.envs,
             }
             .run(payload, &ImportOptions { dry_run })
             .unwrap()
@@ -652,6 +741,126 @@ mod tests {
         assert_eq!(again.mcp[0].outcome, FileOutcome::Unchanged);
     }
 
+    #[test]
+    fn test_env_projects_round_trip_without_their_values() {
+        let source = Machine::new(&[]);
+        let attached = source.home.join("repos/pathors");
+        let pulled = crate::migrate::export::tests::seed_env_vault(&source.envs, &attached);
+        let payload = source.payload(KeySelection::None);
+
+        let dest = Machine::new(&[]);
+        let report = dest.import(&payload, false);
+        assert_eq!(report.env_projects.len(), 2);
+        assert!(report
+            .env_projects
+            .iter()
+            .all(|p| p.outcome == FileOutcome::Created));
+
+        let landed = dest.envs.get("pathors").unwrap().unwrap();
+        assert_eq!(landed.default_env, "dev");
+        let dev = landed.env("dev").unwrap();
+        assert_eq!(dev.synced_names, vec!["DATABASE_URL"]);
+        assert_eq!(dev.synced_at, Some(pulled));
+        // The local layer did not travel, in either half: no names…
+        assert!(dev.local_names.is_empty(), "{dev:?}");
+        // …and no values, in either layer. `merged` reads the keychain.
+        assert!(dest.envs.merged("pathors", "dev").unwrap().vars.is_empty());
+        // The pin survived, so a pull here knows where and as whom.
+        let sync = landed.sync.as_ref().unwrap();
+        assert_eq!(sync.project_id, "9f2c-uuid");
+        assert_eq!(sync.account, "me@work.com");
+
+        // Nothing on this machine is attached to it: paths are machine-local.
+        assert!(dest.envs.attachments().unwrap().is_empty());
+        assert!(!dest.exists("attachments.json"));
+        assert!(report.notes.iter().any(|n| n.contains("pb env pull")));
+    }
+
+    #[test]
+    fn test_a_project_that_already_exists_here_is_never_overwritten() {
+        let source = Machine::new(&[]);
+        crate::migrate::export::tests::seed_env_vault(
+            &source.envs,
+            &source.home.join("repos/pathors"),
+        );
+        let payload = source.payload(KeySelection::None);
+
+        // The destination has its own `pathors`, linked somewhere else — it may
+        // well be the newer machine.
+        let dest = Machine::new(&[]);
+        dest.envs.register("pathors", "staging").unwrap();
+        dest.envs
+            .set_sync(
+                "pathors",
+                crate::envs::SyncConfig {
+                    provider: "infisical".into(),
+                    project_id: "newer-uuid".into(),
+                    account: "me@home.com".into(),
+                    domain: None,
+                    env_map: Default::default(),
+                },
+            )
+            .unwrap();
+        let before = dest.envs.get("pathors").unwrap().unwrap();
+
+        let report = dest.import(&payload, false);
+        let skipped = report
+            .env_projects
+            .iter()
+            .find(|p| p.id == "pathors")
+            .unwrap();
+        assert!(
+            matches!(&skipped.outcome, FileOutcome::Skipped { reason } if reason.contains("already")),
+            "{skipped:?}"
+        );
+        assert_eq!(dest.envs.get("pathors").unwrap().unwrap(), before);
+        assert!(
+            report.notes.iter().any(|n| n.contains("`pathors`")),
+            "the skip has to be named: {:?}",
+            report.notes
+        );
+        // The other one still landed: one skip is not an aborted import.
+        assert!(dest.envs.get("legacy").unwrap().is_some());
+    }
+
+    #[test]
+    fn test_a_dry_run_registers_no_project() {
+        let source = Machine::new(&[]);
+        crate::migrate::export::tests::seed_env_vault(
+            &source.envs,
+            &source.home.join("repos/pathors"),
+        );
+        let payload = source.payload(KeySelection::None);
+
+        let dest = Machine::new(&[]);
+        let report = dest.import(&payload, true);
+        assert_eq!(report.env_projects.len(), 2);
+        assert!(dest.envs.projects().unwrap().is_empty());
+    }
+
+    /// A bundle written before the env vault existed has no `env_projects` key
+    /// at all. Serde's default fills it in, and the import is otherwise
+    /// unchanged — which is why this section did not cost a `BUNDLE_VERSION`.
+    #[test]
+    fn test_a_bundle_from_before_the_env_vault_still_imports() {
+        let source = Machine::new(&source_files());
+        let payload = source.payload(KeySelection::None);
+
+        let mut json = serde_json::to_value(&payload).unwrap();
+        json.as_object_mut().unwrap().remove("env_projects");
+        assert!(json.get("env_projects").is_none());
+        let old: Payload = serde_json::from_value(json).unwrap();
+        assert!(old.env_projects.is_empty());
+
+        let dest = Machine::new(&[]);
+        let report = dest.import(&old, false);
+        assert!(report.env_projects.is_empty());
+        assert!(report.written() >= 6, "{report:?}");
+        for (rel, body) in source_files() {
+            assert_eq!(dest.read(rel), body, "{rel}");
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_the_source_mode_travels_with_the_file() {
@@ -694,12 +903,18 @@ mod tests {
             Box::new(MemoryKeystore::new()),
         );
         let clients = McpClientRegistry::with_paths(paths.clone());
+        let envs = EnvRegistry::new(
+            dest_home.path().join("projects.json"),
+            dest_home.path().join("attachments.json"),
+            Box::new(MemoryKeystore::new()),
+        );
 
         Importer {
             paths: &paths,
             registry: &registry,
             vault: &vault,
             clients: &clients,
+            envs: &envs,
         }
         .run(&payload, &ImportOptions::default())
         .unwrap();
@@ -730,11 +945,17 @@ mod tests {
             Box::new(MemoryKeystore::new()),
         );
         let clients = McpClientRegistry::with_paths(paths.clone());
+        let envs = EnvRegistry::new(
+            dir.path().join("projects.json"),
+            dir.path().join("attachments.json"),
+            Box::new(MemoryKeystore::new()),
+        );
         let payload = Exporter {
             paths: &paths,
             registry: &registry,
             vault: &vault,
             clients: &clients,
+            envs: &envs,
         }
         .payload(&KeySelection::None, Utc::now())
         .unwrap();

@@ -39,7 +39,10 @@ pub use bundle::{peek_version, Payload, BUNDLE_EXTENSION};
 pub use export::{
     check_destination, cloud_service, default_file_name, ExportReport, Exporter, KeySelection,
 };
-pub use import::{FileOutcome, ImportOptions, ImportReport, Importer};
-pub use manifest::{Manifest, SetupItem, SetupStatus, ToolRecord, BUNDLE_VERSION};
+pub use import::{EnvProjectResult, FileOutcome, ImportOptions, ImportReport, Importer};
+pub use manifest::{
+    EnvEnvironmentRecord, EnvProjectRecord, EnvSyncRecord, Manifest, SetupItem, SetupStatus,
+    ToolRecord, BUNDLE_VERSION,
+};
 pub use plan::{plan, recheck};
 pub use policy::{policy_for, Location, Portability, PortabilityKind, ToolPolicy, POLICIES};
