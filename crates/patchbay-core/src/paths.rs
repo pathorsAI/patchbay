@@ -239,7 +239,10 @@ impl Paths {
     pub fn binary_path(&self, name: &str) -> Option<PathBuf> {
         match self.lookup {
             BinaryLookup::System => which::which(name).ok(),
-            BinaryLookup::Disabled => None,
+            // Scripted execution still must not depend on where anything
+            // really lives: install-source detection reads this path, so
+            // returning a real one would make those results vary by machine.
+            BinaryLookup::Disabled | BinaryLookup::Scripted => None,
         }
     }
 

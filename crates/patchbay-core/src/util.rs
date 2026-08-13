@@ -287,7 +287,9 @@ impl Exec for FakeExec {
             }
         }
         // Nothing scripted: the same shape as a binary that is not there.
-        Err(anyhow::anyhow!("could not run `{line}`: no such file or directory"))
+        Err(anyhow::anyhow!(
+            "could not run `{line}`: no such file or directory"
+        ))
     }
 }
 

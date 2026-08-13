@@ -256,7 +256,9 @@ impl Probe for AwsProbe {
                 Some("aws sts get-caller-identity"),
             ));
         }
-        let out = self.paths.run("aws", &["sts", "get-caller-identity", "--output", "json"])?;
+        let out = self
+            .paths
+            .run("aws", &["sts", "get-caller-identity", "--output", "json"])?;
         Ok(if out.ok {
             let arn = serde_json::from_str::<serde_json::Value>(&out.stdout)
                 .ok()

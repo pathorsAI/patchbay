@@ -38,7 +38,7 @@ use serde::Deserialize;
 use crate::paths::Paths;
 use crate::probe::{unsupported_switch, unsupported_verify, Probe};
 use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
-use crate::util::{read_text};
+use crate::util::read_text;
 
 pub struct CloudflaredProbe {
     paths: Paths,

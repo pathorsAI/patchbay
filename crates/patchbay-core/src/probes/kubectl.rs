@@ -18,7 +18,7 @@ use serde::Deserialize;
 use crate::paths::Paths;
 use crate::probe::{unknown_profile, unsupported_switch, unsupported_verify, Probe};
 use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
-use crate::util::{read_text};
+use crate::util::read_text;
 
 pub struct KubectlProbe {
     paths: Paths,
@@ -323,7 +323,9 @@ impl Probe for KubectlProbe {
             ));
         }
 
-        let out = self.paths.run("kubectl", &["config", "use-context", profile_id])?;
+        let out = self
+            .paths
+            .run("kubectl", &["config", "use-context", profile_id])?;
         Ok(if out.ok {
             SwitchOutcome::Switched {
                 tool: Self::TOOL.to_string(),

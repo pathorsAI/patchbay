@@ -555,6 +555,30 @@ pub const VERSIONS: &[ToolVersionSpec] = &[
             note: "Docker Desktop bundles and updates the docker CLI itself",
         }),
     },
+    // `ngrok version 3.25.1`. Verified. Homebrew ships it as a CASK, not a
+    // formula, so `brew outdated --json=v2` reports it under `casks`.
+    ToolVersionSpec {
+        tool: "ngrok",
+        bins: &["ngrok"],
+        args: &["--version"],
+        parse: ParseStrategy::FirstSemver,
+        brew: Some("ngrok"),
+        npm: None,
+        github: None,
+        self_update: None,
+    },
+    // `cloudflared version 2025.2.1 (built …)`. Verified. Calendar versioning,
+    // which the semver extractor still handles: three dotted numbers.
+    ToolVersionSpec {
+        tool: "cloudflared",
+        bins: &["cloudflared"],
+        args: &["--version"],
+        parse: ParseStrategy::FirstSemver,
+        brew: Some("cloudflared"),
+        npm: None,
+        github: Some("cloudflare/cloudflared"),
+        self_update: None,
+    },
     // `1.94.2` then a commit/go banner. Verified.
     ToolVersionSpec {
         tool: "tailscale",

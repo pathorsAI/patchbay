@@ -31,7 +31,7 @@ use serde::Deserialize;
 use crate::paths::Paths;
 use crate::probe::{unsupported_switch, Probe};
 use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
-use crate::util::{read_text};
+use crate::util::read_text;
 
 pub struct OpProbe {
     paths: Paths,

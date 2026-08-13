@@ -268,9 +268,7 @@ impl Probe for RcloneProbe {
             .unwrap_or_default();
 
         let remote = format!("{profile_id}:");
-        let out = self
-            .paths
-            .run("rclone", &["about", &remote, "--json"])?;
+        let out = self.paths.run("rclone", &["about", &remote, "--json"])?;
         if out.ok {
             let detail = match Self::quota(&out.stdout) {
                 Some(quota) => format!("reachable{via}; {quota}"),
@@ -460,7 +458,10 @@ remote = work:Legal
         match probe.verify_profile("pathors").unwrap() {
             VerifyOutcome::Valid { detail, .. } => {
                 assert!(detail.contains("reachable"), "{detail}");
-                assert!(detail.contains("6.5 GiB of 150.0 GiB used (4%)"), "{detail}");
+                assert!(
+                    detail.contains("6.5 GiB of 150.0 GiB used (4%)"),
+                    "{detail}"
+                );
             }
             other => panic!("expected Valid, got {other:?}"),
         }
@@ -491,7 +492,12 @@ remote = work:Legal
             REMOTES,
             FakeExec::new()
                 .on("about", false, "", "Error: doesn't support about")
-                .on("lsd", true, "          -1 2026-01-01 00:00:00        -1 folder\n", ""),
+                .on(
+                    "lsd",
+                    true,
+                    "          -1 2026-01-01 00:00:00        -1 folder\n",
+                    "",
+                ),
         );
 
         match probe.verify_profile("pathors").unwrap() {

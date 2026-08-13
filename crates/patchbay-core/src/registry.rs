@@ -651,8 +651,9 @@ mod tests {
         std::fs::write(paths.versions_file(), "{ not json").unwrap();
 
         let registry = Registry::all(paths);
+        let expected = registry.tool_names().len();
         let board = registry.status_all();
-        assert_eq!(board.len(), 23);
+        assert_eq!(board.len(), expected);
         for status in &board {
             assert!(status.version.is_none());
             assert!(status.notes.is_empty(), "{} got noisy", status.tool);

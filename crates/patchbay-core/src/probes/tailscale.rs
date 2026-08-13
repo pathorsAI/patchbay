@@ -23,7 +23,7 @@ use serde::Deserialize;
 use crate::paths::Paths;
 use crate::probe::{unknown_profile, unsupported_switch, unsupported_verify, Probe};
 use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
-use crate::util::{parse_timestamp};
+use crate::util::parse_timestamp;
 
 pub struct TailscaleProbe {
     paths: Paths,

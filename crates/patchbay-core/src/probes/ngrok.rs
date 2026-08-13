@@ -35,7 +35,7 @@ use crate::keys_verify::{HttpClient, UreqClient};
 use crate::paths::Paths;
 use crate::probe::{unsupported_switch, unsupported_verify, Probe};
 use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
-use crate::util::{read_text};
+use crate::util::read_text;
 
 /// The ngrok API. Used only when an `api_key` is configured — an `authtoken`
 /// authenticates the *agent*, not the API, and cannot be checked this way.

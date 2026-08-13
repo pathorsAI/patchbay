@@ -338,7 +338,9 @@ impl Probe for GcloudProbe {
         }
         // Mints/refreshes an access token for the active account: the cheapest
         // honest liveness check. The token itself is discarded, never parsed.
-        let out = self.paths.run("gcloud", &["auth", "print-access-token", "--quiet"])?;
+        let out = self
+            .paths
+            .run("gcloud", &["auth", "print-access-token", "--quiet"])?;
         Ok(if out.ok {
             VerifyOutcome::Valid {
                 tool: Self::TOOL.to_string(),
