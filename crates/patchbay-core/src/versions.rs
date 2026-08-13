@@ -971,7 +971,15 @@ pub fn parse_brew_outdated(json: &str) -> Result<HashMap<String, String>, String
     let mut out = HashMap::new();
     for entry in parsed.formulae.into_iter().chain(parsed.casks) {
         if !entry.current_version.is_empty() {
-            out.insert(entry.name, entry.current_version);
+            // Casks version as `<version>,<build>` (ngrok: `3.39.11,dy27w…`).
+            // The build id is noise next to what the tool reports about
+            // itself, so it is dropped; formulae have no comma and are
+            // unaffected.
+            let version = match entry.current_version.split_once(',') {
+                Some((version, _build)) => version.to_string(),
+                None => entry.current_version,
+            };
+            out.insert(entry.name, version);
         }
     }
     Ok(out)
@@ -1874,6 +1882,9 @@ mod tests {
             index.get("1password-cli").map(String::as_str),
             Some("2.31.1")
         );
+        // A cask's `<version>,<build>` loses the build id: it is noise beside
+        // what the tool reports about itself.
+        assert_eq!(index.get("ngrok").map(String::as_str), Some("3.39.11"));
         // Not outdated == not present; the caller reads that as "current".
         assert_eq!(index.get("infisical"), None);
         assert_eq!(index.len(), 10);
