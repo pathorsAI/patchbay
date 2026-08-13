@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The panel writes to the key vault** — `add key` opens a form (id, provider,
+  label, a masked secret field, with purpose, scopes, expiry, endpoint and the
+  rotation checkbox folded away), and every row gets a trash affordance behind
+  an inline confirm that says what removing does *not* do: the entry and its
+  keychain value go, the credential keeps working until you revoke it at the
+  provider. Both commands (`key_add`, `key_remove`) are thin wrappers over the
+  same `KeyRegistry` calls the CLI makes, so the registry's rules — duplicate id
+  refused unless you are rotating, empty secret refused, both-or-neither writes —
+  and its error strings reach the panel verbatim. The vault view no longer tells
+  you to go and use the command line. The secret exists in the field, the invoke
+  payload and `KeyRegistry::add`, and nowhere else: it is cleared on submit,
+  never logged, never echoed back. The panel still cannot *read* a value —
+  `get_secret` is not wired up, there is no reveal and no copy, and `pb key copy`
+  remains the only way one leaves the vault. The old CLI-only rule was about
+  argv (`ps`, shell history), and a password field in a native window has
+  neither.
+
 ## [0.2.0] - 2026-08-13
 
 ### Added

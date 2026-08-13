@@ -172,6 +172,33 @@ export interface KeyRow {
   expiry_state: KeyExpiryState;
 }
 
+/**
+ * The metadata half of a registration, as `key_add` takes it. The secret is
+ * deliberately *not* a field here: it is passed separately, so no object in the
+ * panel ever carries a value, not even in flight.
+ *
+ * Blank optional fields are absent fields — the backend trims and drops them.
+ * `expires` is `YYYY-MM-DD` or a full timestamp; the backend parses it and
+ * refuses anything it cannot read.
+ */
+export interface NewKeyInput {
+  id: string;
+  provider: string;
+  label: string;
+  purpose: string | null;
+  scopes: string[];
+  expires: string | null;
+  endpoint: string | null;
+  /** Replace an existing entry under this id — a rotation, not an accident. */
+  overwrite: boolean;
+}
+
+/** What `key_remove` reports: enough to name what is gone, nothing more. */
+export interface RemovedKey {
+  id: string;
+  last4: string;
+}
+
 /** Mirrors `patchbay_core::McpTransport` — an internally tagged enum. */
 export type McpTransport =
   | { transport: "stdio"; command: string; args_len: number }

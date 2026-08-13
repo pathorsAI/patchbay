@@ -24,6 +24,19 @@ pb key verify cf-gh-actions-deploy  # ask Cloudflare whether it still works
 pb key rm  cf-gh-actions-deploy     # metadata and Keychain item, both
 ```
 
+### In the panel
+
+The vault view browses the same registry, and writes to it: **add key** opens a
+form — id, provider, label, a masked secret field, and the optional purpose,
+scopes, expiry and endpoint behind a fold — and each row has a trash affordance
+with an inline confirm. Both go through the same `KeyRegistry` calls as `pb key
+add` and `pb key rm`, so the rules and the error messages are identical.
+
+The panel takes a secret; it never gives one back. There is no reveal, no copy,
+and no command behind the window that returns a value — `pb key copy <id>` is
+still the only way out. See the security model below for why the asymmetry
+survives a GUI intact.
+
 ### Verification
 
 `pb key list` can only repeat what you told it. `pb key verify` asks the issuer:
@@ -111,7 +124,21 @@ it was. The registry never advertises a key whose value was never stored.
 
 **Writing is easy, reading is not.** There is no `pb key show`. `pb key copy`
 pipes the value into `pbcopy` — it never passes through stdout, a log or your
-shell history. Secrets never arrive as arguments either, in either direction.
+shell history.
+
+**Why the CLI reads stdin.** A secret passed as an argument is not private:
+argv is world-readable through `ps` for the length of the process, and your
+shell writes the line verbatim into `~/.zsh_history`. So `pb key add` takes the
+value from a pipe or a hidden prompt, never from a flag — in either direction.
+
+**The panel takes a secret too, and that is not a hole in the rule.** The add
+form's field is a password input; the value lives in memory for one call,
+crosses the Tauri boundary once, and is handed to the same `KeyRegistry::add`
+the CLI uses. No argv, no history file, no log — the two hazards the CLI rule
+exists to avoid are properties of command lines, and a native window has
+neither. What does not change is the other half: the panel never displays a
+value, never copies one, and has no command wired up that could return one.
+`KeyRegistry::get_secret` is deliberately not exposed to the webview.
 
 **AI agents can register keys, not read them.** Over MCP:
 
@@ -140,6 +167,7 @@ has no way to take a password on stdin. Moving to the Security framework API,
 where the value never becomes a command line, is tracked in
 `crates/patchbay-core/src/keystore.rs`.
 
-**Removing is not revoking.** `pb key rm` makes patchbay forget a key. The
-credential keeps working until you revoke it at the provider.
+**Removing is not revoking.** `pb key rm`, and the panel's trash affordance,
+make patchbay forget a key. The credential keeps working until you revoke it at
+the provider — which is what the panel's confirm says before it asks.
 

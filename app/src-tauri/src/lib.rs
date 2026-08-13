@@ -4,6 +4,8 @@
 //! and (tier 2) spawn the tools' own CLIs, so each call runs on the blocking
 //! pool — the webview never waits on the async runtime's worker threads.
 
+use chrono::{DateTime, NaiveDate, NaiveTime, TimeZone, Utc};
+use patchbay_core::keys::NewKey;
 use patchbay_core::{
     KeyEntry, KeyExpiryState, KeyRegistry, McpClient, McpClientRegistry, PermissionsReport,
     Registry, SwitchOutcome, ToolStatus, VerifyOutcome,
@@ -80,8 +82,16 @@ async fn permissions(tool: String) -> CmdResult<PermissionsReport> {
 /// markers on the board can never disagree about what "expiring soon" means.
 ///
 /// Metadata only, by construction: [`KeyEntry`] has never carried the secret
-/// value — only its `last4`. [`KeyRegistry::get_secret`] is deliberately *not*
-/// wired up as a command; the panel displays keys, it never needs to hold one.
+/// value — only its `last4`.
+///
+/// The panel takes a secret exactly once — [`key_add`], from a masked field,
+/// held in memory for the length of one call and handed straight to the
+/// keychain. It never reads one back: [`KeyRegistry::get_secret`] is
+/// deliberately *not* wired up as a command, there is no reveal and no copy in
+/// this window, and `pb key copy` stays the only way a value gets out of the
+/// vault. Writing is easy, reading is not — that asymmetry is the design, and
+/// the CLI-only rule it replaced was about argv (`ps`, shell history), which a
+/// masked field in a native app does not touch.
 #[derive(serde::Serialize)]
 struct KeyRow {
     #[serde(flatten)]
@@ -102,6 +112,109 @@ async fn keys_list() -> CmdResult<Vec<KeyRow>> {
                 entry,
             })
             .collect())
+    })
+    .await
+}
+
+/// What [`key_remove`] reports back: enough to name the key that is gone in a
+/// confirmation, and nothing else. `last4` is the same four characters the
+/// table was already showing.
+#[derive(serde::Serialize)]
+struct RemovedKey {
+    id: String,
+    last4: String,
+}
+
+/// A date the panel's form accepts: `YYYY-MM-DD` (UTC midnight) or a full
+/// timestamp. Reimplemented rather than shared with the CLI's `--expires`
+/// parser — the panel does not depend on `patchbay-cli` and is not about to
+/// start for six lines. Both go through `patchbay_core::util::parse_timestamp`,
+/// which is where the timestamp knowledge actually lives.
+fn parse_expiry(raw: &str) -> anyhow::Result<DateTime<Utc>> {
+    let raw = raw.trim();
+    if let Ok(date) = NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
+        return Ok(Utc.from_utc_datetime(&date.and_time(NaiveTime::MIN)));
+    }
+    patchbay_core::util::parse_timestamp(raw)
+        .ok_or_else(|| anyhow::anyhow!("could not read `{raw}` as a date; try `2027-01-01`"))
+}
+
+/// Trimmed, or `None` when the field was left blank — an empty optional field
+/// is an absent one, not an empty string in the registry.
+fn some_text(raw: Option<String>) -> Option<String> {
+    raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// Register a key: metadata to `keys.json`, value to the keychain, both or
+/// neither — [`KeyRegistry::add`] owns that guarantee and its rules (duplicate
+/// id refused unless `overwrite`, empty secret refused) are surfaced to the
+/// panel verbatim rather than re-litigated here.
+///
+/// `secret` is the one piece of credential material that crosses this boundary.
+/// It is moved into the blocking closure, borrowed once by `add`, and dropped
+/// there. It is never logged, never stored, and never put in an error: every
+/// message the panel can show comes from the registry, which only ever knew the
+/// metadata.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn key_add(
+    id: String,
+    provider: Option<String>,
+    label: Option<String>,
+    purpose: Option<String>,
+    scopes: Vec<String>,
+    expires: Option<String>,
+    endpoint: Option<String>,
+    secret: String,
+    overwrite: bool,
+) -> CmdResult<KeyRow> {
+    off_thread(move || {
+        let id = id.trim().to_string();
+        let expires_at = some_text(expires)
+            .as_deref()
+            .map(parse_expiry)
+            .transpose()?;
+        let new = NewKey::new(
+            id.as_str(),
+            // Where the entry came from, for the `source` column. The vault has
+            // said `"gui"` since it was written; this is the first thing to use it.
+            "gui",
+        )
+        .provider(some_text(provider).unwrap_or_else(|| "unknown".to_string()))
+        .label(some_text(label).unwrap_or_else(|| id.clone()))
+        .purpose(some_text(purpose))
+        .scopes(
+            scopes
+                .into_iter()
+                .filter_map(|s| some_text(Some(s)))
+                .collect(),
+        )
+        .expires_at(expires_at)
+        .endpoint(some_text(endpoint));
+
+        let registry = KeyRegistry::detect()?;
+        let entry = registry.add(new, &secret, overwrite)?;
+        drop(secret);
+
+        Ok(KeyRow {
+            expiry_state: entry.expiry_state(Utc::now()),
+            entry,
+        })
+    })
+    .await
+}
+
+/// Unregister a key: the metadata row and the keychain item both go. Removing
+/// is not revoking — the credential itself keeps working, which is why the
+/// panel says so before it asks.
+#[tauri::command]
+async fn key_remove(id: String) -> CmdResult<RemovedKey> {
+    off_thread(move || {
+        let entry = KeyRegistry::detect()?.remove(id.trim())?;
+        Ok(RemovedKey {
+            id: entry.id,
+            last4: entry.last4,
+        })
     })
     .await
 }
@@ -143,6 +256,8 @@ pub fn run() {
             verify_profile,
             permissions,
             keys_list,
+            key_add,
+            key_remove,
             mcp_list
         ])
         .run(tauri::generate_context!())
