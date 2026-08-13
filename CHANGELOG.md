@@ -40,6 +40,12 @@ it accurately, and never touch a secret value.
   values are never copied into a status struct, never logged, and never
   included in error messages — probes parse the fields they need (expiry,
   scopes, account) and drop the rest.
+- Release artifacts are signed with a Developer ID Application identity. The
+  `.dmg` is notarized by Apple with the notarization ticket stapled to it, so it
+  verifies locally and opens without a Gatekeeper prompt even offline; the `pb`
+  and `patchbay-mcp` binaries are signed with a secure timestamp and the
+  hardened runtime. Forks build unsigned — they have no access to the signing
+  secrets — and that path is kept working on purpose.
 
 [Unreleased]: https://github.com/pathorsAI/patchbay/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/pathorsAI/patchbay/releases/tag/v0.1.0

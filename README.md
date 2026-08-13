@@ -43,11 +43,25 @@ Swap `pb` for `patchbay-mcp` to get the MCP server, then point your agent at it:
 The panel: download `patchbay-<tag>-universal-apple-darwin.dmg` and drag it to
 Applications.
 
-> The release builds are **unsigned and un-notarized** — patchbay has no Apple
-> Developer identity yet. macOS will refuse the first launch; right-click the
-> app and choose *Open*, or run `xattr -dr com.apple.quarantine
-> /Applications/patchbay.app`. Downloaded binaries need the same treatment.
-> Building from source (below) avoids all of this.
+Release builds are **signed with a Developer ID and notarized by Apple**, and
+the notarization ticket is stapled to the `.dmg` — so it opens normally, with no
+Gatekeeper warning, even on a machine that is offline. The `pb` and
+`patchbay-mcp` binaries in the tarballs are Developer ID signed too (they are
+not notarized: a loose executable has nothing to staple a ticket to, and
+Gatekeeper does not quarantine-check a binary you extracted and ran from a
+shell).
+
+> The right-click → *Open* dance is only needed for **builds from before 0.1.0**
+> and for **forks**, which build unsigned because they have no access to the
+> signing secrets. For those: `xattr -dr com.apple.quarantine
+> /Applications/patchbay.app`. Building from source is always unaffected.
+
+Verify what you downloaded actually came from us:
+
+```sh
+spctl --assess --type open --context context:primary-signature -vv patchbay-*.dmg
+codesign -dv --verbose=4 /usr/local/bin/pb 2>&1 | grep Authority
+```
 
 Each release also carries `SHA256SUMS-*.txt`; verify with `shasum -a 256 -c`.
 

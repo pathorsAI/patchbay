@@ -41,6 +41,11 @@ jobs:
       fail-fast: false
       matrix:
         target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    # Neutral names on purpose — see the comment on the `app` job.
+    env:
+      SIGNING_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
     steps:
       - uses: actions/checkout@v4
 
@@ -56,6 +61,27 @@ jobs:
 
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }} -p patchbay-cli -p patchbay-mcp
+
+      - name: Import signing certificate
+        if: env.SIGNING_CERTIFICATE != '' && env.SIGNING_CERTIFICATE_PASSWORD != ''
+        run: bash scripts/ci/macos-keychain.sh import
+
+      # Bare CLI binaries are not notarized — a loose executable has nothing to
+      # staple a ticket to, and Gatekeeper does not quarantine-check something
+      # you extracted from a tarball and ran from a shell. Signing them is still
+      # worth it: it makes `codesign -dv` show a real identity instead of
+      # "adhoc", and it keeps the binaries usable in contexts (TCC prompts,
+      # hardened parent processes) where an ad-hoc signature is treated as
+      # untrusted.
+      - name: Sign binaries
+        if: env.SIGNING_CERTIFICATE != '' && env.SIGNING_IDENTITY != ''
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release"
+          for name in pb patchbay-mcp; do
+            codesign --force --sign "$SIGNING_IDENTITY" --timestamp --options runtime "$bin/$name"
+            codesign --verify --strict --verbose=2 "$bin/$name"
+          done
 
       - name: Package
         run: |
@@ -83,19 +109,32 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  # The desktop panel, as a universal (arm64 + x86_64) .dmg.
+      - name: Remove signing keychain
+        if: always()
+        run: bash scripts/ci/macos-keychain.sh cleanup
+
+  # The desktop panel, as a signed + notarized universal (arm64 + x86_64) .dmg.
   #
-  # Unsigned and un-notarized: no Apple Developer identity is wired into this
-  # repo yet. tauri-action skips signing when APPLE_CERTIFICATE / SIGNING_IDENTITY
-  # are absent, and tauri.conf.json sets no signingIdentity, so the bundle is
-  # produced ad-hoc. Users get Gatekeeper's "unidentified developer" prompt and
-  # must right-click > Open (or clear the quarantine bit) on first launch; the
-  # README says so. Wiring signing = add the APPLE_* secrets below and drop this
-  # comment.
+  # The secrets are bound to neutral SIGNING_* / NOTARY_* names rather than
+  # straight to APPLE_*. This is not cosmetic: a fork (or this repo before the
+  # secrets existed) resolves every `secrets.*` to the empty string, and an
+  # APPLE_SIGNING_IDENTITY of "" is not the same as an absent one — tauri-bundler
+  # reads it as Some("") and tries to sign with an identity named empty string,
+  # which fails the build. Absent means "build unsigned". So the APPLE_* names
+  # are only ever created, further down and via $GITHUB_ENV, once a step has
+  # confirmed the values are non-empty. That keeps the unsigned fork path green.
   app:
     name: panel dmg
     needs: verify
     runs-on: macos-latest
+    env:
+      SIGNING_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      SIGNING_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      NOTARY_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+      NOTARY_API_KEY_ID: ${{ secrets.APPLE_API_KEY }}
+      NOTARY_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
     steps:
       - uses: actions/checkout@v4
 
@@ -119,15 +158,40 @@ jobs:
         run: bun install --frozen-lockfile
         working-directory: app
 
+      - name: Import signing certificate
+        if: env.SIGNING_CERTIFICATE != '' && env.SIGNING_CERTIFICATE_PASSWORD != ''
+        run: bash scripts/ci/macos-keychain.sh import
+
+      # Only now, with the identity proven present in the keychain, do the
+      # APPLE_* names come into existence. tauri-bundler picks them up to sign
+      # the .app and to notarize it with the App Store Connect API key.
+      - name: Export signing environment
+        if: env.SIGNING_CERTIFICATE != '' && env.SIGNING_IDENTITY != ''
+        run: |
+          set -euo pipefail
+          echo "APPLE_SIGNING_IDENTITY=$SIGNING_IDENTITY" >> "$GITHUB_ENV"
+          echo "APPLE_TEAM_ID=$SIGNING_TEAM_ID" >> "$GITHUB_ENV"
+
+      - name: Prepare notarization key
+        if: env.NOTARY_API_KEY_ID != '' && env.NOTARY_API_ISSUER != '' && env.NOTARY_API_KEY_CONTENT != ''
+        run: |
+          set -euo pipefail
+          key_dir="$RUNNER_TEMP/private_keys"
+          mkdir -p "$key_dir"
+          key_path="$key_dir/AuthKey_${NOTARY_API_KEY_ID}.p8"
+          printf '%s' "$NOTARY_API_KEY_CONTENT" > "$key_path"
+          chmod 600 "$key_path"
+          echo "APPLE_API_ISSUER=$NOTARY_API_ISSUER" >> "$GITHUB_ENV"
+          echo "APPLE_API_KEY=$NOTARY_API_KEY_ID" >> "$GITHUB_ENV"
+          echo "APPLE_API_KEY_PATH=$key_path" >> "$GITHUB_ENV"
+
       - name: Build bundle
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # APPLE_CERTIFICATE / APPLE_SIGNING_IDENTITY / APPLE_ID are left
-          # *unset* on purpose. tauri-action imports a certificate only when
-          # APPLE_CERTIFICATE is present, and tauri-bundler signs only when it
-          # gets an identity — setting them to "" would make it try to sign with
-          # an empty identity and fail. Absent means "build unsigned".
+          # APPLE_SIGNING_IDENTITY / APPLE_TEAM_ID / APPLE_API_* arrive from
+          # $GITHUB_ENV above, and only when the secrets were non-empty. Nothing
+          # sets them to "" — see the job comment.
         with:
           # No tagName: tauri-action then only builds. The release itself is
           # assembled once, in the `release` job, so every artifact lands on one
@@ -154,14 +218,44 @@ jobs:
             find app/src-tauri/target -maxdepth 5 -type d -name bundle || true
             exit 1
           fi
-          (cd dist && shasum -a 256 ./*.dmg > SHA256SUMS-dmg.txt)
           ls -l dist
+
+      # tauri notarizes and staples the .app, then signs the .dmg around it —
+      # but it does not notarize the .dmg itself. An un-notarized disk image
+      # still makes Gatekeeper do an online check on first open, and shows a
+      # scarier prompt when the machine is offline. Submitting the dmg and
+      # stapling the ticket onto it makes the download verify locally.
+      - name: Notarize and staple dmg
+        if: env.APPLE_API_KEY_PATH != '' && env.APPLE_SIGNING_IDENTITY != ''
+        run: |
+          set -euo pipefail
+          dmg="$(find dist -name '*.dmg' | head -1)"
+          xcrun notarytool submit "$dmg" \
+            --key "$APPLE_API_KEY_PATH" \
+            --key-id "$APPLE_API_KEY" \
+            --issuer "$APPLE_API_ISSUER" \
+            --wait
+          xcrun stapler staple "$dmg"
+          xcrun stapler validate "$dmg"
+          spctl --assess --type open --context context:primary-signature -vv "$dmg"
+
+      # After stapling: the ticket is written into the dmg, so a checksum taken
+      # before this step would not match what people download.
+      - name: Checksum dmg
+        run: |
+          set -euo pipefail
+          (cd dist && shasum -a 256 ./*.dmg > SHA256SUMS-dmg.txt)
+          cat dist/SHA256SUMS-dmg.txt
 
       - uses: actions/upload-artifact@v4
         with:
           name: panel-dmg
           path: dist/*
           if-no-files-found: error
+
+      - name: Remove signing keychain
+        if: always()
+        run: bash scripts/ci/macos-keychain.sh cleanup
 
   release:
     name: publish release
