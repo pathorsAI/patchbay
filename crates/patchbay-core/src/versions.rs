@@ -665,6 +665,59 @@ pub fn spec_for(tool: &str) -> Option<&'static ToolVersionSpec> {
 }
 
 // ---------------------------------------------------------------------------
+// patchbay's own row
+// ---------------------------------------------------------------------------
+
+/// patchbay, as it appears in its own table.
+///
+/// Deliberately *not* in [`VERSIONS`]: that table is keyed by registered tools,
+/// and patchbay has no probe of itself. Callers ask for this row by putting the
+/// name in the tool list ([`crate::Registry::check_updates`] always does), and
+/// [`check_updates_with`] answers it without touching [`spec_for`].
+pub const SELF_TOOL: &str = "patchbay";
+
+/// patchbay's release feed — the same one the panel's in-app updater reads.
+pub const SELF_REPO: &str = "pathorsAI/patchbay";
+
+/// The spec behind [`SELF_TOOL`].
+///
+/// `bins` and `args` are never used: the installed version is compiled in (see
+/// [`resolve_self`]), because the code asking the question *is* the answer, and
+/// the `pb` on `PATH` may be a different build entirely. The rest is a normal
+/// GitHub-release spec, so the lookup and the update command fall out of the
+/// machinery every other tool already goes through.
+static SELF_SPEC: ToolVersionSpec = ToolVersionSpec {
+    tool: SELF_TOOL,
+    bins: &["pb"],
+    args: &["--version"],
+    parse: ParseStrategy::FirstSemver,
+    brew: None,
+    npm: None,
+    github: Some(SELF_REPO),
+    self_update: Some(SelfUpdate {
+        command: "download the DMG / curl the CLI tarball from the release page",
+        note:
+            "patchbay ships as a signed DMG and CLI tarballs; the panel offers the update in place",
+    }),
+};
+
+/// patchbay's row: the installed version without executing anything.
+///
+/// [`Source::Github`] rather than self-managed — the release page really is the
+/// index, so `latest` is a normal lookup that rides phase 3 with every other
+/// GitHub tool, sharing the same rate-limit stop. Only the *update command* is
+/// a human instruction, the way `gcloud`'s is.
+fn resolve_self(now: DateTime<Utc>) -> Resolved {
+    let mut info = VersionInfo::new(SELF_TOOL, Source::Github, now);
+    info.installed = Some(env!("CARGO_PKG_VERSION").to_string());
+    Resolved {
+        spec: &SELF_SPEC,
+        package: None,
+        info,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // install-source detection
 // ---------------------------------------------------------------------------
 
@@ -1168,7 +1221,15 @@ pub fn check_updates_with(
 
     let cache = VersionCache::load(&paths.versions_file());
     let mut specs: Vec<&'static ToolVersionSpec> = Vec::new();
+    // patchbay reports itself alongside the tools it watches, but it is not one
+    // of them: no probe, no entry in VERSIONS, nothing to exec. Held aside here
+    // and answered by `resolve_self` below.
+    let mut wants_self = false;
     for tool in tools {
+        if *tool == SELF_TOOL {
+            wants_self = true;
+            continue;
+        }
         match spec_for(tool) {
             Some(spec) => specs.push(spec),
             None if OPTED_OUT.contains(tool) => {}
@@ -1194,10 +1255,29 @@ pub fn check_updates_with(
         }
     }
 
+    // patchbay's own row obeys that same TTL — it is one more GitHub lookup,
+    // and there is no reason for it to be the one thing that asks every run.
+    let mut self_pending = false;
+    if wants_self {
+        match (
+            options.refresh,
+            cache.get_fresh(SELF_TOOL, now, options.ttl),
+        ) {
+            (false, Some(cached)) => {
+                report.from_cache += 1;
+                report.entries.push(cached.clone());
+            }
+            _ => self_pending = true,
+        }
+    }
+
     // --- phase 1: local. Ask each tool its own version, in parallel. --------
     let mut resolved: Vec<Resolved> = run_bounded(&pending, MAX_THREADS, |spec| {
         resolve_local(spec, paths, deps, now)
     });
+    if self_pending {
+        resolved.push(resolve_self(now));
+    }
 
     // --- phase 2: Homebrew. ONE call, however many brew tools there are. ----
     let brew_wanted = resolved.iter().any(|r| r.info.source == Source::Homebrew);
@@ -2341,6 +2421,94 @@ mod tests {
 
         assert_eq!(report.network_calls, 0);
         assert_eq!(http.call_count(), 0);
+    }
+
+    // --- patchbay's own row -------------------------------------------------
+
+    #[test]
+    fn test_patchbay_reports_itself_without_execing_a_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        // Nothing on PATH and a runner that refuses everything: the row must
+        // still come out installed, because the version is compiled in.
+        let bins = FakeBinaries::none();
+        let runner = FakeRunner::new(&[]);
+        let brew = FakeBrew::new(BREW_OUTDATED);
+        let http = StubHttp::responding(HttpResponse::new(200, r#"{"tag_name":"v99.0.0"}"#));
+
+        let report = check_updates_with(
+            &Paths::for_test(dir.path()),
+            &[SELF_TOOL],
+            CheckOptions::default(),
+            &deps(&runner, &brew, &http, &bins),
+        );
+
+        assert_eq!(report.entries.len(), 1);
+        let entry = &report.entries[0];
+        assert_eq!(entry.tool, "patchbay");
+        assert_eq!(
+            entry.installed.as_deref(),
+            Some(env!("CARGO_PKG_VERSION")),
+            "the build asking the question is the build installed"
+        );
+        assert_eq!(entry.latest.as_deref(), Some("99.0.0"));
+        assert_eq!(entry.source, Source::Github);
+        assert!(entry.update_available());
+        // A human instruction, like gcloud's — there is no command that
+        // upgrades patchbay from a package index.
+        assert_eq!(
+            entry.update_command.as_deref(),
+            Some("download the DMG / curl the CLI tarball from the release page")
+        );
+        assert_eq!(
+            http.last_url().unwrap(),
+            "https://api.github.com/repos/pathorsAI/patchbay/releases/latest"
+        );
+        assert_eq!(runner.calls.load(Ordering::SeqCst), 0, "nothing was exec'd");
+        assert_eq!(report.brew_calls, 0);
+    }
+
+    #[test]
+    fn test_patchbays_own_row_is_cached_like_every_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::for_test(dir.path());
+        let now = Utc::now();
+
+        let mut cached = VersionInfo::new(SELF_TOOL, Source::Github, now);
+        cached.installed = Some("0.2.0".into());
+        cached.latest = Some("0.3.0".into());
+        let mut cache = VersionCache::default();
+        cache.put(cached);
+        cache.save(&paths.versions_file()).unwrap();
+
+        let runner = FakeRunner::new(&[]);
+        let brew = FakeBrew::new(BREW_OUTDATED);
+        let http = StubHttp::failing("GitHub must not be asked inside the TTL");
+        let bins = FakeBinaries::none();
+
+        let report = check_updates_with(
+            &paths,
+            &[SELF_TOOL],
+            CheckOptions::default(),
+            &deps(&runner, &brew, &http, &bins),
+        );
+        assert_eq!(report.from_cache, 1);
+        assert_eq!(report.network_calls, 0);
+        assert_eq!(http.call_count(), 0);
+        assert_eq!(report.entries[0].latest.as_deref(), Some("0.3.0"));
+    }
+
+    #[test]
+    fn test_patchbay_is_not_a_registered_tool_and_needs_no_version_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = crate::Registry::all(Paths::for_test(dir.path()));
+        assert!(
+            !registry.tool_names().contains(&SELF_TOOL),
+            "patchbay probes CLIs; it is not one of them"
+        );
+        assert!(
+            spec_for(SELF_TOOL).is_none(),
+            "the self row lives outside VERSIONS on purpose — see SELF_SPEC"
+        );
     }
 
     #[test]

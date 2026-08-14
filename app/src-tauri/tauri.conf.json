@@ -25,8 +25,17 @@
       "csp": null
     }
   },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/pathorsAI/patchbay/releases/latest/download/latest.json"
+      ],
+      "pubkey": "TAURI_UPDATER_PUBKEY_PLACEHOLDER"
+    }
+  },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": "all",
     "icon": [
       "icons/32x32.png",

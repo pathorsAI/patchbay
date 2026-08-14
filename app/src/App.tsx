@@ -10,6 +10,7 @@ import { McpView } from "./components/McpView";
 import { Sidebar } from "./components/Sidebar";
 import { ToolCard } from "./components/ToolCard";
 import { ToolDetail } from "./components/ToolDetail";
+import { UpdateBanner } from "./components/UpdateBanner";
 
 const POLL_MS = 30_000;
 /** Countdowns must not go stale between polls. */
@@ -195,6 +196,10 @@ export default function App() {
         />
 
         <main className="board">
+          {/* Above every view, in the flow: an update is worth saying once,
+              and never worth covering the thing the window is for. */}
+          <UpdateBanner />
+
           {view === "keys" && <KeysView />}
           {view === "mcp" && <McpView />}
 

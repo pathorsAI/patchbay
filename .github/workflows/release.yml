@@ -192,6 +192,20 @@ jobs:
           # APPLE_SIGNING_IDENTITY / APPLE_TEAM_ID / APPLE_API_* arrive from
           # $GITHUB_ENV above, and only when the secrets were non-empty. Nothing
           # sets them to "" — see the job comment.
+          #
+          # The minisign keypair behind the in-app updater. This one is NOT
+          # optional the way the Apple identity is: `plugins.updater.pubkey` in
+          # tauri.conf.json makes signing mandatory, so a checkout without the
+          # private key cannot build the panel at all — tauri stops with "a
+          # public key has been found, but no private key". That is the right
+          # trade (an unsigned updater artifact is worse than none), but it does
+          # mean a fork must either add these two secrets or drop the
+          # `plugins.updater` block before it can build the .app.
+          #
+          # The password is legitimately empty for a key generated without one,
+          # so it is passed through as-is rather than gated on being non-empty.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           # No tagName: tauri-action then only builds. The release itself is
           # assembled once, in the `release` job, so every artifact lands on one
@@ -219,6 +233,50 @@ jobs:
             exit 1
           fi
           ls -l dist
+
+      # The other half of the panel's release: what the in-app updater reads.
+      #
+      # `createUpdaterArtifacts` makes tauri tar the finished .app (after it has
+      # been notarized and stapled, so an updated copy verifies offline too) and
+      # sign the tarball with the minisign key. The feed is a `latest.json` we
+      # write here rather than one tauri produces, because the download URL is
+      # only knowable once we have decided what the asset is called.
+      #
+      # Both macOS platform keys point at the same file: the build is universal,
+      # so one bundle genuinely is the update for both architectures. The
+      # updater matches on the key, and an Intel Mac that finds no
+      # `darwin-x86_64` entry concludes there is no update for it.
+      - name: Collect updater bundle and latest.json
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          bundle="app/src-tauri/target/universal-apple-darwin/release/bundle/macos"
+          tarball="$bundle/patchbay.app.tar.gz"
+          if [ ! -f "$tarball" ] || [ ! -f "$tarball.sig" ]; then
+            echo "::error::no signed updater bundle at $tarball(.sig) — is TAURI_SIGNING_PRIVATE_KEY set?"
+            ls -l "$bundle" || true
+            exit 1
+          fi
+          asset="patchbay-$tag-universal-apple-darwin.app.tar.gz"
+          cp "$tarball" "dist/$asset"
+          cp "$tarball.sig" "dist/$asset.sig"
+          # Version without the leading v: the updater parses it as semver and
+          # compares it against the running app's own version.
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/$tag/$asset"
+          jq -n \
+            --arg version "${{ needs.verify.outputs.version }}" \
+            --arg pub_date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg signature "$(cat "$tarball.sig")" \
+            --arg url "$url" \
+            '{
+              version: $version,
+              pub_date: $pub_date,
+              platforms: {
+                "darwin-aarch64": { signature: $signature, url: $url },
+                "darwin-x86_64": { signature: $signature, url: $url }
+              }
+            }' > dist/latest.json
+          cat dist/latest.json
 
       # tauri notarizes and staples the .app, then signs the .dmg around it —
       # but it does not notarize the .dmg itself. An un-notarized disk image
@@ -288,7 +346,14 @@ jobs:
           # Appends the commit/PR list under whatever body we supplied.
           generate_release_notes: true
           fail_on_unmatched_files: true
+          # `*.tar.gz` covers both the CLI tarballs and the panel's updater
+          # bundle. The `.sig` and `latest.json` beside it are what the in-app
+          # updater fetches — `latest.json` has to be a release asset under this
+          # exact name, because the endpoint in tauri.conf.json is the
+          # `releases/latest/download/latest.json` redirect.
           files: |
             artifacts/*.tar.gz
+            artifacts/*.tar.gz.sig
+            artifacts/latest.json
             artifacts/*.dmg
             artifacts/SHA256SUMS-*.txt

@@ -75,7 +75,10 @@ neon         2.38.2          3.1.1           brew           brew upgrade neonctl
 wrangler     4.105.0         4.122.0         bun            bun add -g wrangler@latest
 vercel       42.2.0          58.11.0         pnpm           pnpm add -g vercel@latest
 gcloud       578.0.0         —               self-managed
+patchbay     0.2.0           0.3.0           github         download the DMG / curl the CLI tarball from the release page
 ```
+
+**patchbay reports itself** in that table too — installed is the build answering the question, latest is the newest GitHub release — because a tool that tells you twenty-three CLIs are behind while saying nothing about itself is the one row you would have to remember to check by hand. In the panel you do not even get the command: when a newer *signed* build exists it offers `update and relaunch` in a banner above the board, verifies the signature, installs in place and restarts.
 
 patchbay works out **how each tool was installed** and asks the right place. Every Homebrew tool is answered by a single `brew outdated --json=v2` call, npm/bun/pnpm globals by one small registry request each, and self-updating vendor CLIs (`gcloud`, `az`) by nothing at all — they get their own update command instead of a made-up version number. `latest: —` always means "could not check", never "up to date".
 

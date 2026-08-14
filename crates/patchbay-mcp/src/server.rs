@@ -474,6 +474,11 @@ install source). Say 'could not check', not 'current'.
 - `update_command` is the exact command for THIS machine's install — `brew upgrade gh` and \
 `npm install -g wrangler@latest` are not interchangeable, so use the one given rather than \
 guessing at a package manager. Offer it; do not run it without being asked.
+- One entry is `patchbay` itself. It is NOT a connection — it will never appear on \
+list_connections and has no profiles to switch — it is patchbay reporting its own version against \
+its newest GitHub release. Its `update_command` is an instruction for the human (download the DMG, \
+curl the CLI tarball); the desktop panel offers the same update in place, so if the user runs the \
+panel, tell them to take it there.
 - `advisories[]` is curated deprecation knowledge, independent of version numbers: renames, \
 removals, end-of-life dates. `removed` and `unmaintained` entries are worth raising even when the \
 user only asked about versions. Every one carries a source `url` — pass it on.
