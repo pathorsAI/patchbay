@@ -431,6 +431,13 @@ button {
   grid-template-rows: auto 1fr auto;
   align-content: space-between;
   min-width: 0;
+  /* A <button>, so: full width of its grid cell, text left, no UA chrome.
+     `font`/`color` already come from the global button reset. */
+  width: 100%;
+  margin: 0;
+  text-align: left;
+  -webkit-appearance: none;
+  appearance: none;
   padding: 12px 13px;
   border: 1px solid var(--line);
   border-radius: 10px;
@@ -634,6 +641,12 @@ button {
   display: flex;
   align-items: flex-start;
   gap: 8px;
+  /* A <button> wearing a code face: reset the UA's centring and width. */
+  width: 100%;
+  margin: 0;
+  text-align: left;
+  -webkit-appearance: none;
+  appearance: none;
   padding: 4px 6px;
   border: 1px solid var(--line);
   border-radius: 4px;
@@ -865,6 +878,7 @@ dialog.detail {
   border: 1px solid var(--line-soft);
   border-radius: 8px;
   background: var(--panel-2);
+  transition: border-color 90ms linear, background 90ms linear;
 }
 
 .dprofile.is-active {
@@ -904,6 +918,9 @@ dialog.detail {
 }
 
 .dprofile-id {
+  /* A <span> now — the switch target is a <button>, which may only contain
+     phrasing content — so the block box it used to get from <div> is set here. */
+  display: block;
   margin-top: 3px;
   font-family: var(--mono);
   font-size: 10px;
@@ -920,13 +937,22 @@ dialog.detail {
 
 /* Switching *is* what a profile row is for, so the row's information is the
    target — not a 60px button beside it. The whole row lights up; the foot
-   names the actions. The active row has nothing to switch to and stays inert. */
-.dprofile {
-  transition: border-color 90ms linear, background 90ms linear;
-}
+   names the actions. The active row has nothing to switch to and stays inert.
 
+   The body is a real <button>, so its chrome is reset back to the block of
+   text it looks like: a UA button is a centred inline-block with its own
+   border, padding and background, none of which a full-width row wants. */
 .dprofile-body {
+  display: block;
+  width: 100%;
   min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  text-align: left;
+  -webkit-appearance: none;
+  appearance: none;
 }
 
 .dprofile.is-armed .dprofile-body {
@@ -939,7 +965,7 @@ dialog.detail {
   background: var(--panel);
 }
 
-.dprofile.is-armed .dprofile-body[aria-disabled="true"] {
+.dprofile.is-armed .dprofile-body:disabled {
   cursor: default;
 }
 

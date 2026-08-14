@@ -325,7 +325,7 @@ const MARKS: Record<string, Mark> = {
   },
 };
 
-export function ToolLogo({ tool, size = 20 }: { tool: string; size?: number }) {
+export function ToolLogo({ tool, size = 20 }: Readonly<{ tool: string; size?: number }>) {
   const mark = MARKS[tool];
   const style = {
     width: size,
@@ -338,8 +338,10 @@ export function ToolLogo({ tool, size = 20 }: { tool: string; size?: number }) {
     return (
       <span className="logo" style={style} title={mark.title} aria-hidden="true">
         <svg viewBox={mark.viewBox} width={box} height={box} preserveAspectRatio="xMidYMid meet">
-          {mark.layers.map((layer, i) => (
-            <path key={i} d={layer.d} fill={layer.fill} transform={layer.transform} />
+          {/* Keyed on the path data: a mark's layers are a fixed literal, and
+              the geometry is what makes a layer that layer. */}
+          {mark.layers.map((layer) => (
+            <path key={layer.d} d={layer.d} fill={layer.fill} transform={layer.transform} />
           ))}
         </svg>
       </span>

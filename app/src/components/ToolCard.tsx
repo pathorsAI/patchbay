@@ -1,4 +1,3 @@
-import type { KeyboardEvent } from "react";
 import { headlineExpiry } from "../expiry";
 import type { Panel } from "../panel";
 import { STATE_LABEL, type ToolStatus } from "../types";
@@ -11,8 +10,17 @@ import { ToolLogo } from "./ToolLogo";
  * is a status surface, so every card must be the same shape and nothing on it
  * may wrap. Everything you can *do* to a tool lives in the detail view; the
  * card's only interaction is opening it.
+ *
+ * That single interaction is why the card is a real <button> rather than an
+ * <article> wearing role="button": the focus ring, the Enter/Space handling and
+ * the announced role all come from the element instead of being re-implemented
+ * beside it. A button may only contain phrasing content, so the three rows are
+ * spans rather than <header>/<h2>/<footer>. Nothing inside the card is itself
+ * interactive, so the flattening costs nothing — and the `title` tooltips on
+ * the badges keep working, which an absolutely-positioned overlay button would
+ * have swallowed.
  */
-export function ToolCard({ status, panel }: { status: ToolStatus; panel: Panel }) {
+export function ToolCard({ status, panel }: Readonly<{ status: ToolStatus; panel: Panel }>) {
   const active = status.profiles.find((p) => p.id === status.active) ?? null;
   const state = status.connection_state;
   const profiles = status.profiles.length;
@@ -24,30 +32,20 @@ export function ToolCard({ status, panel }: { status: ToolStatus; panel: Panel }
     (k) => k.expiry_state === "expired" || k.expiry_state === "expiring_soon",
   ).length;
 
-  const open = () => panel.open(status.tool);
-  const onKey = (e: KeyboardEvent) => {
-    if (e.key === "Enter" || e.key === " ") {
-      e.preventDefault();
-      open();
-    }
-  };
-
   return (
-    <article
+    <button
+      type="button"
       className={`card${status.installed ? "" : " card-absent"}`}
-      onClick={open}
-      onKeyDown={onKey}
-      role="button"
-      tabIndex={0}
+      onClick={() => panel.open(status.tool)}
       aria-label={`${status.tool}, ${STATE_LABEL[state]}`}
     >
-      <header className="card-head">
+      <span className="card-head">
         <ToolLogo tool={status.tool} size={20} />
-        <h2 className="tool">{status.tool}</h2>
+        <span className="tool">{status.tool}</span>
         <span className={`state-dot state-${state}`} title={STATE_LABEL[state]} />
-      </header>
+      </span>
 
-      <div className="card-active">
+      <span className="card-active">
         {active ? (
           <span className="active-id" title={active.id}>
             {active.label}
@@ -57,9 +55,9 @@ export function ToolCard({ status, panel }: { status: ToolStatus; panel: Panel }
             {status.installed ? "— not connected" : "— not installed"}
           </span>
         )}
-      </div>
+      </span>
 
-      <footer className="card-foot">
+      <span className="card-foot">
         {/* No profiles means no credential to date — a "no expiry" chip there
             would read as a fact about a login that does not exist. */}
         {profiles > 0 && <ExpiryChip expiresAt={headlineExpiry(status)} now={panel.now} />}
@@ -83,7 +81,7 @@ export function ToolCard({ status, panel }: { status: ToolStatus; panel: Panel }
             {status.notes.length}
           </span>
         )}
-      </footer>
-    </article>
+      </span>
+    </button>
   );
 }

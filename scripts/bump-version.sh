@@ -47,10 +47,10 @@ collect() {
     tauri_version="$(read_tauri_conf)"
     pkg_version="$(read_app_pkg)"
 
-    [ -n "$root_version" ] || die "no version found in $root_cargo"
-    [ -n "$app_cargo_version" ] || die "no version found in $app_cargo"
-    [ -n "$tauri_version" ] || die "no version found in $tauri_conf"
-    [ -n "$pkg_version" ] || die "no version found in $app_pkg"
+    [[ -n "$root_version" ]] || die "no version found in $root_cargo"
+    [[ -n "$app_cargo_version" ]] || die "no version found in $app_cargo"
+    [[ -n "$tauri_version" ]] || die "no version found in $tauri_conf"
+    [[ -n "$pkg_version" ]] || die "no version found in $app_pkg"
 }
 
 report() {
@@ -65,16 +65,16 @@ check() {
     local expected="${1:-}"
     collect
 
-    if [ "$root_version" != "$app_cargo_version" ] ||
-        [ "$root_version" != "$tauri_version" ] ||
-        [ "$root_version" != "$pkg_version" ]; then
+    if [[ "$root_version" != "$app_cargo_version" ]] ||
+        [[ "$root_version" != "$tauri_version" ]] ||
+        [[ "$root_version" != "$pkg_version" ]]; then
         echo "bump-version: versions disagree:" >&2
         report >&2
         echo "run: scripts/bump-version.sh <semver>" >&2
         exit 1
     fi
 
-    if [ -n "$expected" ] && [ "$expected" != "$root_version" ]; then
+    if [[ -n "$expected" ]] && [[ "$expected" != "$root_version" ]]; then
         die "expected version $expected, but the tree says $root_version"
     fi
 
@@ -119,7 +119,7 @@ bump() {
 case "${1:-}" in
 "" | -h | --help)
     sed -n '2,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
-    [ -n "${1:-}" ] || exit 1
+    [[ -n "${1:-}" ]] || exit 1
     ;;
 --check)
     check "${2:-}"

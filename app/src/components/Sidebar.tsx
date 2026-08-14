@@ -68,6 +68,7 @@ export const Sidebar = forwardRef<HTMLInputElement, Props>(function Sidebar(
         <ul className="side-list">
           <li>
             <button
+              type="button"
               className={`side-item${onBoard && filters.category === null ? " is-on" : ""}`}
               onClick={() => filter({ ...filters, category: null })}
             >
@@ -78,6 +79,7 @@ export const Sidebar = forwardRef<HTMLInputElement, Props>(function Sidebar(
           {categories.map((c) => (
             <li key={c}>
               <button
+                type="button"
                 className={`side-item${onBoard && filters.category === c ? " is-on" : ""}`}
                 onClick={() => filter({ ...filters, category: filters.category === c ? null : c })}
               >
@@ -94,6 +96,7 @@ export const Sidebar = forwardRef<HTMLInputElement, Props>(function Sidebar(
         <ul className="side-list">
           <li>
             <button
+              type="button"
               className={`side-item${onBoard && filters.state === null ? " is-on" : ""}`}
               onClick={() => filter({ ...filters, state: null })}
             >
@@ -106,6 +109,7 @@ export const Sidebar = forwardRef<HTMLInputElement, Props>(function Sidebar(
             return (
               <li key={s}>
                 <button
+                  type="button"
                   className={`side-item${onBoard && filters.state === s ? " is-on" : ""}${n === 0 ? " is-void" : ""}`}
                   onClick={() => filter({ ...filters, state: filters.state === s ? null : s })}
                   disabled={n === 0}
@@ -126,6 +130,7 @@ export const Sidebar = forwardRef<HTMLInputElement, Props>(function Sidebar(
         <ul className="side-list">
           <li>
             <button
+              type="button"
               className={`side-item${view === "keys" ? " is-on" : ""}`}
               onClick={() => onView(view === "keys" ? "board" : "keys")}
               aria-pressed={view === "keys"}
@@ -138,6 +143,7 @@ export const Sidebar = forwardRef<HTMLInputElement, Props>(function Sidebar(
           </li>
           <li>
             <button
+              type="button"
               className={`side-item${view === "mcp" ? " is-on" : ""}`}
               onClick={() => onView(view === "mcp" ? "board" : "mcp")}
               aria-pressed={view === "mcp"}
