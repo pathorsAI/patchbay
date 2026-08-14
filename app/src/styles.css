@@ -401,6 +401,28 @@ button {
   font-size: 12px;
 }
 
+/* A newer patchbay is news, not a fault: same row, accent instead of risk. */
+.banner-update {
+  align-items: center;
+  border-color: var(--line);
+  background: var(--neutral-wash);
+}
+
+.banner-update .glyph {
+  color: var(--accent);
+}
+
+.banner-text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.banner-actions {
+  display: flex;
+  flex: none;
+  gap: 6px;
+}
+
 /* ---------- card ---------- */
 
 /* Three rows, one height, identical padding — see .grid. */

@@ -20,6 +20,10 @@ patchbay-core = { path = "../../crates/patchbay-core" }
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 tauri = { version = "2", features = [] }
+# In-app self-update: the updater checks the signed release feed, `process`
+# is what relaunches into the build it just installed.
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread"] }

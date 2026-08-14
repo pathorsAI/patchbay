@@ -195,8 +195,13 @@ impl Registry {
     ///
     /// Seconds, not milliseconds: this is the only entry point in patchbay that
     /// both spawns processes and makes outbound requests.
+    ///
+    /// patchbay is in the list too. A tool that tells you twenty-three CLIs are
+    /// behind while saying nothing about itself is the one row people would
+    /// have to remember to check by hand.
     pub fn check_updates(&self, options: CheckOptions) -> CheckReport {
-        let tools = self.tool_names();
+        let mut tools = self.tool_names();
+        tools.push(versions::SELF_TOOL);
         versions::check_updates(&self.paths, &tools, options)
     }
 

@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **patchbay updates itself** — the panel checks the signed release feed a
+  couple of seconds after launch and, when a newer build exists, says so in a
+  slim banner above the board: `update and relaunch`, or `not now`. Applying is
+  always a click — patchbay is a thing you open to answer a question about your
+  logins, and an update must never be what happens instead — and the banner sits
+  in the flow rather than over the board, so the answer you came for is never
+  covered. The download is verified against a minisign public key compiled into
+  the app before anything is installed, which is the whole reason this is
+  allowed to be automatic at all. A failed check is silent: an offline machine
+  has no update to offer, and that is not news. `not now` lasts for the session
+  and is written nowhere, because something you have neither accepted nor
+  refused should be asked again next launch. `pb check-updates` gained the
+  matching row: patchbay reports its own installed version (the build answering
+  the question, not whichever `pb` is on `PATH`) against the newest GitHub
+  release, on the same 24-hour cache and the same shared rate limit as every
+  other tool. Its `UPDATE WITH` is a human instruction — download the DMG, curl
+  the CLI tarball — the way `gcloud`'s is, rather than a command that does not
+  exist.
+
 - **The panel writes to the key vault** — `add key` opens a form (id, provider,
   label, a masked secret field, with purpose, scopes, expiry, endpoint and the
   rotation checkbox folded away), and every row gets a trash affordance behind

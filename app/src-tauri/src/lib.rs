@@ -230,6 +230,12 @@ async fn mcp_list() -> CmdResult<Vec<McpClient>> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Self-update. The updater reads the signed feed named in
+        // tauri.conf.json; `process` supplies the relaunch that takes the user
+        // into the build it just installed. Both are inert until the front end
+        // calls them — see `src/lib/update.ts`.
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         // A blank window is nearly always "the webview could not load its
         // source" — a debug binary run without `tauri dev` points at the Vite
         // URL and finds nothing there. Say which URL, and whether it loaded.
