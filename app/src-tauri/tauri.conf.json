@@ -30,7 +30,7 @@
       "endpoints": [
         "https://github.com/pathorsAI/patchbay/releases/latest/download/latest.json"
       ],
-      "pubkey": "TAURI_UPDATER_PUBKEY_PLACEHOLDER"
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEYzQUZFMUYzRTRBRUQ4OTUKUldTVjJLN2s4K0d2ODNnSDBIRGV0TGNnaDJMVVFoWlpmeHJpYnY5TlR3R2ZjME94ME8xZm1MVm4K"
     }
   },
   "bundle": {
