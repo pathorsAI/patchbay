@@ -5,7 +5,64 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.2] - 2026-08-14
+
+### Fixed
+
+- **Verifying a profile now verifies *that* profile.** The panel's per-row
+  check has always sent the profile id, and the Tauri command has always thrown
+  it away and asked about whichever profile was active — so on a `gcloud` board
+  with two configurations, pressing "verify" on the inactive one reported the
+  active account's answer under the inactive one's row. Two rows, one truth,
+  filed under both. The command now calls `Registry::verify_profile`, and
+  `GcloudProbe` implements it: `gcloud auth print-access-token --account=<the
+  account that configuration names>`, which is per-invocation and so never
+  activates what it checks.
+
+- **`gcloud` no longer reports a login as expired because its access token
+  cache went stale.** `access_tokens.db` has a `token_expiry` column, and it is
+  not the answer it looks like: it dates a one-hour OAuth access token that
+  gcloud refreshes silently on the next call. Read as the profile's expiry it
+  marked a working login "expired 3d" the moment you stopped using it for an
+  afternoon, counted it in the board's expired tally, and — because a token
+  minted *this second* is one hour out, well inside the 24h attention window —
+  meant `gcloud` could never once read Connected. What actually ends a gcloud
+  session is revocation or an org reauthentication policy, and neither is
+  written to this machine, so the expiry is now `None` (unknown, as it is) with
+  a note saying so and pointing at verify. `pb verify gcloud` is what answers
+  the question that column was pretending to.
+
+- **A failed `gcloud` check reads as one sentence instead of gcloud's error.**
+  A reauth failure is four lines of shell instructions, which the panel joined
+  into `…non-interactive execution.; Please run:; $ gcloud auth login; to
+  obtain…`. Reauthentication, a revoked credential and a missing credential are
+  now each named in a line that ends with the command that fixes it, for the
+  account it is actually about; anything else keeps gcloud's own first line
+  minus the prefix that only repeats what patchbay just ran. An account with no
+  row in `credentials.db` is answered from tier 1 without spawning anything,
+  and a `gcloud` that is not on `PATH` is `unsupported` rather than an error.
+
+- **`gcloud`'s IAM hint is a command you can run.** It carried `<project>` and
+  `<account>` placeholders while patchbay had both values on the row directly
+  above, and its `--flatten=bindings[].members` was unquoted — a glob, which
+  zsh answers with `no matches found` before gcloud ever starts. Now filled in,
+  quoted, and the report names the account as its subject.
+
+- **`firebase` and `neon` were dating the same borrowed hour.** Both stored an
+  OAuth access token's expiry as the profile's, and both papered over it with a
+  note — so the board read `firebase — expired 235d` and `neon — expired 12d`
+  for two logins that work, and counted them in the expired tally on every
+  refresh. Neither now reports an expiry it cannot stand behind, and both draw
+  the line at the thing that actually decides it: `firebase` keeps the hour
+  only for a grant with no `refresh_token` beside it (presence read through
+  `serde::de::IgnoredAny`, so the value is still never held), and `neon` keeps
+  it only for a grant without an `offline` scope, where the hour really is the
+  whole login. The notes say what is unknown instead of apologising for what
+  was shown.
+
+- The permissions button no longer offers to "re-read scopes" for a tool
+  patchbay has no scope reader for, where a second press cannot say anything
+  the first did not.
 
 ## [0.3.1] - 2026-08-14
 

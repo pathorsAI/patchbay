@@ -7,15 +7,20 @@
 //! * `user` — the decoded id-token claims of the primary account. `email` is
 //!   the only field patchbay takes.
 //! * `tokens` — `{ expires_at (epoch **milliseconds**), refresh_token,
-//!   access_token, scopes, scope, ... }`. The two token values are
-//!   [`serde::de::IgnoredAny`]; only the expiry and the scope list are read.
+//!   access_token, scopes, scope, ... }`. `access_token` is never named at all;
+//!   `refresh_token` is [`serde::de::IgnoredAny`], so its presence is known and
+//!   its value is not. Only the expiry and the scope list are read.
 //! * `additionalAccounts` — `[{ user, tokens }]` for `firebase login:add`.
 //! * `activeProjects` — a project alias per working directory, which is why
 //!   patchbay reports the *account*, not the project, as the profile.
 //!
-//! The access token is an hour-long OAuth token that firebase-tools refreshes
-//! silently, so an expiry in the past is normal and is explained in a note
-//! rather than raised as a failure.
+//! `tokens.expires_at` dates an hour-long OAuth access token, not the login:
+//! where a `refresh_token` sits beside it, firebase-tools mints a new one
+//! silently on the next command. So that expiry is reported only for a grant
+//! that has no refresh token — for every ordinary login it is `None`, because
+//! what ends the session is the refresh token being revoked and nothing here
+//! records when that happens. The alternative is a board that says "expired
+//! 235d" about an account you used this morning.
 
 use serde::Deserialize;
 
@@ -54,14 +59,25 @@ struct User {
     email: Option<String>,
 }
 
-/// `access_token` / `refresh_token` / `id_token` are deliberately absent from
-/// this struct: what serde never names, it never holds.
+/// `access_token` and `id_token` are deliberately absent from this struct: what
+/// serde never names, it never holds. `refresh_token` is named but typed
+/// [`serde::de::IgnoredAny`], which is the same guarantee — the field records
+/// only that a refresh token is *there*, which is what decides whether the
+/// hour-long access token expiry means anything.
 #[derive(Deserialize)]
 struct Tokens {
     #[serde(default)]
     expires_at: Option<i64>,
     #[serde(default)]
+    refresh_token: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
     scopes: Vec<String>,
+}
+
+impl Tokens {
+    fn refreshable(&self) -> bool {
+        self.refresh_token.is_some()
+    }
 }
 
 impl FirebaseProbe {
@@ -72,15 +88,22 @@ impl FirebaseProbe {
     }
 
     fn profile(email: &str, tokens: Option<&Tokens>) -> Profile {
-        let expires_at = tokens
-            .and_then(|t| t.expires_at)
-            .and_then(parse_epoch_millis);
+        // The hour is only the truth for a grant that cannot refresh itself.
+        let refreshable = tokens.is_some_and(Tokens::refreshable);
+        let expires_at = (!refreshable)
+            .then(|| {
+                tokens
+                    .and_then(|t| t.expires_at)
+                    .and_then(parse_epoch_millis)
+            })
+            .flatten();
         Profile::new(email)
             .expires_at(expires_at)
             .with_meta(
                 "scopes",
                 tokens.map(|t| t.scopes.clone()).unwrap_or_default(),
             )
+            .with_meta("refreshable", refreshable)
             .with_meta("auth", "google oauth")
     }
 }
@@ -143,11 +166,14 @@ impl Probe for FirebaseProbe {
             return Ok(status);
         }
 
-        status.note(
-            "the stored access token lasts about an hour; firebase-tools refreshes it silently, \
-             so an expiry in the past does not mean you are logged out"
-                .to_string(),
-        );
+        if status.profiles.iter().any(|p| p.expires_at.is_none()) {
+            status.note(
+                "firebase-tools records no expiry for a login: the token it dates is an hour-long \
+                 access token it refreshes silently, and revocation of the refresh token behind it \
+                 is decided by Google, not written here"
+                    .to_string(),
+            );
+        }
         if !store.active_projects.is_empty() {
             status.note(format!(
                 "the active Firebase project is per-directory ({} recorded); the profile above is \
@@ -247,7 +273,7 @@ mod tests {
         "scopes": ["email", "https://www.googleapis.com/auth/cloud-platform"]
       },
       "additionalAccounts": [
-        { "user": { "email": "ops@example.com" }, "tokens": { "expires_at": 1766355597325, "access_token": "fake-fixture-second" } }
+        { "user": { "email": "ops@example.com" }, "tokens": { "expires_at": 1766355597325, "access_token": "fake-fixture-second", "refresh_token": "fake-fixture-second-refresh" } }
       ],
       "activeProjects": { "/work/app": "app-prod", "/work/site": "site-dev" }
     }"#;
@@ -260,14 +286,43 @@ mod tests {
         assert_eq!(ids, vec!["dev@example.com", "ops@example.com"]);
         assert_eq!(status.active.as_deref(), Some("dev@example.com"));
         assert_eq!(status.profiles[0].meta["primary"], true);
+        assert_eq!(status.profiles[0].meta["scopes"][0], "email");
+        assert!(status.notes.iter().any(|n| n.contains("per-directory")));
+        assert!(status.notes.iter().any(|n| n.contains("--account")));
+    }
+
+    #[test]
+    fn test_an_hourly_token_beside_a_refresh_token_is_not_the_logins_expiry() {
+        // `expires_at` in STORE is 2025-12-21 — long past, and reported as the
+        // profile's expiry it put a working account on the board as "expired
+        // 235d" and counted it among the tool's dead logins.
+        let (_dir, home) = fixture(STORE);
+        let status = FirebaseProbe::new(Paths::for_test(&home)).status().unwrap();
+        assert!(status.profiles.iter().all(|p| p.expires_at.is_none()));
+        assert!(status
+            .profiles
+            .iter()
+            .all(|p| p.meta["refreshable"] == true));
+        assert_eq!(
+            status.connection_state(),
+            crate::types::ConnectionState::Connected
+        );
+        assert!(status.notes.iter().any(|n| n.contains("records no expiry")));
+    }
+
+    #[test]
+    fn test_a_grant_with_no_refresh_token_keeps_the_hour_it_really_has() {
+        let (_dir, home) = fixture(
+            r#"{ "user": { "email": "dev@example.com" },
+                 "tokens": { "expires_at": 1766355597325, "access_token": "fake-fixture-access" } }"#,
+        );
+        let status = FirebaseProbe::new(Paths::for_test(&home)).status().unwrap();
+        assert_eq!(status.profiles[0].meta["refreshable"], false);
         // epoch milliseconds, not seconds.
         assert_eq!(
             status.profiles[0].expires_at.unwrap().to_rfc3339(),
             "2025-12-21T22:19:57.325+00:00"
         );
-        assert_eq!(status.profiles[0].meta["scopes"][0], "email");
-        assert!(status.notes.iter().any(|n| n.contains("per-directory")));
-        assert!(status.notes.iter().any(|n| n.contains("--account")));
     }
 
     #[test]

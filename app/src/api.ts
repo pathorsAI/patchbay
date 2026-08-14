@@ -19,9 +19,8 @@ export const verify = (tool: string) => invoke<VerifyOutcome>("verify", { tool }
 
 /**
  * Verify one profile. The panel always asks this way — "is this login still
- * good?" is a question about a credential, not about a tool. Core's per-profile
- * verify is still landing, so today the command answers about the active
- * profile; the profile id is already on the wire for when it does.
+ * good?" is a question about a credential, not about a tool, and the answer is
+ * about the profile named here rather than whichever one happens to be active.
  */
 export const verifyProfile = (tool: string, profile: string) =>
   invoke<VerifyOutcome>("verify_profile", { tool, profile });

@@ -194,9 +194,12 @@ function PermissionsSection({
   const loading = report === null;
   const hasScopeReader = PERMISSIONS_TOOLS.has(tool);
 
+  // "re-read" only where something was read. A tool patchbay has no scope
+  // reader for answers "not supported", and offering to re-read that implies a
+  // second press could say something different.
   let readLabel: string;
   if (loading) readLabel = "reading…";
-  else if (report) readLabel = "re-read scopes";
+  else if (report?.supported) readLabel = "re-read scopes";
   else readLabel = "read scopes";
 
   return (

@@ -60,16 +60,12 @@ async fn verify(tool: String) -> CmdResult<VerifyOutcome> {
 ///
 /// The panel verifies per profile row, because "is this login still good?" is a
 /// question about a credential, not about a tool — on a board where `gcloud`
-/// has two configurations, a single tool-level answer is ambiguous at best.
-///
-/// TODO(core): swap the body for `registry.verify_profile(&tool, &profile)`
-/// once it lands — it is this one line. Until then every row asks about the
-/// active profile, which is the honest subset of the answer rather than a
-/// wrong one, and the UI already passes the profile id it wants.
+/// has two configurations, a single tool-level answer is worse than ambiguous:
+/// it files the active profile's answer under every row, so the row you pressed
+/// reports a failure that belongs to a different account.
 #[tauri::command]
 async fn verify_profile(tool: String, profile: String) -> CmdResult<VerifyOutcome> {
-    let _ = &profile;
-    blocking(move |registry| registry.verify(&tool)).await
+    blocking(move |registry| registry.verify_profile(&tool, Some(&profile))).await
 }
 
 #[tauri::command]
