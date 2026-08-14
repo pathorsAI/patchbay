@@ -744,48 +744,33 @@ mod tests {
     /// expired yesterday is.
     #[test]
     fn test_expiring_soon_is_done_and_actually_expired_is_open() {
-        // gcloud dates its access token, so it is the one that can show both.
-        let soon = (Utc::now() + chrono::Duration::hours(1))
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string();
-        let past = (Utc::now() - chrono::Duration::days(2))
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string();
+        // An AWS SSO session dates a real login — unlike gcloud, whose only
+        // dated thing is an hourly access token it refreshes by itself, which
+        // is why that probe reports no expiry at all.
+        let soon = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let past = (Utc::now() - chrono::Duration::days(2)).to_rfc3339();
 
         for (stamp, expected) in [(soon, SetupStatus::Done), (past, SetupStatus::Open)] {
             let m = Machine::new(&[
-                (".config/gcloud/active_config", "work"),
                 (
-                    ".config/gcloud/configurations/config_work",
-                    "[core]\naccount = me@work.com\nproject = p\n",
+                    ".aws/config",
+                    "[default]\nsso_start_url = https://work.awsapps.com/start\nsso_role_name = Admin\nregion = us-east-1\n",
+                ),
+                (
+                    ".aws/sso/cache/aaa.json",
+                    &format!(
+                        r#"{{"startUrl":"https://work.awsapps.com/start","expiresAt":"{stamp}","accessToken":"fake-fixture-token"}}"#
+                    ),
                 ),
             ]);
-            gcloud_token_db(&m.home, "me@work.com", &stamp);
             let items = m.plan(None);
             assert_eq!(
-                item(&items, "tool:gcloud").status,
+                item(&items, "tool:aws").status,
                 expected,
                 "{:?}",
-                item(&items, "tool:gcloud")
+                item(&items, "tool:aws")
             );
         }
-    }
-
-    /// The shape the gcloud probe reads its expiry from.
-    fn gcloud_token_db(home: &std::path::Path, account: &str, expiry: &str) {
-        let path = home.join(".config/gcloud/access_tokens.db");
-        let db = rusqlite::Connection::open(&path).unwrap();
-        db.execute(
-            "CREATE TABLE access_tokens (account_id TEXT PRIMARY KEY, access_token TEXT, \
-             token_expiry TIMESTAMP)",
-            [],
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO access_tokens VALUES (?1, 'redacted', ?2)",
-            rusqlite::params![account, expiry],
-        )
-        .unwrap();
     }
 
     #[test]

@@ -11,6 +11,13 @@
 //! expires_at, user_id }`. `expires_at` is epoch **milliseconds**; the three
 //! token fields are never named by the parser at all.
 //!
+//! That `expires_at` is only the login's expiry when the grant is *not*
+//! offline-scoped. With `offline`/`offline_access` in the scope list the CLI
+//! refreshes the access token itself on the next command, so the timestamp
+//! describes an hour-long token nobody has to think about — reported as an
+//! expiry it puts a live login on the board as "expired 12d". Offline-scoped
+//! grants therefore carry no expiry, only a note.
+//!
 //! `NEON_API_KEY` in the environment overrides the file entirely, which is how
 //! CI runs the CLI — worth a note, because the file's expiry then describes a
 //! credential nothing is using.
@@ -108,7 +115,9 @@ impl Probe for NeonProbe {
                     Some(id) => format!("neon user {id}"),
                     None => "neon oauth login".to_string(),
                 })
-                .expires_at(expires_at)
+                // Only a grant that cannot refresh itself has an expiry worth
+                // showing; see the module header.
+                .expires_at(expires_at.filter(|_| !refreshable))
                 .with_meta("user_id", credentials.user_id.clone())
                 .with_meta("token_type", credentials.token_type.clone())
                 .with_meta("scopes", scopes)
@@ -121,14 +130,13 @@ impl Probe for NeonProbe {
             "the config directory is still `neonctl` even though the binary is now `neon`"
                 .to_string(),
         );
-        if let Some(expires_at) = expires_at {
-            if expires_at < chrono::Utc::now() && refreshable {
-                status.note(
-                    "the access token has expired, but the grant is offline-scoped: the CLI will \
-                     refresh it on the next command"
-                        .to_string(),
-                );
-            }
+        if refreshable {
+            status.note(
+                "the grant is offline-scoped, so the CLI refreshes the access token itself; the \
+                 only timestamp in credentials.json dates that hourly token, not the login, and \
+                 nothing here says when the grant behind it stops working"
+                    .to_string(),
+            );
         }
 
         Ok(status)
@@ -220,16 +228,19 @@ mod tests {
         )
     }
 
+    /// The same credentials without the two offline scopes: an access token
+    /// that really is the whole login.
+    fn credentials_without_offline(expires_at: i64) -> String {
+        credentials(expires_at).replace("openid offline offline_access ", "openid ")
+    }
+
     #[test]
-    fn test_grant_expiry_and_scopes() {
+    fn test_grant_scopes_and_no_expiry_for_a_grant_that_refreshes_itself() {
         let (_dir, home) = fixture(&credentials(1785611828464));
         let status = NeonProbe::new(Paths::for_test(&home)).status().unwrap();
         assert_eq!(status.active.as_deref(), Some("default"));
         let profile = &status.profiles[0];
-        assert_eq!(
-            profile.expires_at.unwrap().to_rfc3339(),
-            "2026-08-01T19:17:08.464+00:00"
-        );
+        assert!(profile.expires_at.is_none());
         assert_eq!(profile.meta["scopes"][0], "openid");
         assert_eq!(profile.meta["refreshable"], true);
         assert_eq!(profile.meta["token_type"], "bearer");
@@ -246,11 +257,34 @@ mod tests {
     }
 
     #[test]
-    fn test_expired_but_refreshable_is_explained() {
-        // 2021-01-01 in milliseconds.
+    fn test_a_long_stale_offline_grant_is_not_a_dead_login() {
+        // 2021-01-01 in milliseconds — an hourly token five years past, which
+        // read as the login's expiry parked neon permanently in the board's
+        // expired tally.
         let (_dir, home) = fixture(&credentials(1609459200000));
         let status = NeonProbe::new(Paths::for_test(&home)).status().unwrap();
-        assert!(status.notes.iter().any(|n| n.contains("will refresh it")));
+        assert!(status.profiles[0].expires_at.is_none());
+        assert_eq!(
+            status.connection_state(),
+            crate::types::ConnectionState::Connected
+        );
+        assert!(status
+            .notes
+            .iter()
+            .any(|n| n.contains("refreshes the access token itself")));
+    }
+
+    #[test]
+    fn test_a_grant_that_cannot_refresh_keeps_its_expiry() {
+        // No offline scope: when this hour is up the login really is over, so
+        // the timestamp is the answer rather than noise.
+        let (_dir, home) = fixture(&credentials_without_offline(1785611828464));
+        let status = NeonProbe::new(Paths::for_test(&home)).status().unwrap();
+        assert_eq!(status.profiles[0].meta["refreshable"], false);
+        assert_eq!(
+            status.profiles[0].expires_at.unwrap().to_rfc3339(),
+            "2026-08-01T19:17:08.464+00:00"
+        );
     }
 
     #[test]
