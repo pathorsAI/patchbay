@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-08-14
+
+### Security
+
+- **Every third-party action in CI and the release workflow is pinned to a full
+  commit SHA**, with the tag it came from kept in a trailing comment. A moving
+  tag is a standing invitation: whoever controls the action's repository can
+  change what runs in a job that holds the Apple signing certificate. One trap
+  worth recording, because it turns a hardening into a broken build if you miss
+  it — `dtolnay/rust-toolchain` derives the channel it installs from
+  `github.action_ref`, which is exactly how `@stable` means stable. Pinned to a
+  SHA that default becomes the SHA, so every use now names `toolchain: stable`
+  outright.
+
+- **`bun install` runs with `--ignore-scripts`.** Nothing in the front end's
+  tree needs a lifecycle script — esbuild and the tauri CLI ship their platform
+  binaries as optional dependencies rather than postinstall downloads — so the
+  scripts were only ever an unused path from a compromised package to a runner
+  that holds the release secrets.
+
+- **`release.yml` is `contents: read` at the workflow level**, and only the
+  `release` job raises itself to `contents: write`. The three jobs that build
+  and sign now carry a token that cannot publish a release.
+
+- **Every `cargo` invocation takes `--locked`,** so CI fails on a lockfile that
+  has drifted from the manifests instead of quietly resolving a different
+  dependency tree than the one that was reviewed.
+
+- **The keychain script fetches Apple's CA anchors over HTTPS only**
+  (`--proto '=https' --proto-redir '=https' --tlsv1.2`). It passes `-L`, so
+  without the redirect guard a 302 into `http://` would have been followed and
+  the trust anchors taken in the clear.
+
+### Added
+
+- **A `core (Linux)` CI job**, retiring a TODO that turned out to be wrong about
+  its own premise. `patchbay-core` has no `cfg(target_os)` branch anywhere: the
+  macOS-shaped tool locations are plain strings built under a home directory the
+  caller supplies, and the suite supplies a synthetic one; the Keychain path is
+  covered through `MemoryKeystore`, so no test shells out to `security`. The
+  core suite was already portable, and this job is what keeps it that way — it
+  goes red the moment core reaches for a real `$HOME` or a platform cfg. It is
+  not a claim that patchbay runs on Linux. `pb`, the panel and the probes are
+  still macOS-only, which is why exactly one crate is built there.
+
+### Fixed
+
+- **The panel's clickable surfaces are real controls.** The tool card, the
+  profile row's switch target, the copyable command and the detail scrim were
+  each a non-interactive element wearing `role="button"`, a `tabIndex` and a
+  hand-written Enter/Space handler; they are now `<button>`s, and the detail
+  drawer is a native `<dialog>` — the same pair the key vault's drawer has used
+  since it landed. The focus ring, the keyboard behaviour and the announced role
+  come from the element instead of being re-implemented beside it. Nothing moves
+  on screen: a button may only hold phrasing content, so the layout elements
+  inside became spans and the stylesheet carries the boxes.
+
+- The boot splash's light-mode text sat at 4.1:1 on its background, just under
+  WCAG AA, while being the only thing on screen. It is now 5.3:1.
+
+- `headlineExpiry` sorts with an explicit comparator. The default sort compares
+  UTF-16 code units, which happens to be right for RFC 3339 stamps but said so
+  nowhere.
+
 ## [0.3.0] - 2026-08-14
 
 ### Added
@@ -298,5 +362,8 @@ it accurately, and never touch a secret value.
   hardened runtime. Forks build unsigned — they have no access to the signing
   secrets — and that path is kept working on purpose.
 
-[Unreleased]: https://github.com/pathorsAI/patchbay/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/pathorsAI/patchbay/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/pathorsAI/patchbay/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/pathorsAI/patchbay/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/pathorsAI/patchbay/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/pathorsAI/patchbay/releases/tag/v0.1.0
