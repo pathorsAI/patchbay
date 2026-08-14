@@ -44,7 +44,9 @@ export function headlineExpiry(status: ToolStatus): string | null {
   const known = status.profiles
     .map((p) => p.expires_at)
     .filter((e): e is string => Boolean(e))
-    .sort();
+    // Explicit comparator: the default sort compares UTF-16 code units, which
+    // happens to be right for RFC 3339 stamps but says so nowhere.
+    .sort((a, b) => a.localeCompare(b));
   return known[0] ?? null;
 }
 

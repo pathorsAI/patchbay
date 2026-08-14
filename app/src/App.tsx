@@ -178,7 +178,7 @@ export default function App() {
         </span>
         <span className="header-right">
           {refreshedAt && <span className="stamp">{clockTime(refreshedAt)}</span>}
-          <button className="action" onClick={() => void refresh()} disabled={refreshing}>
+          <button type="button" className="action" onClick={() => void refresh()} disabled={refreshing}>
             {refreshing ? <span className="spinner" /> : null}
             refresh
           </button>
@@ -221,7 +221,7 @@ export default function App() {
               {statuses && all.length > 0 && shown.length === 0 && (
                 <div className="empty">
                   <p className="empty-line">no tools match</p>
-                  <button className="action" onClick={() => setFilters(NO_FILTERS)}>
+                  <button type="button" className="action" onClick={() => setFilters(NO_FILTERS)}>
                     clear filters
                   </button>
                 </div>

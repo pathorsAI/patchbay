@@ -128,9 +128,7 @@ export function McpView() {
           <li key={c.client} className={c.present ? "" : "is-absent"}>
             <span className="path-label">{c.label}</span>
             <span className="path-file">{c.config_path}</span>
-            <span className="path-count">
-              {c.present ? `${c.servers.length} server${c.servers.length === 1 ? "" : "s"}` : "—"}
-            </span>
+            <span className="path-count">{serverCount(c)}</span>
           </li>
         ))}
       </ul>
@@ -159,4 +157,11 @@ function transportOf(s: McpServerEntry): string {
     return s.args_len === 0 ? `stdio ${base}` : `stdio ${base} (${s.args_len})`;
   }
   return `${s.transport} ${s.url}`;
+}
+
+/** "3 servers" for a client whose config exists, an em dash for one that does not. */
+function serverCount(client: McpClient): string {
+  if (!client.present) return "—";
+  const n = client.servers.length;
+  return `${n} server${n === 1 ? "" : "s"}`;
 }

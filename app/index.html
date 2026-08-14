@@ -23,11 +23,15 @@
         text-align: center;
         font: 12px/1.5 ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace;
       }
+      /* One shade darker than the app's --muted: on #f1f2f0 that token lands at
+         4.1:1, just under WCAG AA for body text, and this line is the only
+         thing on screen while it shows. The dark pairing above already clears
+         AA at 5.3:1. */
       @media (prefers-color-scheme: light) {
         html,
         body {
           background: #f1f2f0;
-          color: #6b7778;
+          color: #5a6667;
         }
       }
     </style>

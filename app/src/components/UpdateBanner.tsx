@@ -51,11 +51,11 @@ export function UpdateBanner() {
         {failure ?? (installing ? updatingLabel(progress) : `patchbay ${update.version} is available`)}
       </span>
       <span className="banner-actions">
-        <button className="action" onClick={run} disabled={installing}>
+        <button type="button" className="action" onClick={run} disabled={installing}>
           {installing ? <span className="spinner" /> : null}
           update and relaunch
         </button>
-        <button className="action" onClick={() => setDismissed(true)} disabled={installing}>
+        <button type="button" className="action" onClick={() => setDismissed(true)} disabled={installing}>
           not now
         </button>
       </span>

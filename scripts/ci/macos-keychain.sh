@@ -60,7 +60,7 @@ do_import() {
         line="${line#"${line%%[![:space:]]*}"}" # leading whitespace
         line="${line%\"}"
         line="${line#\"}"
-        [ -n "$line" ] && original_keychains+=("$line")
+        [[ -n "$line" ]] && original_keychains+=("$line")
     done < <(security list-keychains -d user)
     printf '%s\n' "${original_keychains[@]}" >"$orig_list_file"
     security default-keychain -d user | tr -d '" ' >"$orig_default_file" || true
@@ -90,9 +90,11 @@ do_import() {
     # The exported .p12 holds only the leaf cert, not Apple's intermediate/root.
     # Runners normally already have them; import best-effort and tolerate the
     # non-zero "already exists" so this does not abort under `set -e`.
-    curl -fsSL -o "$state_dir/DeveloperIDG2CA.cer" \
+    curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 \
+        -o "$state_dir/DeveloperIDG2CA.cer" \
         https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer || true
-    curl -fsSL -o "$state_dir/AppleRoot.cer" \
+    curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 \
+        -o "$state_dir/AppleRoot.cer" \
         https://www.apple.com/appleca/AppleIncRootCertificate.cer || true
     security import "$state_dir/DeveloperIDG2CA.cer" -k "$keychain_path" 2>/dev/null || true
     security import "$state_dir/AppleRoot.cer" -k "$keychain_path" 2>/dev/null || true
@@ -122,22 +124,22 @@ do_import() {
 do_cleanup() {
     # Best-effort throughout: this runs with `if: always()`, including after a
     # failure that happened before the keychain ever existed.
-    if [ -f "$orig_default_file" ]; then
+    if [[ -f "$orig_default_file" ]]; then
         local original_default
         original_default="$(cat "$orig_default_file")"
-        [ -n "$original_default" ] && security default-keychain -s "$original_default" || true
+        [[ -n "$original_default" ]] && security default-keychain -s "$original_default" || true
     fi
 
-    if [ -f "$orig_list_file" ]; then
+    if [[ -f "$orig_list_file" ]]; then
         local restore=()
         while IFS= read -r line; do
-            [ -n "$line" ] && restore+=("$line")
+            [[ -n "$line" ]] && restore+=("$line")
         done <"$orig_list_file"
-        [ ${#restore[@]} -gt 0 ] && security list-keychains -d user -s "${restore[@]}" || true
+        [[ ${#restore[@]} -gt 0 ]] && security list-keychains -d user -s "${restore[@]}" || true
     fi
 
     # delete-keychain also drops it from the search list.
-    [ -f "$keychain_path" ] && security delete-keychain "$keychain_path" || true
+    [[ -f "$keychain_path" ]] && security delete-keychain "$keychain_path" || true
     rm -f "$orig_list_file" "$orig_default_file" "$state_dir/certificate.p12"
     echo "macos-keychain: cleaned up $keychain_path"
 }
