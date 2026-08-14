@@ -3,8 +3,14 @@
 //! Wrangler keeps one global login at
 //! `~/Library/Preferences/.wrangler/config/default.toml`, with the older
 //! `~/.wrangler/config/default.toml` still present on machines that predate the
-//! move. Presence of the file means "logged in"; `expiration_time` gives a real
-//! expiry and `scopes` gives a real permissions list.
+//! move. Presence of the file means "logged in", and `scopes` gives a real
+//! permissions list.
+//!
+//! `expiration_time` dates the *access* token. Where a `refresh_token` sits
+//! beside it, wrangler renews that silently on the next command, so the
+//! timestamp is not when the login stops working — reported as the profile's
+//! expiry it put a live grant on the board as "expired 154d". It is kept only
+//! for a grant with no refresh token, where the deadline really is the login's.
 //!
 //! `oauth_token` and `refresh_token` are typed as [`serde::de::IgnoredAny`]:
 //! serde confirms the keys exist and throws the values away, so no Cloudflare
@@ -99,6 +105,7 @@ impl Probe for WranglerProbe {
         if config.expiration_time.is_some() && expires_at.is_none() {
             status.note("expiration_time is present but could not be parsed".to_string());
         }
+        let refreshable = config.refresh_token.is_some();
 
         status.profiles.push(
             Profile::new(Self::PROFILE_ID)
@@ -107,7 +114,9 @@ impl Probe for WranglerProbe {
                 } else {
                     "cloudflare oauth login"
                 })
-                .expires_at(expires_at)
+                // Only a grant wrangler cannot renew for you has an expiry
+                // worth showing; see the module header.
+                .expires_at(expires_at.filter(|_| !refreshable))
                 .with_meta(
                     "auth_type",
                     if config.api_token.is_some() {
@@ -117,17 +126,15 @@ impl Probe for WranglerProbe {
                     },
                 )
                 .with_meta("scopes", config.scopes.clone())
-                .with_meta("refreshable", config.refresh_token.is_some())
+                .with_meta("refreshable", refreshable)
                 .with_meta("source", path.display().to_string()),
         );
         status.active = Some(Self::PROFILE_ID.to_string());
 
-        if let Some(expires_at) = expires_at {
-            if expires_at < chrono::Utc::now() && config.refresh_token.is_some() {
-                status.note(
-                    "the access token has expired, but a refresh token is present: wrangler will renew it silently on the next command".to_string(),
-                );
-            }
+        if refreshable {
+            status.note(
+                "a refresh token is present, so wrangler renews the access token itself on the next command; the only timestamp in the config dates that access token, not the login, and nothing here says when the grant behind it stops working".to_string(),
+            );
         }
 
         Ok(status)
@@ -210,8 +217,15 @@ mod tests {
         )
     }
 
+    /// The same grant with nothing to renew it: then the deadline is real.
+    fn config_without_refresh(expiry: &str) -> String {
+        format!(
+            "oauth_token = \"fake-fixture-oauth\"\nexpiration_time = \"{expiry}\"\nscopes = [ \"account:read\", \"workers:write\" ]\n"
+        )
+    }
+
     #[test]
-    fn test_expiry_and_scopes_without_touching_the_token() {
+    fn test_scopes_without_touching_the_token() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().to_path_buf();
         write(&home, NEW_PATH, &config("2030-03-13T10:24:29.685Z"));
@@ -220,10 +234,6 @@ mod tests {
         assert_eq!(status.active.as_deref(), Some("default"));
         assert_eq!(status.profiles.len(), 1);
         let profile = &status.profiles[0];
-        assert_eq!(
-            profile.expires_at.unwrap().to_rfc3339(),
-            "2030-03-13T10:24:29.685+00:00"
-        );
         assert_eq!(profile.meta["auth_type"], "oauth");
         assert_eq!(profile.meta["refreshable"], true);
         assert_eq!(profile.meta["scopes"][1], "workers:write");
@@ -237,8 +247,16 @@ mod tests {
     fn test_new_location_wins_and_the_duplicate_is_reported() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().to_path_buf();
-        write(&home, NEW_PATH, &config("2030-01-01T00:00:00Z"));
-        write(&home, OLD_PATH, &config("2029-01-01T00:00:00Z"));
+        write(
+            &home,
+            NEW_PATH,
+            &config_without_refresh("2030-01-01T00:00:00Z"),
+        );
+        write(
+            &home,
+            OLD_PATH,
+            &config_without_refresh("2029-01-01T00:00:00Z"),
+        );
 
         let status = WranglerProbe::new(Paths::for_test(&home)).status().unwrap();
         assert_eq!(
@@ -265,12 +283,40 @@ mod tests {
     }
 
     #[test]
-    fn test_expired_with_refresh_token_is_explained() {
+    fn test_a_renewable_grant_is_not_expired_however_old_its_access_token_is() {
+        // The exact shape from a real machine: an `expiration_time` five months
+        // past beside a refresh token, which the board reported as
+        // "expired 154d" for a login `wrangler deploy` would have used fine.
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().to_path_buf();
         write(&home, NEW_PATH, &config("2020-01-01T00:00:00Z"));
         let status = WranglerProbe::new(Paths::for_test(&home)).status().unwrap();
-        assert!(status.notes.iter().any(|n| n.contains("renew it silently")));
+        assert!(status.profiles[0].expires_at.is_none());
+        assert_eq!(
+            status.connection_state(),
+            crate::types::ConnectionState::Connected
+        );
+        assert!(status
+            .notes
+            .iter()
+            .any(|n| n.contains("renews the access token itself")));
+    }
+
+    #[test]
+    fn test_a_grant_with_nothing_to_renew_it_keeps_its_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        write(
+            &home,
+            NEW_PATH,
+            &config_without_refresh("2030-03-13T10:24:29.685Z"),
+        );
+        let status = WranglerProbe::new(Paths::for_test(&home)).status().unwrap();
+        assert_eq!(status.profiles[0].meta["refreshable"], false);
+        assert_eq!(
+            status.profiles[0].expires_at.unwrap().to_rfc3339(),
+            "2030-03-13T10:24:29.685+00:00"
+        );
     }
 
     #[test]

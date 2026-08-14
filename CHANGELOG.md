@@ -5,6 +5,50 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3] - 2026-08-14
+
+### Fixed
+
+- **`wrangler` and `rclone` had the same borrowed-hour bug 0.3.2 fixed in three
+  other probes**, and 0.3.2's sweep stopped at the probes that happened to be
+  on the reporter's board. Both store an OAuth *access* token's expiry and both
+  renew that token themselves — wrangler on the next command, rclone by
+  refreshing and rewriting `rclone.conf` — so a live Cloudflare grant read
+  "expired 154d" and Drive remotes read expired for as long as you had not used
+  them. Each now keeps the timestamp only where nothing can renew it: wrangler
+  when the config has no `refresh_token`, rclone when the remote's token blob
+  has none. rclone learns that by reducing `refresh_token` to a bool at the
+  point it reads the blob, so no part of the token outlives the parse.
+
+  The full audit, so the next reader does not have to redo it: `aws` (SSO
+  session — a real deadline, kept), `stripe` (`stripe login` keys expire and are
+  not renewed, kept), `az` / `gh` / `claude` / `cloudflared` / `flyctl` (already
+  reported unknown). `huggingface` stores `expires_at` beside an optional
+  `refresh_token` and is the one case left unverified — see below.
+
+- **The window no longer scrolls as one sheet.** `.body` carried `min-height: 0`
+  but not `min-width: 0`, and as a grid item it therefore took its min-content
+  width — which for a flex container is content-driven even when its children
+  may shrink. One wide row of cards, or one long unbroken path in a note, sized
+  that column past the window and took the header, the sidebar and the title
+  bar scrolling sideways with it. Measured at a 420px viewport: the document
+  was 506px wide. Containment is now structural — `html`/`body`/`#root` are
+  `overflow: hidden`, `.body` is `min-width: 0` and hidden, and the board
+  scrolls itself in both axes — so the chrome stays put and only the region you
+  are reading moves.
+
+### Changed
+
+- **Opening a tool now verifies it.** Every profile in the drawer that has no
+  verdict yet is checked on the way in, rather than showing a button and
+  waiting to be asked a second time — the click that opened the drawer is the
+  consent for the tier-2 call. Once per tool: a row that has been checked, or
+  is being checked, is skipped, so the 30s board poll cannot turn it into a
+  loop, and re-checking on demand is still the row's own button. The board
+  itself stays tier 1 — file reads only, no network — because a status surface
+  that shells out to twenty-five CLIs every thirty seconds is a different
+  program.
+
 ## [0.3.2] - 2026-08-14
 
 ### Fixed

@@ -48,6 +48,25 @@ export function ToolDetail({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [wantPermissions, status.tool]);
 
+  // Opening a tool is the question. Answering it with "nobody has checked yet"
+  // and a button is a question back, so every profile that has no verdict gets
+  // checked on the way in — the click that opened the drawer *is* the consent
+  // for the tier-2 call.
+  //
+  // Once per tool, not once per render: `verdicts` is keyed per row and is
+  // never cleared by a board refresh, so a profile that has been checked (or is
+  // being checked, which parks `null` in the map immediately) is skipped, and
+  // the 30s poll cannot turn this into a loop. Re-checking on demand stays the
+  // row's own button.
+  useEffect(() => {
+    for (const profile of status.profiles) {
+      if (panel.verdicts[rowKey(status.tool, profile.id)] === undefined) {
+        panel.verifyRow(status.tool, profile.id);
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [status.tool]);
+
   return (
     <>
       {/* Click-outside is a control, so it answers to the keyboard too — hence
