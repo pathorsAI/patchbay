@@ -83,11 +83,16 @@
   box-sizing: border-box;
 }
 
+/* The window itself never scrolls. Everything that can overflow — the board,
+   the sidebar, the detail drawer — scrolls inside its own box, so the header
+   and the sidebar stay put while you read. Without this the whole app slides
+   sideways as one sheet and the title bar leaves with it. */
 html,
 body,
 #root {
   height: 100%;
   margin: 0;
+  overflow: hidden;
 }
 
 body {
@@ -179,15 +184,25 @@ button {
   color: var(--muted);
 }
 
+/* `min-width: 0` is the load-bearing one, and it is not symmetry with
+   `min-height`. As a grid item this box defaults to `min-width: auto`, which
+   resolves to its min-content width — and a flex container's min-content width
+   is content-driven even where its items may shrink, so one wide card row or
+   one long unbroken path in a note sized this column past the window and took
+   the whole document scrolling sideways with it. `overflow: hidden` then makes
+   the containment structural rather than a thing each child remembers. */
 .body {
   display: flex;
+  min-width: 0;
   min-height: 0;
+  overflow: hidden;
 }
 
 .board {
   flex: 1 1 auto;
   min-width: 0;
-  overflow-y: auto;
+  min-height: 0;
+  overflow: auto;
   padding: 16px 18px 22px;
 }
 

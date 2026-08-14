@@ -18,6 +18,12 @@ pub struct RcloneProbe {
     paths: Paths,
 }
 
+/// What a remote's `token` blob says, with nothing of the token in it.
+struct TokenState {
+    expiry: Option<chrono::DateTime<chrono::Utc>>,
+    refreshable: bool,
+}
+
 /// Config keys that are safe to surface. Anything not listed here is dropped,
 /// which is the right default for a file full of credentials.
 const SAFE_KEYS: &[&str] = &[
@@ -38,13 +44,28 @@ impl RcloneProbe {
         Self { paths }
     }
 
-    /// Pull `expiry` out of an rclone OAuth token blob. Returns `None` for a
-    /// malformed blob; the token itself is never returned in any form.
-    fn token_expiry(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    /// Read an rclone OAuth token blob: when it expires, and whether rclone can
+    /// renew it without you. `None` for a malformed blob; no part of the token
+    /// is ever returned in any form — `refresh_token` is reduced to a bool at
+    /// the point it is read.
+    ///
+    /// The distinction matters because rclone refreshes an access token itself
+    /// on the next command and writes the new one back to `rclone.conf`. For a
+    /// remote with a refresh token that hourly `expiry` is not the login's, and
+    /// showing it as one marks working remotes expired for as long as you
+    /// happen not to have used them.
+    fn token_state(raw: &str) -> Option<TokenState> {
         let json: serde_json::Value = serde_json::from_str(raw).ok()?;
-        json.get("expiry")
-            .and_then(|v| v.as_str())
-            .and_then(parse_timestamp)
+        Some(TokenState {
+            expiry: json
+                .get("expiry")
+                .and_then(|v| v.as_str())
+                .and_then(parse_timestamp),
+            refreshable: json
+                .get("refresh_token")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty()),
+        })
     }
 }
 
@@ -129,12 +150,18 @@ impl Probe for RcloneProbe {
         }
 
         let mut unparsed_tokens = Vec::new();
+        let mut refreshable_remotes = 0usize;
         for section in &ini.sections {
             let mut profile = Profile::new(&section.name);
 
             if let Some(raw) = section.get("token") {
-                match Self::token_expiry(raw) {
-                    Some(expiry) => profile = profile.expires_at(Some(expiry)),
+                match Self::token_state(raw) {
+                    Some(state) => {
+                        profile = profile
+                            .expires_at(state.expiry.filter(|_| !state.refreshable))
+                            .with_meta("refreshable", state.refreshable);
+                        refreshable_remotes += usize::from(state.refreshable);
+                    }
                     None => unparsed_tokens.push(section.name.clone()),
                 }
                 profile = profile.with_meta("auth", "oauth token");
@@ -156,6 +183,11 @@ impl Probe for RcloneProbe {
             status.note(format!(
                 "could not read an expiry from the stored token of: {}",
                 unparsed_tokens.join(", ")
+            ));
+        }
+        if refreshable_remotes > 0 {
+            status.note(format!(
+                "{refreshable_remotes} remote(s) carry a refresh token, so rclone renews the access token itself and rewrites rclone.conf; the `expiry` in those blobs dates that access token, not the login, and is not reported as one"
             ));
         }
         if !status.profiles.is_empty() {
@@ -354,6 +386,21 @@ remote = work:Legal
 "#;
 
     #[test]
+    fn test_a_remote_with_no_refresh_token_keeps_its_expiry() {
+        // Some backends hand out an access token and nothing to renew it with;
+        // there the timestamp really is when the remote stops working.
+        let (_dir, home) = fixture(
+            "[box]\ntype = box\ntoken = {\"access_token\":\"fake-fixture-access\",\"expiry\":\"2030-05-01T12:00:00.123456789+08:00\"}\n",
+        );
+        let status = RcloneProbe::new(Paths::for_test(&home)).status().unwrap();
+        assert_eq!(status.profiles[0].meta["refreshable"], false);
+        assert_eq!(
+            status.profiles[0].expires_at.unwrap().to_rfc3339(),
+            "2030-05-01T04:00:00.123456789+00:00"
+        );
+    }
+
+    #[test]
     fn test_remotes_expiry_and_allow_listed_meta() {
         let (_dir, home) = fixture(CONF);
         let status = RcloneProbe::new(Paths::for_test(&home)).status().unwrap();
@@ -367,10 +414,14 @@ remote = work:Legal
         assert_eq!(work.meta["root_folder_id"], "abc123");
         // Empty values are not carried through as noise.
         assert!(work.meta.get("team_drive").is_none());
-        assert_eq!(
-            work.expires_at.unwrap().to_rfc3339(),
-            "2030-05-01T04:00:00.123456789+00:00"
-        );
+        // A refresh token beside the expiry: rclone renews it and rewrites the
+        // config, so that timestamp is the access token's, not the login's.
+        assert_eq!(work.meta["refreshable"], true);
+        assert!(work.expires_at.is_none());
+        assert!(status
+            .notes
+            .iter()
+            .any(|n| n.contains("renews the access token itself")));
 
         let legal = &status.profiles[2];
         assert_eq!(legal.meta["remote"], "work:Legal");
