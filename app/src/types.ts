@@ -224,6 +224,69 @@ export interface McpClient {
   notes: string[];
 }
 
+/** The three transports, as a spec that is about to be written. */
+export type McpTransportKind = "stdio" | "http" | "sse";
+
+/**
+ * Mirrors the Tauri shell's `McpTransportWire` — `McpTransport` with the values
+ * back in: the arguments themselves rather than a count.
+ */
+export type McpTransportSpec =
+  | { transport: "stdio"; command: string; args: string[] }
+  | { transport: "http"; url: string }
+  | { transport: "sse"; url: string };
+
+/**
+ * One server as one client has it written down, values included.
+ *
+ * The only shape in the panel that carries MCP secrets — an `Authorization`
+ * header, a `--api-key=…` argument, a token in `env`. It arrives from
+ * `mcpReadSpec` for one server the user opened, lives in that drawer's form
+ * state, and leaves through `mcpAdd`. It must never be put in the list state
+ * the matrix renders from, and must never be logged.
+ *
+ * Pairs, not objects: file order is what an edit has to preserve.
+ */
+export type McpSpec = McpTransportSpec & {
+  env: [string, string][];
+  headers: [string, string][];
+};
+
+/** Mirrors `patchbay_core::mcp_clients::WriteReport`. */
+export interface McpWriteReport {
+  client: string;
+  label: string;
+  name: string;
+  config_path: string;
+  /** Where the undo lives. Null only when the config file was created. */
+  backup_path: string | null;
+  created_file: boolean;
+  /** Format caveats and the restart hint. Show all of them. */
+  notes: string[];
+}
+
+/** Mirrors `patchbay_core::mcp_clients::CopyReport`. */
+export interface McpCopyReport {
+  name: string;
+  from: string;
+  summary: string;
+  /** Names of env vars whose VALUES travelled. Say so. */
+  env_carried: string[];
+  /** Names of headers whose VALUES travelled. Same. */
+  header_carried: string[];
+  written: McpWriteReport[];
+}
+
+/**
+ * Whether this client has the server in a scope patchbay will write.
+ *
+ * Mirrors `McpServerEntry::is_writable_scope`. A Claude Code entry under
+ * `projects.<path>` is that project's business: core reads it, labels it, and
+ * refuses to touch it — so the panel must not offer to.
+ */
+export const isWritableScope = (e: McpServerEntry): boolean =>
+  !(e.scope?.startsWith("project:") ?? false);
+
 export type SwitchOutcome =
   | { result: "switched"; tool: string; profile_id: string; detail: string; notes: string[] }
   | { result: "unsupported"; tool: string; reason: string; hint: string | null }

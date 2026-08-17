@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { mcpList } from "../api";
 import type { McpClient, McpServerEntry } from "../types";
+import { McpServerDetail } from "./McpServerDetail";
 
 /** What one client has to say about one server name. */
 type Cell = "user" | "project" | "none";
@@ -14,6 +15,9 @@ function cellFor(entries: McpServerEntry[]): Cell {
 
 const MARK: Record<Cell, string> = { user: "✓", project: "proj", none: "—" };
 
+/** Which drawer is open, if any. */
+type Open = { mode: "add" } | { mode: "edit"; name: string };
+
 /**
  * Which AI clients have which MCP servers. The matrix is the point: MCP config
  * is per-client and lives in six different files, so the only way to see that
@@ -22,12 +26,34 @@ const MARK: Record<Cell, string> = { user: "✓", project: "proj", none: "—" }
  * Clients that are not installed keep their column — an empty column is the
  * answer to "did I configure it there?", and hiding it would lose that.
  *
- * Read-only: `pb mcp add/copy/rm` does the writing. Transports show a command
- * or a URL and the *names* of env vars and headers, never their values.
+ * The matrix itself stays value-free: a command or a URL, and the *names* of
+ * env vars and headers, never their values. Values are read one server at a
+ * time, by `McpServerDetail`, because a row was opened — see the note there.
+ * Seeing the gap is only half of it, so a row is a way in: open it and you can
+ * edit that client's copy, copy it to the clients that are missing it, or take
+ * it out. `pb mcp add/copy/rm` still does the same work from a terminal.
  */
 export function McpView() {
   const [clients, setClients] = useState<McpClient[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [open, setOpen] = useState<Open | null>(null);
+  /** The outcome of a write that outlived the drawer it happened in. */
+  const [note, setNote] = useState<string | null>(null);
+
+  /** Re-read the matrix. Resolves with the fresh list, which is what lets the
+   *  drawer decide whether the server it was showing still exists. */
+  const load = useCallback(async () => {
+    const fresh = await mcpList();
+    setClients(fresh);
+    setError(null);
+    return fresh;
+  }, []);
+
+  /** Open a drawer, and drop the last drawer's parting note with it. */
+  const show = (next: Open) => {
+    setNote(null);
+    setOpen(next);
+  };
 
   useEffect(() => {
     let live = true;
@@ -67,7 +93,16 @@ export function McpView() {
           {servers.length} {servers.length === 1 ? "server" : "servers"} across {configured} of{" "}
           {clients.length} clients
         </span>
+        <button type="button" className="action" onClick={() => show({ mode: "add" })}>
+          add server
+        </button>
       </div>
+
+      {note && (
+        <div className="switch-note">
+          <span>{note}</span>
+        </div>
+      )}
 
       {servers.length === 0 ? (
         <div className="empty">
@@ -75,6 +110,9 @@ export function McpView() {
           <p className="muted small vault-blurb">
             None of the {clients.length} clients patchbay knows about has a server configured.
           </p>
+          <button type="button" className="action" onClick={() => show({ mode: "add" })}>
+            add server
+          </button>
         </div>
       ) : (
         <div className="scroller">
@@ -101,8 +139,17 @@ export function McpView() {
                 // description as any.
                 const spec = clients.flatMap((c) => c.servers).find((s) => s.name === name)!;
                 return (
-                  <tr key={name}>
-                    <td className="cell-id">{name}</td>
+                  // The whole row opens the drawer, the way a board card does:
+                  // the row's information *is* what you came to act on. A <tr>
+                  // cannot be a button, so the name cell holds a real one for
+                  // the keyboard; its click bubbles here and asks for the same
+                  // thing twice, which costs nothing.
+                  <tr key={name} className="row-open" onClick={() => show({ mode: "edit", name })}>
+                    <td className="cell-id">
+                      <button type="button" className="row-open-name">
+                        {name}
+                      </button>
+                    </td>
                     {clients.map((c) => {
                       const cell = cellFor(c.servers.filter((s) => s.name === name));
                       return (
@@ -146,6 +193,20 @@ export function McpView() {
             )),
           )}
         </ul>
+      )}
+
+      {open && (
+        <McpServerDetail
+          // Remounts when the row changes, so no drawer ever shows one
+          // server's form under another server's name.
+          key={open.mode === "add" ? "add" : `edit:${open.name}`}
+          mode={open.mode}
+          name={open.mode === "edit" ? open.name : ""}
+          clients={clients}
+          onClose={() => setOpen(null)}
+          refresh={load}
+          onGone={setNote}
+        />
       )}
     </div>
   );

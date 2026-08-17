@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **MCP servers can be added, edited, copied and removed from the panel.** The
+  matrix could already show you that Cursor was missing the server Claude Code
+  has, and then leave you to go and fix it somewhere else. A row now opens a
+  drawer: the clients that have that server as chips, an editable form for the
+  one you picked — transport, command and arguments or url, env vars, headers —
+  a "copy here" beside every client that is missing it, and a remove. `+ add
+  server` in the head opens the same drawer empty, with a checkbox per client
+  to say where it should land.
+
+  The form always shows exactly one client's copy and says whose, because that
+  is the truth: six clients keep six files and Cursor's definition of a server
+  can differ from Codex's, so a save writes one file rather than flattening the
+  difference. Every write goes through the same core path the CLI uses, keeping
+  the rolling backup, the parse–modify–serialize round trip and the atomic
+  rename; the report says which file was written, where the backup is, and
+  repeats core's caveats, the restart hint included. Saving is an explicit
+  button — nothing autosaves, and closing a dirty drawer asks first. A Claude
+  Code entry in a project scope is shown and explained rather than offered:
+  patchbay does not write that scope, and now says so where you would try.
+
+  The value boundary the matrix was built on is unchanged. `mcp_list`, which
+  fills the table and refreshes after every write, still reports env var and
+  header *names* and a count of arguments. Values are read by one new command,
+  for one named server of one named client, because you opened its drawer —
+  and a copy still reports which values travelled between files by name.
+
 ### Fixed
 
 - **The main pane no longer scrolls sideways.** 0.3.3 stopped the *window*
