@@ -445,6 +445,25 @@ impl Probe for KubectlProbe {
             }
         }
 
+        // A floor of `default`, so long as there is any context to ask about.
+        //
+        // Every cluster has a `default` namespace and a context that names none
+        // operates in it, so an empty list here never meant "kubectl has no
+        // namespaces" — it meant no context declared one *and* the cluster was
+        // not reachable to be asked. That is the common shape: contexts rarely
+        // set `namespace:`, and a kubeconfig this machine cannot load (a
+        // directory of per-cluster files, say) fails the live lookup too. The
+        // empty list then reached the panel as "permissions are not read per
+        // scope for this tool", which is a claim about kubectl rather than
+        // about the moment, and the wrong one.
+        //
+        // Nothing is marked active when no context is current: `permissions_in`
+        // will say so plainly if it is tried. The picker's job here is to show
+        // the capability exists, not to promise the read will succeed.
+        if names.is_empty() && !status.profiles.is_empty() {
+            names.push("default".to_string());
+        }
+
         names.sort();
         names.dedup();
         Ok(names
@@ -1263,8 +1282,17 @@ users:
         let (dir, _config) = config_dir_fixture();
         let exec = fake(crate::util::FakeExec::new());
 
+        // No context declares a namespace and the cluster cannot be asked, but
+        // the contexts are real and every cluster has a `default` — so the
+        // picker still has something to offer. An empty list here would reach
+        // the panel as "kubectl does not do per-scope permissions", which is a
+        // claim about the tool rather than about this machine's kubeconfig.
         let scopes = probe_with(dir.path(), exec).permission_scopes().unwrap();
-        assert!(scopes.is_empty(), "no context names a namespace");
+        let ids: Vec<&str> = scopes.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["default"], "{scopes:?}");
+        // Nothing is current, so nothing is marked active; the panel falls back
+        // to the first entry and `permissions_in` explains the rest.
+        assert!(!scopes[0].active);
 
         // And one that does still comes through without any exec at all.
         let (_dir, home) = fixture(".kube/config", CONFIG);
