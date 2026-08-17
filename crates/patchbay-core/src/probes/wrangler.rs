@@ -22,6 +22,7 @@ use serde::Deserialize;
 
 use crate::paths::Paths;
 use crate::probe::{unsupported_switch, unsupported_verify, Probe};
+use crate::probes::cli_verify;
 use crate::types::{
     Expiry, Note, PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome,
 };
@@ -52,6 +53,84 @@ impl WranglerProbe {
 
     pub fn new(paths: Paths) -> Self {
         Self { paths }
+    }
+
+    /// One sentence out of `wrangler whoami`'s several screens.
+    ///
+    /// The real output is a version banner, a progress line, an English
+    /// sentence naming the token type and email, a box-drawn table of accounts,
+    /// and a scope list — none of which belongs in a `detail` verbatim. What
+    /// the user needs is the identity, so they can hold it against what the
+    /// board claimed: the email, the token type, and the accounts it reaches.
+    ///
+    /// Every part is optional. Cloudflare has reworded this output before, and
+    /// a reword must cost a thinner sentence, never a failed verify.
+    fn describe_whoami(text: &str) -> String {
+        let mut parts = Vec::new();
+        if let Some(kind) = Self::token_kind(text) {
+            parts.push(kind);
+        }
+        if let Some(email) = Self::email(text) {
+            parts.push(format!("for {email}"));
+        }
+        let accounts = Self::accounts(text);
+        if !accounts.is_empty() {
+            parts.push(format!("on {}", accounts.join(", ")));
+        }
+        if parts.is_empty() {
+            // Exit 0 means Cloudflare answered, so the token does work; only
+            // the identity is missing. Saying so beats inventing either half.
+            return "Cloudflare accepted the token, but patchbay could not read an account out of \
+                    `wrangler whoami`"
+                .to_string();
+        }
+        format!("Cloudflare accepted the {}", parts.join(" "))
+    }
+
+    /// `You are logged in with an OAuth Token, associated with the email x@y.`
+    fn email(text: &str) -> Option<String> {
+        let (_, rest) = text.split_once("associated with the email")?;
+        let email = rest
+            .split_whitespace()
+            .next()?
+            .trim_end_matches(['.', '!', ',', '"', '\''])
+            .to_string();
+        (!email.is_empty() && email.contains('@')).then_some(email)
+    }
+
+    /// "OAuth Token" / "API Token", lower-cased, from the same sentence.
+    fn token_kind(text: &str) -> Option<String> {
+        let lower = text.to_lowercase();
+        if lower.contains("oauth token") {
+            Some("OAuth token".to_string())
+        } else if lower.contains("api token") {
+            Some("API token".to_string())
+        } else {
+            None
+        }
+    }
+
+    /// Account names out of the box-drawn `Account Name | Account ID` table.
+    ///
+    /// Parsed defensively: a row is a `│`-delimited line with exactly two
+    /// non-empty cells, the header is dropped by name, and anything else is
+    /// simply not a row. Account **ids** are read past and never reported —
+    /// they are the noisy half and the sentence has no room for them.
+    fn accounts(text: &str) -> Vec<String> {
+        text.lines()
+            .filter(|line| line.contains('│'))
+            .filter_map(|line| {
+                let cells: Vec<&str> = line
+                    .split('│')
+                    .map(str::trim)
+                    .filter(|c| !c.is_empty())
+                    .collect();
+                match cells.as_slice() {
+                    [name, _id] if *name != "Account Name" => Some((*name).to_string()),
+                    _ => None,
+                }
+            })
+            .collect()
     }
 }
 
@@ -157,13 +236,41 @@ impl Probe for WranglerProbe {
     }
 
     fn verify(&self) -> anyhow::Result<VerifyOutcome> {
-        // `wrangler whoami` is a network call that also happens to be slow to
-        // start (node). Left unsupported until it earns its place.
-        Ok(unsupported_verify(
-            Self::TOOL,
-            "patchbay does not run wrangler yet; the local expiry in status is usually enough",
-            Some("wrangler whoami"),
-        ))
+        if !self.paths.may_exec() || !self.paths.has_binary("wrangler") {
+            return Ok(unsupported_verify(
+                Self::TOOL,
+                "the wrangler CLI is not available on PATH",
+                Some("wrangler whoami"),
+            ));
+        }
+
+        let out = self.paths.run("wrangler", &["whoami"])?;
+        if !out.ok {
+            return Ok(cli_verify::failure_outcome(
+                Self::TOOL,
+                &out,
+                "Cloudflare",
+                "wrangler login",
+            ));
+        }
+
+        // wrangler puts the banner on stderr and the report on stdout, but
+        // which half lands where has moved between majors; read both.
+        let text = format!("{}\n{}", out.stdout, out.stderr);
+
+        // Exit 0 is not the answer on its own: logged out, `wrangler whoami`
+        // prints "You are not authenticated." and still succeeds.
+        if cli_verify::says_logged_out(&text) {
+            return Ok(VerifyOutcome::Invalid {
+                tool: Self::TOOL.to_string(),
+                detail: "not logged in — run `wrangler login`".to_string(),
+            });
+        }
+
+        Ok(VerifyOutcome::Valid {
+            tool: Self::TOOL.to_string(),
+            detail: Self::describe_whoami(&text),
+        })
     }
 
     fn permissions(&self) -> anyhow::Result<PermissionsReport> {
@@ -398,6 +505,148 @@ mod tests {
             .notes
             .iter()
             .any(|n| n.text.contains("not logged in")));
+    }
+
+    // ---------------------------------------------------------------- verify
+
+    /// verify never reads the filesystem, so the fixture home stays empty and
+    /// only the scripted exec decides the answer.
+    fn probe_with(
+        exec: std::sync::Arc<crate::util::FakeExec>,
+    ) -> (tempfile::TempDir, WranglerProbe) {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = WranglerProbe::new(Paths::for_test(dir.path()).with_exec(exec));
+        (dir, probe)
+    }
+
+    /// `wrangler whoami` on this machine, verbatim apart from the ids.
+    const WHOAMI: &str = "\n ⛅️ wrangler 4.105.0\n\
+        ───────────────────────────────\n\
+        Getting User settings...\n\
+        👋 You are logged in with an OAuth Token, associated with the email dev@example.com.\n\
+        ┌──────────────┬──────────────────────────────────┐\n\
+        │ Account Name │ Account ID                       │\n\
+        ├──────────────┼──────────────────────────────────┤\n\
+        │ Cerana       │ 00000000000000000000000000000001 │\n\
+        ├──────────────┼──────────────────────────────────┤\n\
+        │ Pathors      │ 00000000000000000000000000000002 │\n\
+        └──────────────┴──────────────────────────────────┘\n\
+        🔓 Token Permissions:\n\
+        - account (read)\n";
+
+    #[test]
+    fn test_verify_reports_the_email_and_the_accounts_wrangler_names() {
+        let exec = std::sync::Arc::new(crate::util::FakeExec::new().on("whoami", true, WHOAMI, ""));
+        let (_dir, probe) = probe_with(exec.clone());
+        let outcome = probe.verify().unwrap();
+        assert_eq!(exec.last().unwrap().line(), "wrangler whoami");
+        match outcome {
+            VerifyOutcome::Valid { detail, .. } => {
+                assert!(detail.contains("dev@example.com"), "{detail}");
+                assert!(detail.contains("OAuth token"), "{detail}");
+                assert!(
+                    detail.contains("Cerana") && detail.contains("Pathors"),
+                    "{detail}"
+                );
+                // The header row is not an account.
+                assert!(!detail.contains("Account Name"), "{detail}");
+                assert_eq!(detail.lines().count(), 1, "{detail}");
+            }
+            other => panic!("expected Valid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_a_zero_exit_that_says_not_authenticated_is_not_a_working_login() {
+        // The trap: `wrangler whoami` succeeds when logged out.
+        let exec = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "whoami",
+            true,
+            "You are not authenticated. Please run `wrangler login`.\n",
+            "",
+        ));
+        let (_dir, probe) = probe_with(exec);
+        match probe.verify().unwrap() {
+            VerifyOutcome::Invalid { detail, .. } => {
+                assert!(detail.contains("wrangler login"), "{detail}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_a_rejected_token_and_an_outage_are_told_apart() {
+        let rejected = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "whoami",
+            false,
+            "",
+            "✘ [ERROR] A request to the Cloudflare API failed.\n  Unable to authenticate request [code: 10000]\n",
+        ));
+        let (_dir, probe) = probe_with(rejected);
+        match probe.verify().unwrap() {
+            VerifyOutcome::Invalid { detail, .. } => {
+                assert!(detail.contains("wrangler login"), "{detail}");
+                assert_eq!(detail.lines().count(), 1, "{detail}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+
+        let offline = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "whoami",
+            false,
+            "",
+            "✘ [ERROR] getaddrinfo ENOTFOUND api.cloudflare.com\n",
+        ));
+        let (_dir, probe) = probe_with(offline);
+        match probe.verify().unwrap() {
+            // An outage must never be filed as a dead login.
+            VerifyOutcome::Unsupported { reason, .. } => {
+                assert!(reason.contains("could not reach Cloudflare"), "{reason}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_unreadable_output_degrades_instead_of_panicking() {
+        // Cloudflare rewords this output regularly; a reword costs a thinner
+        // sentence, not a crash and not a false negative.
+        for junk in ["", "\u{0}\u{1}│││", "┌─┐\n│ only one cell │\n└─┘"] {
+            let exec =
+                std::sync::Arc::new(crate::util::FakeExec::new().on("whoami", true, junk, ""));
+            let (_dir, probe) = probe_with(exec);
+            match probe.verify().unwrap() {
+                VerifyOutcome::Valid { detail, .. } => {
+                    assert!(detail.contains("could not read an account"), "{detail}");
+                }
+                other => panic!("expected Valid, got {other:?}"),
+            }
+        }
+
+        // Same on the failure side: no message, still a sentence.
+        let exec = std::sync::Arc::new(crate::util::FakeExec::new().on("whoami", false, "", ""));
+        let (_dir, probe) = probe_with(exec);
+        match probe.verify().unwrap() {
+            VerifyOutcome::Invalid { detail, .. } => {
+                assert!(detail.contains("without saying why"), "{detail}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_verify_without_the_binary_stays_unsupported() {
+        let dir = tempfile::tempdir().unwrap();
+        match WranglerProbe::new(Paths::for_test(dir.path()))
+            .verify()
+            .unwrap()
+        {
+            VerifyOutcome::Unsupported { reason, hint, .. } => {
+                assert!(reason.contains("not available on PATH"), "{reason}");
+                assert_eq!(hint.as_deref(), Some("wrangler whoami"));
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
     }
 
     #[test]

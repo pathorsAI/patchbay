@@ -27,6 +27,7 @@ use serde::Deserialize;
 
 use crate::paths::Paths;
 use crate::probe::{unsupported_switch, unsupported_verify, Probe};
+use crate::probes::cli_verify;
 use crate::types::{
     ActiveConcept, Expiry, PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome,
 };
@@ -66,11 +67,97 @@ impl StripeProbe {
         Self { paths }
     }
 
+    /// What `stripe whoami` is, and is not.
+    ///
+    /// Stripe's CLI has no read-only command that both names the account and
+    /// exercises the key: `whoami` is explicit that it "reads credentials from
+    /// the config file and keychain — no API calls are made". So the tick means
+    /// "this is the key the CLI will send", not "Stripe still honours it", and
+    /// the detail says so rather than letting a green row imply the stronger
+    /// claim.
+    ///
+    /// **Why `whoami` and not `config --list`.** `config --list` prints the
+    /// config file back, and that file holds `test_mode_api_key` in plain text.
+    /// It is the same local read with a live secret in the output and no
+    /// `authenticated` flag to read. `whoami` reports key *availability* and
+    /// expiry without ever printing key material.
+    const CHECK_CAVEAT: &'static str =
+        "the stripe CLI names the key it will use (`whoami` reads the local config and keychain, \
+         so it does not prove Stripe still accepts it)";
+
     /// Stripe writes `YYYY-MM-DD` with no time and no zone. Treat it as end of
     /// that day UTC, so a key is not called expired hours early.
     fn parse_expiry(raw: &str) -> Option<chrono::DateTime<Utc>> {
         let date = NaiveDate::parse_from_str(raw.trim(), "%Y-%m-%d").ok()?;
         Utc.from_utc_datetime(&date.and_hms_opt(23, 59, 59)?).into()
+    }
+}
+
+/// `stripe whoami --format json`.
+///
+/// Every field is optional on purpose — the schema is documented as stable, but
+/// a verify that fails because one key moved is worse than a thinner sentence.
+/// Note what is *not* here: the key values. `whoami` reports availability and
+/// expiry only, which is exactly why it is the command patchbay runs.
+#[derive(Deserialize, Default)]
+struct Whoami {
+    #[serde(default)]
+    authenticated: Option<bool>,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    account_id: Option<String>,
+    #[serde(default)]
+    device_name: Option<String>,
+    #[serde(default)]
+    test_mode_key: Option<KeyState>,
+    #[serde(default)]
+    live_mode_key: Option<KeyState>,
+}
+
+#[derive(Deserialize, Default)]
+struct KeyState {
+    #[serde(default)]
+    available: Option<bool>,
+    #[serde(default)]
+    expires_at: Option<String>,
+}
+
+impl Whoami {
+    fn parse(stdout: &str) -> Option<Self> {
+        serde_json::from_str(stdout.trim()).ok()
+    }
+
+    fn describe(&self) -> String {
+        let who = self
+            .display_name
+            .clone()
+            .or_else(|| self.account_id.clone())
+            .unwrap_or_else(|| "an account it would not name".to_string());
+        let mut parts = Vec::new();
+        if let Some(account) = self.account_id.clone().filter(|a| *a != who) {
+            parts.push(account);
+        }
+        if let Some(device) = self.device_name.clone() {
+            parts.push(format!("device {device}"));
+        }
+        for (label, key) in [
+            ("test key", self.test_mode_key.as_ref()),
+            ("live key", self.live_mode_key.as_ref()),
+        ] {
+            let Some(key) = key else { continue };
+            if key.available == Some(false) {
+                continue;
+            }
+            match key.expires_at.as_deref().map(str::trim) {
+                Some(when) if !when.is_empty() => parts.push(format!("{label} to {when}")),
+                _ => parts.push(label.to_string()),
+            }
+        }
+        match parts.is_empty() {
+            true => who,
+            false => format!("{who} ({})", parts.join(", ")),
+        }
     }
 }
 
@@ -216,11 +303,66 @@ impl Probe for StripeProbe {
     }
 
     fn verify(&self) -> anyhow::Result<VerifyOutcome> {
-        Ok(unsupported_verify(
-            Self::TOOL,
-            "patchbay does not run stripe yet; the stored key expiry in status is the cheap answer",
-            Some("stripe config --list"),
-        ))
+        let status = self.status()?;
+        self.verify_profile(status.active.as_deref().unwrap_or(Self::ACTIVE_TABLE))
+    }
+
+    /// One profile, as the CLI itself resolves it.
+    ///
+    /// `--project-name` is the CLI's own per-invocation profile selector, so
+    /// asking about a profile never rewrites the file the way
+    /// `config --set-default` would.
+    fn verify_profile(&self, profile_id: &str) -> anyhow::Result<VerifyOutcome> {
+        if !self.paths.may_exec() || !self.paths.has_binary("stripe") {
+            return Ok(unsupported_verify(
+                Self::TOOL,
+                "the stripe CLI is not available on PATH",
+                Some("stripe whoami"),
+            ));
+        }
+
+        let mut args = vec!["whoami", "--format", "json"];
+        if profile_id != Self::ACTIVE_TABLE {
+            args.extend_from_slice(&["--project-name", profile_id]);
+        }
+        // The CLI fires a telemetry beacon and then *waits up to three seconds*
+        // for it before exiting. patchbay's verify should not pay that, and
+        // should not phone home on the user's behalf either.
+        let out = self.paths.run_env(
+            "stripe",
+            &args,
+            &[("STRIPE_CLI_TELEMETRY_OPTOUT", "1"), ("DO_NOT_TRACK", "1")],
+        )?;
+        if !out.ok {
+            return Ok(cli_verify::failure_outcome(
+                Self::TOOL,
+                &out,
+                "the Stripe CLI",
+                "stripe login",
+            ));
+        }
+
+        let who = Whoami::parse(&out.stdout);
+        if who.as_ref().is_some_and(|w| w.authenticated == Some(false)) {
+            return Ok(VerifyOutcome::Invalid {
+                tool: Self::TOOL.to_string(),
+                detail: format!(
+                    "the stripe CLI holds no key for profile `{profile_id}` — run `stripe login`"
+                ),
+            });
+        }
+        Ok(VerifyOutcome::Valid {
+            tool: Self::TOOL.to_string(),
+            detail: match who {
+                Some(who) => format!("{}: {}", Self::CHECK_CAVEAT, who.describe()),
+                // `whoami` exits non-zero when it is not authenticated, so a
+                // zero exit is still an answer even when the shape is strange.
+                None => format!(
+                    "{}, but `stripe whoami --format json` did not parse",
+                    Self::CHECK_CAVEAT
+                ),
+            },
+        })
     }
 
     fn permissions(&self) -> anyhow::Result<PermissionsReport> {
@@ -381,6 +523,183 @@ test_mode_key_expires_at = "2020-01-01"
             .find(|n| n.text.contains("display_name"))
             .expect("the profile rule is explained");
         assert_eq!(explanation.kind, NoteKind::Info);
+    }
+
+    // ---------------------------------------------------------------- verify
+
+    fn probe_with(
+        home: &std::path::Path,
+        exec: std::sync::Arc<crate::util::FakeExec>,
+    ) -> StripeProbe {
+        StripeProbe::new(Paths::for_test(home).with_exec(exec))
+    }
+
+    /// `stripe whoami --format json`, authenticated. Note what a real answer
+    /// does *not* contain: any key value.
+    const WHOAMI: &str = r#"{
+      "authenticated": true,
+      "profile_name": "default",
+      "display_name": "Pathors Ltd",
+      "account_id": "acct_1FAKEFIXTURE",
+      "device_name": "fixture-mbp",
+      "test_mode_key": { "available": true, "expires_at": "2030-11-11" },
+      "live_mode_key": { "available": true, "expires_at": "2030-12-01" },
+      "api_version": "2026-03-31"
+    }"#;
+
+    #[test]
+    fn test_verify_names_the_account_and_never_quotes_a_key() {
+        let (_dir, home) = fixture(CONFIG);
+        let exec = std::sync::Arc::new(crate::util::FakeExec::new().on("whoami", true, WHOAMI, ""));
+        let outcome = probe_with(&home, exec.clone()).verify().unwrap();
+        let call = exec.last().unwrap();
+        assert_eq!(call.line(), "stripe whoami --format json");
+        // The CLI waits up to three seconds on a telemetry beacon otherwise.
+        assert!(
+            call.env
+                .iter()
+                .any(|(k, v)| k == "STRIPE_CLI_TELEMETRY_OPTOUT" && v == "1"),
+            "{:?}",
+            call.env
+        );
+        match outcome {
+            VerifyOutcome::Valid { detail, .. } => {
+                assert!(detail.contains("Pathors Ltd"), "{detail}");
+                assert!(detail.contains("acct_1FAKEFIXTURE"), "{detail}");
+                assert!(detail.contains("test key to 2030-11-11"), "{detail}");
+                // The caveat travels with the tick: this is a local read.
+                assert!(detail.contains("does not prove"), "{detail}");
+                assert_eq!(detail.lines().count(), 1, "{detail}");
+            }
+            other => panic!("expected Valid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_verify_profile_pins_the_profile_it_was_asked_about() {
+        let (_dir, home) = fixture(CONFIG);
+        let exec = std::sync::Arc::new(crate::util::FakeExec::new().on("whoami", true, WHOAMI, ""));
+        let probe = probe_with(&home, exec.clone());
+        probe.verify_profile("staging").unwrap();
+        let args = exec.last().unwrap().args;
+        assert!(
+            args.contains(&"--project-name".to_string()) && args.contains(&"staging".to_string()),
+            "{args:?}"
+        );
+
+        // The default profile is the one the CLI already uses; naming it adds
+        // nothing and `--project-name default` is not how it is spelled.
+        probe.verify_profile("default").unwrap();
+        assert!(
+            !exec
+                .last()
+                .unwrap()
+                .args
+                .contains(&"--project-name".to_string()),
+            "{:?}",
+            exec.last().unwrap().args
+        );
+    }
+
+    #[test]
+    fn test_an_unauthenticated_answer_is_a_logged_out_answer() {
+        let (_dir, home) = fixture(CONFIG);
+        // `whoami` exits 1 in this state, but the flag is honoured either way.
+        let exec = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "whoami",
+            true,
+            r#"{ "authenticated": false, "profile_name": "default" }"#,
+            "",
+        ));
+        match probe_with(&home, exec).verify().unwrap() {
+            VerifyOutcome::Invalid { detail, .. } => {
+                assert!(detail.contains("stripe login"), "{detail}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_no_key_expired_key_and_an_outage_get_three_different_answers() {
+        let (_dir, home) = fixture(CONFIG);
+
+        let none = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "whoami",
+            false,
+            "You have not configured API keys yet.\n",
+            "",
+        ));
+        match probe_with(&home, none).verify().unwrap() {
+            VerifyOutcome::Invalid { detail, .. } => {
+                assert!(detail.contains("stripe login"), "{detail}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+
+        let expired = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "whoami",
+            false,
+            "",
+            "The API key for the default profile has expired. Run `stripe login` to re-authenticate.\nYou can also set the STRIPE_API_KEY environment variable.\n",
+        ));
+        match probe_with(&home, expired).verify().unwrap() {
+            VerifyOutcome::Invalid { detail, .. } => {
+                assert!(detail.contains("rejected"), "{detail}");
+                // One sentence, not both of the CLI's lines.
+                assert_eq!(detail.lines().count(), 1, "{detail}");
+                assert!(!detail.contains("STRIPE_API_KEY"), "{detail}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+
+        let offline = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "whoami",
+            false,
+            "",
+            "Get \"https://api.stripe.com/v1/account\": dial tcp: lookup api.stripe.com: no such host\n",
+        ));
+        match probe_with(&home, offline).verify().unwrap() {
+            VerifyOutcome::Unsupported { reason, .. } => {
+                assert!(reason.contains("could not reach"), "{reason}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_unreadable_output_degrades_instead_of_panicking() {
+        let (_dir, home) = fixture(CONFIG);
+        for junk in ["", "not json", "[[[[", "null"] {
+            let exec =
+                std::sync::Arc::new(crate::util::FakeExec::new().on("whoami", true, junk, ""));
+            match probe_with(&home, exec).verify().unwrap() {
+                VerifyOutcome::Valid { detail, .. } => {
+                    assert!(detail.contains("did not parse"), "{junk:?} -> {detail}");
+                }
+                other => panic!("expected Valid for {junk:?}, got {other:?}"),
+            }
+        }
+
+        // Valid JSON of an unexpected shape is not a crash either.
+        let exec = std::sync::Arc::new(crate::util::FakeExec::new().on("whoami", true, "{}", ""));
+        match probe_with(&home, exec).verify().unwrap() {
+            VerifyOutcome::Valid { detail, .. } => {
+                assert!(detail.contains("would not name"), "{detail}")
+            }
+            other => panic!("expected Valid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_verify_without_the_binary_stays_unsupported() {
+        let (_dir, home) = fixture(CONFIG);
+        match StripeProbe::new(Paths::for_test(&home)).verify().unwrap() {
+            VerifyOutcome::Unsupported { reason, hint, .. } => {
+                assert!(reason.contains("not available on PATH"), "{reason}");
+                assert_eq!(hint.as_deref(), Some("stripe whoami"));
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
     }
 
     #[test]

@@ -22,6 +22,7 @@
 
 use crate::paths::Paths;
 use crate::probe::{unsupported_switch, unsupported_verify, Probe};
+use crate::probes::cli_verify;
 use crate::types::{Expiry, PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
 use crate::util::{read_text, Ini};
 
@@ -37,6 +38,117 @@ impl HuggingfaceProbe {
     pub fn new(paths: Paths) -> Self {
         Self { paths }
     }
+
+    /// The whoami invocation for whichever CLI generation is installed.
+    ///
+    /// huggingface_hub 1.0 renamed the binary and moved the verb: `hf auth
+    /// whoami` replaced `huggingface-cli whoami`. Machines mid-upgrade have
+    /// only one of them, so the command is chosen rather than assumed.
+    ///
+    /// **`--format json` is not an optimisation, it is a correctness fix.** The
+    /// modern CLI defaults to `--format auto`, which sniffs environment
+    /// variables to decide whether it is talking to a human or to an AI agent
+    /// harness and *changes the output shape accordingly*. patchbay is
+    /// frequently launched from exactly such a harness, so leaving the format
+    /// to auto-detection means parsing a different answer depending on who
+    /// started the panel. The flag pins it.
+    fn whoami_command(&self) -> Option<(&'static str, Vec<&'static str>)> {
+        if !self.paths.may_exec() {
+            return None;
+        }
+        if self.paths.has_binary("hf") {
+            Some(("hf", vec!["auth", "whoami", "--format", "json"]))
+        } else if self.paths.has_binary("huggingface-cli") {
+            // The pre-1.0 CLI has neither the `auth` verb nor `--format`.
+            Some(("huggingface-cli", vec!["whoami"]))
+        } else {
+            None
+        }
+    }
+
+    /// `(username, orgs)` out of whoami, in either dialect it speaks.
+    ///
+    /// JSON first: `{"user": "...", "orgs": "a,b", "endpoint": null}` — note
+    /// that `orgs` is a **comma-joined string**, not a list, and is `null` when
+    /// there are none. Anything that is not JSON falls through to the legacy
+    /// text shape, which is the username on its own line and an optional
+    /// `orgs:  a,b` beneath it.
+    fn parse_whoami(stdout: &str) -> Option<(String, Vec<String>)> {
+        if let Some(parsed) = Self::parse_whoami_json(stdout) {
+            return Some(parsed);
+        }
+        Self::parse_whoami_text(stdout)
+    }
+
+    fn parse_whoami_json(stdout: &str) -> Option<(String, Vec<String>)> {
+        let value: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
+        let user = value.get("user")?.as_str()?.trim().to_string();
+        if user.is_empty() {
+            return None;
+        }
+        let orgs = value
+            .get("orgs")
+            .and_then(|o| o.as_str())
+            .map(|o| {
+                o.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        Some((user, orgs))
+    }
+
+    fn parse_whoami_text(stdout: &str) -> Option<(String, Vec<String>)> {
+        let mut user = None;
+        let mut orgs = Vec::new();
+        for line in stdout.lines() {
+            // NO_COLOR is set on every child, but a bold escape that slips
+            // through must not become part of a username.
+            let line = strip_ansi(line);
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(rest) = line.to_lowercase().strip_prefix("orgs:") {
+                let start = line.len() - rest.len();
+                orgs = line[start..]
+                    .split(',')
+                    .map(|o| o.trim().to_string())
+                    .filter(|o| !o.is_empty())
+                    .collect();
+                continue;
+            }
+            // A private-endpoint notice follows the username; do not take it.
+            if line.starts_with("Authenticated through") {
+                continue;
+            }
+            if user.is_none() {
+                user = Some(line.to_string());
+            }
+        }
+        user.map(|user| (user, orgs))
+    }
+}
+
+/// Drop CSI escape sequences. Deliberately tiny: this only ever sees one short
+/// line of a CLI's own output, and a dependency for that would be absurd.
+fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        // ESC [ … <final byte in @..~>
+        for c in chars.by_ref() {
+            if ('\u{40}'..='\u{7e}').contains(&c) && c != '[' {
+                break;
+            }
+        }
+    }
+    out
 }
 
 impl Probe for HuggingfaceProbe {
@@ -158,11 +270,53 @@ impl Probe for HuggingfaceProbe {
     }
 
     fn verify(&self) -> anyhow::Result<VerifyOutcome> {
-        Ok(unsupported_verify(
-            Self::TOOL,
-            "patchbay does not run the hf CLI yet; `hf auth whoami` is a network call",
-            Some("hf auth whoami"),
-        ))
+        let Some((bin, args)) = self.whoami_command() else {
+            return Ok(unsupported_verify(
+                Self::TOOL,
+                "the hf CLI is not available on PATH",
+                Some("hf auth whoami"),
+            ));
+        };
+
+        let out = self.paths.run(bin, &args)?;
+        if !out.ok {
+            // No token and a rejected token both exit 1 here — `Error: Not
+            // logged in` versus `Error: Invalid user token.` — so the text is
+            // what separates them, which is precisely what `classify` does.
+            return Ok(cli_verify::failure_outcome(
+                Self::TOOL,
+                &out,
+                "the Hugging Face Hub",
+                "hf auth login",
+            ));
+        }
+
+        // Belt and braces for older hub releases, which printed `Not logged in`
+        // and exited **zero**: on those, the exit code alone files a logged-out
+        // machine as a working login.
+        if cli_verify::says_logged_out(&out.stdout) {
+            return Ok(VerifyOutcome::Invalid {
+                tool: Self::TOOL.to_string(),
+                detail: "not logged in — run `hf auth login`".to_string(),
+            });
+        }
+
+        Ok(match Self::parse_whoami(&out.stdout) {
+            Some((user, orgs)) => VerifyOutcome::Valid {
+                tool: Self::TOOL.to_string(),
+                detail: match orgs.is_empty() {
+                    true => format!("the Hub accepted the token for {user}"),
+                    false => format!(
+                        "the Hub accepted the token for {user} (orgs: {})",
+                        orgs.join(", ")
+                    ),
+                },
+            },
+            None => VerifyOutcome::Valid {
+                tool: Self::TOOL.to_string(),
+                detail: "the Hub accepted the token, but `whoami` named no user".to_string(),
+            },
+        })
     }
 
     fn permissions(&self) -> anyhow::Result<PermissionsReport> {
@@ -314,6 +468,179 @@ mod tests {
         assert_eq!(env.kind, NoteKind::Warn);
         let json = serde_json::to_string(&status).unwrap();
         assert!(!json.contains("hf_fakefixtureenv"), "{json}");
+    }
+
+    // ---------------------------------------------------------------- verify
+
+    fn probe_with(
+        home: &std::path::Path,
+        exec: std::sync::Arc<crate::util::FakeExec>,
+    ) -> HuggingfaceProbe {
+        HuggingfaceProbe::new(Paths::for_test(home).with_exec(exec))
+    }
+
+    #[test]
+    fn test_verify_pins_the_output_format_and_reports_user_and_orgs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exec = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "whoami",
+            true,
+            r#"{"user": "pathors", "orgs": "pathors-ai,cerana", "endpoint": null}"#,
+            "",
+        ));
+        let outcome = probe_with(tmp.path(), exec.clone()).verify().unwrap();
+        // `--format auto` sniffs the environment for an AI-agent harness and
+        // changes shape; patchbay is often started from one, so the format is
+        // pinned rather than detected.
+        assert_eq!(exec.last().unwrap().line(), "hf auth whoami --format json");
+        match outcome {
+            VerifyOutcome::Valid { detail, .. } => {
+                assert!(detail.contains("pathors"), "{detail}");
+                // `orgs` arrives as one comma-joined string, not a list.
+                assert!(detail.contains("pathors-ai, cerana"), "{detail}");
+            }
+            other => panic!("expected Valid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_the_legacy_text_shape_still_parses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exec = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "whoami",
+            true,
+            "pathors\norgs:  pathors-ai,cerana\n",
+            "",
+        ));
+        match probe_with(tmp.path(), exec).verify().unwrap() {
+            VerifyOutcome::Valid { detail, .. } => {
+                assert!(detail.contains("pathors-ai, cerana"), "{detail}")
+            }
+            other => panic!("expected Valid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_no_token_and_a_bad_token_both_exit_one_and_are_told_apart() {
+        // Both are exit 1 with an `Error: …` on stderr, so only the text
+        // separates "you never logged in" from "your token was rejected".
+        let tmp = tempfile::tempdir().unwrap();
+        let exec = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "whoami",
+            false,
+            "",
+            "Error: Not logged in\n",
+        ));
+        match probe_with(tmp.path(), exec).verify().unwrap() {
+            VerifyOutcome::Invalid { detail, .. } => {
+                assert!(detail.contains("not logged in"), "{detail}");
+                assert!(detail.contains("hf auth login"), "{detail}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+
+        let exec = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "whoami",
+            false,
+            "",
+            "Error: Invalid user token. The token stored is invalid. Please run `hf auth login --force` to set a new token.\n",
+        ));
+        match probe_with(tmp.path(), exec).verify().unwrap() {
+            VerifyOutcome::Invalid { detail, .. } => {
+                assert!(detail.contains("rejected"), "{detail}");
+                assert_eq!(detail.lines().count(), 1, "{detail}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_not_logged_in_on_a_zero_exit_is_still_not_logged_in() {
+        // Older hub releases printed this and exited **0**.
+        let tmp = tempfile::tempdir().unwrap();
+        let exec = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "whoami",
+            true,
+            "Not logged in\n",
+            "",
+        ));
+        match probe_with(tmp.path(), exec).verify().unwrap() {
+            VerifyOutcome::Invalid { detail, .. } => {
+                assert!(detail.contains("hf auth login"), "{detail}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_a_revoked_token_and_an_outage_are_told_apart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let revoked = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "whoami",
+            false,
+            "401 Client Error: Unauthorized for url: https://huggingface.co/api/whoami-v2\n{\"error\":\"Invalid credentials in Authorization header\"}\n",
+            "",
+        ));
+        match probe_with(tmp.path(), revoked).verify().unwrap() {
+            VerifyOutcome::Invalid { detail, .. } => {
+                assert!(detail.contains("hf auth login"), "{detail}");
+                assert_eq!(detail.lines().count(), 1, "{detail}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+
+        let offline = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "whoami",
+            false,
+            "",
+            "requests.exceptions.ConnectionError: HTTPSConnectionPool(host='huggingface.co', port=443): Max retries exceeded\n",
+        ));
+        match probe_with(tmp.path(), offline).verify().unwrap() {
+            VerifyOutcome::Unsupported { reason, .. } => {
+                assert!(reason.contains("could not reach"), "{reason}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_unreadable_output_degrades_instead_of_panicking() {
+        let tmp = tempfile::tempdir().unwrap();
+        for junk in ["", "\n\n\n", "\u{1b}[1m\u{1b}[0m"] {
+            let exec =
+                std::sync::Arc::new(crate::util::FakeExec::new().on("whoami", true, junk, ""));
+            match probe_with(tmp.path(), exec).verify().unwrap() {
+                VerifyOutcome::Valid { detail, .. } => {
+                    assert!(detail.contains("named no user"), "{junk:?} -> {detail}");
+                }
+                other => panic!("expected Valid for {junk:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_the_legacy_binary_uses_the_verb_it_understands() {
+        // `hf auth whoami` did not exist before huggingface_hub 1.0.
+        assert_eq!(
+            HuggingfaceProbe::parse_whoami("pathors\n").map(|(u, _)| u),
+            Some("pathors".to_string())
+        );
+        assert_eq!(strip_ansi("\u{1b}[1morgs: \u{1b}[0m a"), "orgs:  a");
+    }
+
+    #[test]
+    fn test_verify_without_the_binary_stays_unsupported() {
+        let tmp = tempfile::tempdir().unwrap();
+        match HuggingfaceProbe::new(Paths::for_test(tmp.path()))
+            .verify()
+            .unwrap()
+        {
+            VerifyOutcome::Unsupported { reason, hint, .. } => {
+                assert!(reason.contains("not available on PATH"), "{reason}");
+                assert_eq!(hint.as_deref(), Some("hf auth whoami"));
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
     }
 
     #[test]

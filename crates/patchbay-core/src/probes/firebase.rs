@@ -28,6 +28,7 @@ use serde::Deserialize;
 
 use crate::paths::Paths;
 use crate::probe::{unsupported_switch, unsupported_verify, Probe};
+use crate::probes::cli_verify;
 use crate::types::{
     Expiry, Note, PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome,
 };
@@ -89,6 +90,69 @@ impl FirebaseProbe {
 
     pub fn new(paths: Paths) -> Self {
         Self { paths }
+    }
+
+    /// What a `login:list` answer is and — just as importantly — is not. The
+    /// caveat travels with every success detail rather than being left for the
+    /// user to infer from a green tick.
+    const CHECK_CAVEAT: &'static str =
+        "firebase-tools names the account it will use (`login:list` reads the local store, so it \
+         does not prove Google still accepts the grant)";
+
+    /// `firebase login:list`, reduced to the email addresses it names.
+    ///
+    /// `Ok(Err(outcome))` is the "already answered" case — no binary, or the
+    /// CLI failed — so callers can return it unchanged.
+    ///
+    /// **Why not `--json`.** `firebase login:list --json` does answer, and its
+    /// answer embeds the live `access_token` and `refresh_token` of every
+    /// account. Parsing it would put Google refresh tokens in patchbay's memory
+    /// and one careless error path away from a log line. The plain text prints
+    /// email addresses and nothing else, so the text is what gets parsed.
+    fn login_list(&self) -> anyhow::Result<Result<Vec<String>, VerifyOutcome>> {
+        if !self.paths.may_exec() || !self.paths.has_binary("firebase") {
+            return Ok(Err(unsupported_verify(
+                Self::TOOL,
+                "the firebase CLI is not available on PATH",
+                Some("firebase login:list"),
+            )));
+        }
+        // `--non-interactive` is belt and braces: login:list never prompts, but
+        // a future firebase-tools that decides to must fail rather than block a
+        // spinner forever.
+        let out = self
+            .paths
+            .run("firebase", &["login:list", "--non-interactive"])?;
+        if !out.ok {
+            return Ok(Err(cli_verify::failure_outcome(
+                Self::TOOL,
+                &out,
+                "firebase-tools",
+                "firebase login",
+            )));
+        }
+        Ok(Ok(Self::parse_login_list(&out.stdout)))
+    }
+
+    /// The emails out of `login:list`, primary first.
+    ///
+    /// The real output is `Logged in as a@b.com`, optionally followed by an
+    /// `Other accounts:` block of indented addresses. Rather than depend on
+    /// that layout surviving, this takes every `@`-shaped word in order and
+    /// de-duplicates — `Logged in as` is simply where the first one appears.
+    fn parse_login_list(stdout: &str) -> Vec<String> {
+        let mut emails: Vec<String> = Vec::new();
+        for word in stdout.split_whitespace() {
+            let candidate = word.trim_matches(|c: char| !c.is_ascii_graphic() || c == ',');
+            let is_email = candidate.contains('@')
+                && !candidate.starts_with('@')
+                && !candidate.ends_with('@')
+                && candidate.contains('.');
+            if is_email && !emails.iter().any(|e| e == candidate) {
+                emails.push(candidate.to_string());
+            }
+        }
+        emails
     }
 
     fn profile(email: &str, tokens: Option<&Tokens>) -> Profile {
@@ -200,11 +264,52 @@ impl Probe for FirebaseProbe {
     }
 
     fn verify(&self) -> anyhow::Result<VerifyOutcome> {
-        Ok(unsupported_verify(
-            Self::TOOL,
-            "patchbay does not run firebase yet; the CLI is node-based and slow to start",
-            Some("firebase login:list"),
-        ))
+        let accounts = match self.login_list()? {
+            Ok(accounts) => accounts,
+            Err(outcome) => return Ok(outcome),
+        };
+        let Some((primary, others)) = accounts.split_first() else {
+            return Ok(VerifyOutcome::Invalid {
+                tool: Self::TOOL.to_string(),
+                detail: "firebase-tools holds no account — run `firebase login`".to_string(),
+            });
+        };
+        let also = if others.is_empty() {
+            String::new()
+        } else {
+            format!(" (also {})", others.join(", "))
+        };
+        Ok(VerifyOutcome::Valid {
+            tool: Self::TOOL.to_string(),
+            detail: format!("{}: {primary}{also}", Self::CHECK_CAVEAT),
+        })
+    }
+
+    /// One named account, checked against the list the CLI itself keeps.
+    ///
+    /// firebase-tools has no global active account — `--account` picks one per
+    /// command — so the question worth answering per profile is whether the CLI
+    /// still holds a login for that address at all.
+    fn verify_profile(&self, profile_id: &str) -> anyhow::Result<VerifyOutcome> {
+        let accounts = match self.login_list()? {
+            Ok(accounts) => accounts,
+            Err(outcome) => return Ok(outcome),
+        };
+        Ok(
+            if accounts.iter().any(|a| a.eq_ignore_ascii_case(profile_id)) {
+                VerifyOutcome::Valid {
+                    tool: Self::TOOL.to_string(),
+                    detail: format!("{}: {profile_id}", Self::CHECK_CAVEAT),
+                }
+            } else {
+                VerifyOutcome::Invalid {
+                    tool: Self::TOOL.to_string(),
+                    detail: format!(
+                        "firebase-tools holds no login for {profile_id} — run `firebase login:add`"
+                    ),
+                }
+            },
+        )
     }
 
     fn permissions(&self) -> anyhow::Result<PermissionsReport> {
@@ -390,6 +495,124 @@ mod tests {
             .notes
             .iter()
             .any(|n| n.kind == NoteKind::Problem && n.text.contains("not valid JSON")));
+    }
+
+    // ---------------------------------------------------------------- verify
+
+    fn probe_with(
+        home: &std::path::Path,
+        exec: std::sync::Arc<crate::util::FakeExec>,
+    ) -> FirebaseProbe {
+        FirebaseProbe::new(Paths::for_test(home).with_exec(exec))
+    }
+
+    #[test]
+    fn test_verify_reports_the_accounts_the_cli_itself_lists() {
+        let (_dir, home) = fixture(STORE);
+        let exec = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "login:list",
+            true,
+            "Logged in as dev@example.com\n\nOther accounts:\n  ops@example.com\n",
+            "",
+        ));
+        let outcome = probe_with(&home, exec.clone()).verify().unwrap();
+        assert_eq!(
+            exec.last().unwrap().line(),
+            "firebase login:list --non-interactive"
+        );
+        match outcome {
+            VerifyOutcome::Valid { detail, .. } => {
+                assert!(detail.contains("dev@example.com"), "{detail}");
+                assert!(detail.contains("ops@example.com"), "{detail}");
+                // The caveat travels with the tick: this is a local read.
+                assert!(detail.contains("local store"), "{detail}");
+                assert_eq!(detail.lines().count(), 1, "{detail}");
+            }
+            other => panic!("expected Valid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_verify_profile_answers_for_the_account_it_was_asked_about() {
+        let (_dir, home) = fixture(STORE);
+        let listing = "Logged in as dev@example.com\n\nOther accounts:\n  ops@example.com\n";
+        let exec =
+            std::sync::Arc::new(crate::util::FakeExec::new().on("login:list", true, listing, ""));
+        let probe = probe_with(&home, exec);
+        assert!(matches!(
+            probe.verify_profile("ops@example.com").unwrap(),
+            VerifyOutcome::Valid { .. }
+        ));
+        match probe.verify_profile("stranger@example.com").unwrap() {
+            VerifyOutcome::Invalid { detail, .. } => {
+                assert!(detail.contains("firebase login:add"), "{detail}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_an_empty_listing_is_a_logged_out_answer() {
+        let (_dir, home) = fixture(STORE);
+        let exec = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "login:list",
+            true,
+            "No accounts to list\n",
+            "",
+        ));
+        match probe_with(&home, exec).verify().unwrap() {
+            VerifyOutcome::Invalid { detail, .. } => {
+                assert!(detail.contains("firebase login"), "{detail}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_a_failing_cli_becomes_one_sentence_not_a_stack_trace() {
+        let (_dir, home) = fixture(STORE);
+        let exec = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "login:list",
+            false,
+            "",
+            "Error: Failed to authenticate, have you run firebase login?\n    at requireAuth (/usr/lib/node_modules/firebase-tools/lib/requireAuth.js:52:11)\n    at async Command.prepare\n",
+        ));
+        match probe_with(&home, exec).verify().unwrap() {
+            VerifyOutcome::Invalid { detail, .. } => {
+                assert!(detail.contains("firebase login"), "{detail}");
+                // Not a paste of somebody else's stack.
+                assert!(!detail.contains("at requireAuth"), "{detail}");
+                assert_eq!(detail.lines().count(), 1, "{detail}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_unreadable_output_degrades_instead_of_panicking() {
+        let (_dir, home) = fixture(STORE);
+        for junk in ["", "@\n@@\n", "Logged in as\n", "\u{0}\u{1}\u{2}"] {
+            let exec =
+                std::sync::Arc::new(crate::util::FakeExec::new().on("login:list", true, junk, ""));
+            match probe_with(&home, exec).verify().unwrap() {
+                VerifyOutcome::Invalid { detail, .. } => {
+                    assert!(detail.contains("firebase login"), "{junk:?} -> {detail}");
+                }
+                other => panic!("expected Invalid for {junk:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_verify_without_the_binary_stays_unsupported() {
+        let (_dir, home) = fixture(STORE);
+        match FirebaseProbe::new(Paths::for_test(&home)).verify().unwrap() {
+            VerifyOutcome::Unsupported { reason, hint, .. } => {
+                assert!(reason.contains("not available on PATH"), "{reason}");
+                assert_eq!(hint.as_deref(), Some("firebase login:list"));
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
     }
 
     #[test]

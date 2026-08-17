@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Nine CLIs patchbay refused to verify are now verified.** `wrangler`,
+  `vercel`, `neon`, `supabase`, `flyctl`, `doctl`, `huggingface`, `stripe` and
+  `firebase` used to answer `verify` with an excuse and a command to paste —
+  "the CLI is node-based and slow to start", "that is a network call". Slow is
+  not a reason: `verify` only runs when you press the button or type `pb
+  verify`. Each now runs the tool's own check and reports the identity it
+  answers with, so you can hold it against what the board claimed: the
+  Cloudflare accounts behind a wrangler token, the Vercel username, the Neon
+  account and plan, the Supabase projects and org, the Fly and DigitalOcean
+  accounts, the Hub user and orgs, the Stripe account and key expiry, the
+  firebase-tools accounts.
+
+  Failures say one actionable sentence rather than pasting the tool's error
+  paragraph, and they distinguish three states that used to be one: logged out,
+  credential rejected, and *the network was unreachable* — the last of which is
+  no longer reported as a bad login, because nothing about the credential was
+  established. Where a check is local rather than a round trip (stripe and
+  firebase have no read-only command that both names the account and exercises
+  the credential) the answer says so instead of letting a tick imply more than
+  it proved.
+
+  Two hazards are handled rather than discovered later: `neon me` starts a
+  browser login when there is no credential, so that state is answered from the
+  tier-1 read without executing anything; and `fly auth whoami` offers an
+  interactive login unless `--json` is passed, so it is.
+
 ### Changed
 
 - **Notes carry a severity.** `ToolStatus.notes` was a `Vec<String>` — an
@@ -70,6 +98,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   project-scope note in the MCP server drawer explains that patchbay declines
   to write another project's config — a deliberate boundary, not a failure. It
   now renders as a quiet notice.
+
 
 ## [0.3.4] - 2026-08-17
 
