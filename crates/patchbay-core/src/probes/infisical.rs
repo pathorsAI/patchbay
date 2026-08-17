@@ -308,11 +308,15 @@ impl Probe for InfisicalProbe {
         })
     }
 
+    /// Genuinely unreadable, rather than not yet implemented: the Infisical CLI
+    /// has no command that reports a member's role, so there is nothing for
+    /// patchbay to run. No hint — the honest one would be "go and click around
+    /// in a dashboard", which is a chore, not an answer.
     fn permissions(&self) -> anyhow::Result<PermissionsReport> {
         Ok(PermissionsReport::unsupported(
             Self::TOOL,
-            "Infisical permissions are per-project roles held server-side; patchbay does not query the API",
-            Some("check the member's role in the Infisical project settings"),
+            "Infisical roles are held server-side and its CLI has no command that reports them",
+            None,
         ))
     }
 }
