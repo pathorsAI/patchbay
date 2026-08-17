@@ -3,6 +3,7 @@
 pub mod aws;
 pub mod az;
 pub mod claude;
+mod cli_verify;
 pub mod cloudflared;
 pub mod docker;
 pub mod doctl;

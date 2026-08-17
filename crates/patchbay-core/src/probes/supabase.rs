@@ -20,8 +20,11 @@
 //! account. There is no expiry anywhere: Supabase tokens are long-lived with
 //! server-side revocation (ADR 0008).
 
+use serde::Deserialize;
+
 use crate::paths::Paths;
 use crate::probe::{unsupported_switch, unsupported_verify, Probe};
+use crate::probes::cli_verify;
 use crate::types::{
     ActiveConcept, Expiry, PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome,
 };
@@ -39,6 +42,74 @@ impl SupabaseProbe {
     pub fn new(paths: Paths) -> Self {
         Self { paths }
     }
+
+    /// What the token can see, in one clause.
+    ///
+    /// A Supabase token has no "whoami": it carries the full rights of the
+    /// account that made it, and the only identity the API will hand back is
+    /// the set of organisations and projects it reaches. So that is what is
+    /// reported — the org slug where the projects agree on one, and enough
+    /// project names to recognise the account by.
+    ///
+    /// **An empty list is a success, not a failure.** The CLI builds the array
+    /// by appending to a nil slice, so a brand-new account serialises as `null`
+    /// rather than `[]`; both mean "the token worked and owns no projects", and
+    /// reading either as a broken login would be wrong.
+    fn describe_projects(stdout: &str) -> Option<String> {
+        let value: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
+        let projects: Vec<Project> = match value {
+            serde_json::Value::Null => Vec::new(),
+            serde_json::Value::Array(items) => items
+                .into_iter()
+                .filter_map(|item| serde_json::from_value(item).ok())
+                .collect(),
+            _ => return None,
+        };
+        if projects.is_empty() {
+            return Some("no projects on this account".to_string());
+        }
+
+        let mut orgs: Vec<&str> = projects
+            .iter()
+            .filter_map(|p| p.organization_slug.as_deref())
+            .collect();
+        orgs.sort_unstable();
+        orgs.dedup();
+
+        let named: Vec<&str> = projects
+            .iter()
+            .filter_map(|p| p.name.as_deref())
+            .take(3)
+            .collect();
+        let count = projects.len();
+        let plural = if count == 1 { "" } else { "s" };
+        let mut summary = format!("{count} project{plural}");
+        if !named.is_empty() {
+            let more = count.saturating_sub(named.len());
+            summary.push_str(&format!(" ({}", named.join(", ")));
+            if more > 0 {
+                summary.push_str(&format!(", +{more}"));
+            }
+            summary.push(')');
+        }
+        match orgs.as_slice() {
+            [only] => summary.push_str(&format!(" in org {only}")),
+            [] => {}
+            many => summary.push_str(&format!(" across {} orgs", many.len())),
+        }
+        Some(summary)
+    }
+}
+
+/// The two fields of a project row that say whose account this is. Everything
+/// else the CLI returns — region, status, database host, timestamps — is
+/// inventory, not identity.
+#[derive(Deserialize)]
+struct Project {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    organization_slug: Option<String>,
 }
 
 impl Probe for SupabaseProbe {
@@ -132,15 +203,43 @@ impl Probe for SupabaseProbe {
     }
 
     fn verify(&self) -> anyhow::Result<VerifyOutcome> {
-        // `supabase projects list` is the cheapest authenticated call, but it
-        // is a network round trip against an account patchbay has not been
-        // asked to touch. Left to the human until it earns its place.
-        Ok(unsupported_verify(
-            Self::TOOL,
-            "patchbay does not run supabase yet; the token is in the keyring, so only the CLI can \
-             answer whether it still works",
-            Some("supabase projects list"),
-        ))
+        if !self.paths.may_exec() || !self.paths.has_binary("supabase") {
+            return Ok(unsupported_verify(
+                Self::TOOL,
+                "the supabase CLI is not available on PATH",
+                Some("supabase projects list"),
+            ));
+        }
+
+        // This is the one probe where verify is not a nicety: the token
+        // normally lives in the OS keyring, which patchbay does not read, so
+        // tier 1 genuinely cannot say whether there is a login at all. Only the
+        // CLI can answer, and `projects list` is the cheapest thing that makes
+        // it try. `--output json` is a global flag on this CLI.
+        let out = self
+            .paths
+            .run("supabase", &["projects", "list", "--output", "json"])?;
+        if !out.ok {
+            return Ok(cli_verify::failure_outcome(
+                Self::TOOL,
+                &out,
+                "Supabase",
+                "supabase login",
+            ));
+        }
+
+        Ok(match Self::describe_projects(&out.stdout) {
+            Some(summary) => VerifyOutcome::Valid {
+                tool: Self::TOOL.to_string(),
+                detail: format!("Supabase accepted the token: {summary}"),
+            },
+            None => VerifyOutcome::Valid {
+                tool: Self::TOOL.to_string(),
+                detail: "Supabase accepted the token, but `supabase projects list --output json` \
+                         did not parse"
+                    .to_string(),
+            },
+        })
     }
 
     fn permissions(&self) -> anyhow::Result<PermissionsReport> {
@@ -257,5 +356,166 @@ mod tests {
         let status = SupabaseProbe::new(paths).status().unwrap();
         assert!(status.installed);
         assert_eq!(status.profiles.len(), 1);
+    }
+
+    // ---------------------------------------------------------------- verify
+
+    fn probe_with(
+        home: &std::path::Path,
+        exec: std::sync::Arc<crate::util::FakeExec>,
+    ) -> SupabaseProbe {
+        SupabaseProbe::new(Paths::for_test(home).with_exec(exec))
+    }
+
+    const PROJECTS: &str = r#"[
+      { "id": "aaaa", "name": "pathors-prod", "organization_id": "org1",
+        "organization_slug": "pathors", "region": "ap-northeast-1",
+        "status": "ACTIVE_HEALTHY", "linked": true },
+      { "id": "bbbb", "name": "pathors-stage", "organization_id": "org1",
+        "organization_slug": "pathors", "region": "ap-northeast-1",
+        "status": "ACTIVE_HEALTHY", "linked": false }
+    ]"#;
+
+    #[test]
+    fn test_verify_answers_the_question_tier_one_cannot() {
+        // The token normally lives in the OS keyring, so status has no profile
+        // to show; only the CLI can say whether there is a login.
+        let dir = tempfile::tempdir().unwrap();
+        let exec = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "projects list",
+            true,
+            PROJECTS,
+            "",
+        ));
+        let outcome = probe_with(dir.path(), exec.clone()).verify().unwrap();
+        assert_eq!(
+            exec.last().unwrap().line(),
+            "supabase projects list --output json"
+        );
+        match outcome {
+            VerifyOutcome::Valid { detail, .. } => {
+                assert!(detail.contains("2 projects"), "{detail}");
+                assert!(detail.contains("pathors-prod"), "{detail}");
+                assert!(detail.contains("in org pathors"), "{detail}");
+                assert_eq!(detail.lines().count(), 1, "{detail}");
+            }
+            other => panic!("expected Valid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_an_account_with_no_projects_is_a_working_token() {
+        // The Go CLI appends into a nil slice, so an empty result serialises as
+        // `null`. Reading either shape as a broken login would be wrong.
+        let dir = tempfile::tempdir().unwrap();
+        for empty in ["null", "[]"] {
+            let exec = std::sync::Arc::new(crate::util::FakeExec::new().on(
+                "projects list",
+                true,
+                empty,
+                "",
+            ));
+            match probe_with(dir.path(), exec).verify().unwrap() {
+                VerifyOutcome::Valid { detail, .. } => {
+                    assert!(detail.contains("no projects"), "{empty} -> {detail}");
+                }
+                other => panic!("expected Valid for {empty}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_logged_out_rejected_and_offline_get_three_different_answers() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let logged_out = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "projects list",
+            false,
+            "",
+            "Access token not provided. Supply an access token by running supabase login or setting the SUPABASE_ACCESS_TOKEN environment variable.\n",
+        ));
+        match probe_with(dir.path(), logged_out).verify().unwrap() {
+            VerifyOutcome::Invalid { detail, .. } => {
+                assert!(detail.contains("not logged in"), "{detail}");
+                assert!(detail.contains("supabase login"), "{detail}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+
+        let rejected = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "projects list",
+            false,
+            "",
+            "Unexpected error retrieving projects: {\"message\":\"Unauthorized\"}\n",
+        ));
+        match probe_with(dir.path(), rejected).verify().unwrap() {
+            VerifyOutcome::Invalid { detail, .. } => {
+                assert!(detail.contains("rejected"), "{detail}");
+                assert_eq!(detail.lines().count(), 1, "{detail}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+
+        // The CLI resolves through its own DNS-over-HTTPS dialer and says so.
+        let offline = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "projects list",
+            false,
+            "",
+            "failed to list projects: failed to dial native: dial tcp: lookup api.supabase.com: no such host\nfailed to dial fallback: context deadline exceeded\n",
+        ));
+        match probe_with(dir.path(), offline).verify().unwrap() {
+            VerifyOutcome::Unsupported { reason, .. } => {
+                assert!(reason.contains("could not reach Supabase"), "{reason}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_unreadable_output_degrades_instead_of_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        for junk in ["", "not json", "{\"unexpected\": true}", "[[[["] {
+            let exec = std::sync::Arc::new(crate::util::FakeExec::new().on(
+                "projects list",
+                true,
+                junk,
+                "",
+            ));
+            match probe_with(dir.path(), exec).verify().unwrap() {
+                VerifyOutcome::Valid { detail, .. } => {
+                    assert!(detail.contains("did not parse"), "{junk:?} -> {detail}");
+                }
+                other => panic!("expected Valid for {junk:?}, got {other:?}"),
+            }
+        }
+
+        // Rows of an unfamiliar shape are skipped, not fatal.
+        let exec = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "projects list",
+            true,
+            "[{\"id\": \"aaaa\"}]",
+            "",
+        ));
+        match probe_with(dir.path(), exec).verify().unwrap() {
+            VerifyOutcome::Valid { detail, .. } => {
+                assert!(detail.contains("1 project"), "{detail}")
+            }
+            other => panic!("expected Valid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_verify_without_the_binary_stays_unsupported() {
+        let dir = tempfile::tempdir().unwrap();
+        match SupabaseProbe::new(Paths::for_test(dir.path()))
+            .verify()
+            .unwrap()
+        {
+            VerifyOutcome::Unsupported { reason, hint, .. } => {
+                assert!(reason.contains("not available on PATH"), "{reason}");
+                assert_eq!(hint.as_deref(), Some("supabase projects list"));
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
     }
 }

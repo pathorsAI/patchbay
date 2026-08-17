@@ -20,6 +20,7 @@ use serde::Deserialize;
 
 use crate::paths::Paths;
 use crate::probe::{unsupported_switch, unsupported_verify, Probe};
+use crate::probes::cli_verify;
 use crate::types::{Expiry, PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
 use crate::util::read_text;
 
@@ -53,6 +54,29 @@ impl VercelProbe {
 
     pub fn new(paths: Paths) -> Self {
         Self { paths }
+    }
+
+    /// The username out of `vercel whoami`.
+    ///
+    /// Verified against Vercel CLI 42: the `▲ Vercel CLI <version>` banner goes
+    /// to **stderr** and the bare username to stdout, so this only ever reads
+    /// stdout. The banner filter is belt and braces — older CLIs printed it on
+    /// stdout, and a `> ` progress line still shows up there under some flags.
+    fn parse_whoami(stdout: &str) -> Option<String> {
+        stdout
+            .lines()
+            .map(str::trim)
+            // Searching from the end: the username is the last thing said,
+            // after any preamble.
+            .rfind(|line| {
+                !line.is_empty()
+                    && !line.starts_with("Vercel CLI")
+                    && !line.starts_with('>')
+                    && !line.starts_with('▲')
+                    && !line.starts_with("WARN")
+                    && !line.starts_with("NOTE")
+            })
+            .map(str::to_string)
     }
 
     /// First config directory that actually holds an `auth.json` or a
@@ -162,11 +186,37 @@ impl Probe for VercelProbe {
     }
 
     fn verify(&self) -> anyhow::Result<VerifyOutcome> {
-        Ok(unsupported_verify(
-            Self::TOOL,
-            "patchbay does not run vercel yet; the CLI is node-based and slow to start",
-            Some("vercel whoami"),
-        ))
+        if !self.paths.may_exec() || !self.paths.has_binary("vercel") {
+            return Ok(unsupported_verify(
+                Self::TOOL,
+                "the vercel CLI is not available on PATH",
+                Some("vercel whoami"),
+            ));
+        }
+
+        let out = self.paths.run("vercel", &["whoami"])?;
+        if !out.ok {
+            return Ok(cli_verify::failure_outcome(
+                Self::TOOL,
+                &out,
+                "Vercel",
+                "vercel login",
+            ));
+        }
+
+        Ok(match Self::parse_whoami(&out.stdout) {
+            Some(who) => VerifyOutcome::Valid {
+                tool: Self::TOOL.to_string(),
+                detail: format!("Vercel accepted the token for {who}"),
+            },
+            // Exit 0 means Vercel answered, so the token is good; only the name
+            // is missing. Reporting that as a dead login would be a lie.
+            None => VerifyOutcome::Valid {
+                tool: Self::TOOL.to_string(),
+                detail: "Vercel accepted the token, but `vercel whoami` printed no username"
+                    .to_string(),
+            },
+        })
     }
 
     fn permissions(&self) -> anyhow::Result<PermissionsReport> {
@@ -293,17 +343,131 @@ mod tests {
     }
 
     #[test]
-    fn test_switch_and_verify_are_honest_about_not_being_supported() {
+    fn test_switch_and_permissions_are_honest_about_not_being_supported() {
         let dir = tempfile::tempdir().unwrap();
         let probe = VercelProbe::new(Paths::for_test(dir.path()));
         assert!(matches!(
             probe.switch("team_x").unwrap(),
             SwitchOutcome::Unsupported { .. }
         ));
-        assert!(matches!(
-            probe.verify().unwrap(),
-            VerifyOutcome::Unsupported { .. }
-        ));
         assert!(!probe.permissions().unwrap().supported);
+    }
+
+    // ---------------------------------------------------------------- verify
+
+    fn probe_with(exec: std::sync::Arc<crate::util::FakeExec>) -> (tempfile::TempDir, VercelProbe) {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = VercelProbe::new(Paths::for_test(dir.path()).with_exec(exec));
+        (dir, probe)
+    }
+
+    #[test]
+    fn test_verify_reports_the_username_vercel_answers_with() {
+        // Verified against Vercel CLI 42: banner on stderr, username on stdout.
+        let exec = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "whoami",
+            true,
+            "yjack0000\n",
+            "Vercel CLI 42.2.0\n",
+        ));
+        let (_dir, probe) = probe_with(exec.clone());
+        let outcome = probe.verify().unwrap();
+        assert_eq!(exec.last().unwrap().line(), "vercel whoami");
+        match outcome {
+            VerifyOutcome::Valid { detail, .. } => {
+                assert!(detail.contains("yjack0000"), "{detail}");
+                // The banner is not an identity.
+                assert!(!detail.contains("Vercel CLI 42"), "{detail}");
+            }
+            other => panic!("expected Valid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_a_banner_on_stdout_is_still_not_mistaken_for_the_username() {
+        let exec = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "whoami",
+            true,
+            "Vercel CLI 28.0.0\n> Fetching user\nyjack0000\n",
+            "",
+        ));
+        let (_dir, probe) = probe_with(exec);
+        match probe.verify().unwrap() {
+            VerifyOutcome::Valid { detail, .. } => {
+                assert!(detail.ends_with("yjack0000"), "{detail}")
+            }
+            other => panic!("expected Valid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_logged_out_names_the_command_that_fixes_it() {
+        let exec = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "whoami",
+            false,
+            "",
+            "Error: No existing credentials found. Please run `vercel login` or pass \"--token\"\n",
+        ));
+        let (_dir, probe) = probe_with(exec);
+        match probe.verify().unwrap() {
+            VerifyOutcome::Invalid { detail, .. } => {
+                assert!(detail.contains("vercel login"), "{detail}");
+                assert_eq!(detail.lines().count(), 1, "{detail}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_an_outage_is_not_reported_as_a_dead_token() {
+        let exec = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "whoami",
+            false,
+            "",
+            "Error: Failed to fetch user: FetchError: request to https://api.vercel.com/v2/user failed, reason: getaddrinfo ENOTFOUND api.vercel.com\n",
+        ));
+        let (_dir, probe) = probe_with(exec);
+        match probe.verify().unwrap() {
+            VerifyOutcome::Unsupported { reason, .. } => {
+                assert!(reason.contains("could not reach Vercel"), "{reason}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_unreadable_output_degrades_instead_of_panicking() {
+        let exec = std::sync::Arc::new(crate::util::FakeExec::new().on("whoami", true, "\n\n", ""));
+        let (_dir, probe) = probe_with(exec);
+        match probe.verify().unwrap() {
+            VerifyOutcome::Valid { detail, .. } => {
+                assert!(detail.contains("no username"), "{detail}")
+            }
+            other => panic!("expected Valid, got {other:?}"),
+        }
+
+        let exec = std::sync::Arc::new(crate::util::FakeExec::new().on("whoami", false, "", ""));
+        let (_dir, probe) = probe_with(exec);
+        match probe.verify().unwrap() {
+            VerifyOutcome::Invalid { detail, .. } => {
+                assert!(detail.contains("without saying why"), "{detail}")
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_verify_without_the_binary_stays_unsupported() {
+        let dir = tempfile::tempdir().unwrap();
+        match VercelProbe::new(Paths::for_test(dir.path()))
+            .verify()
+            .unwrap()
+        {
+            VerifyOutcome::Unsupported { reason, hint, .. } => {
+                assert!(reason.contains("not available on PATH"), "{reason}");
+                assert_eq!(hint.as_deref(), Some("vercel whoami"));
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
     }
 }

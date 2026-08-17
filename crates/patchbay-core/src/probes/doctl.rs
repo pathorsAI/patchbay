@@ -30,6 +30,7 @@ use serde::Deserialize;
 
 use crate::paths::Paths;
 use crate::probe::{unknown_profile, unsupported_switch, unsupported_verify, Probe};
+use crate::probes::cli_verify;
 use crate::types::{Expiry, PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
 use crate::util::read_text;
 
@@ -60,6 +61,138 @@ impl DoctlProbe {
 
     pub fn new(paths: Paths) -> Self {
         Self { paths }
+    }
+
+    /// `doctl account get -o json`, optionally pinned to one auth context.
+    fn run_account_get(&self, context: Option<&str>) -> anyhow::Result<VerifyOutcome> {
+        if !self.paths.may_exec() || !self.paths.has_binary("doctl") {
+            return Ok(unsupported_verify(
+                Self::TOOL,
+                "the doctl CLI is not available on PATH",
+                Some("doctl account get"),
+            ));
+        }
+
+        let mut args = vec!["account", "get", "-o", "json"];
+        if let Some(context) = context {
+            args.extend_from_slice(&["--context", context]);
+        }
+        let out = self.paths.run("doctl", &args)?;
+        if !out.ok {
+            return Ok(cli_verify::failure_outcome(
+                Self::TOOL,
+                &Self::surface_error(&out),
+                "DigitalOcean",
+                "doctl auth init",
+            ));
+        }
+
+        let named = match context {
+            Some(context) => format!("context `{context}`: "),
+            None => String::new(),
+        };
+        Ok(match Account::parse(&out.stdout) {
+            Some(account) => VerifyOutcome::Valid {
+                tool: Self::TOOL.to_string(),
+                detail: format!(
+                    "{named}DigitalOcean accepted the token for {}",
+                    account.describe()
+                ),
+            },
+            // Exit 0: DigitalOcean answered, so the token is live. Only the
+            // shape of the answer is unfamiliar.
+            None => VerifyOutcome::Valid {
+                tool: Self::TOOL.to_string(),
+                detail: format!(
+                    "{named}DigitalOcean accepted the token, but `doctl account get -o json` did \
+                     not parse"
+                ),
+            },
+        })
+    }
+
+    /// Lift doctl's error out of wherever `-o json` put it.
+    ///
+    /// **The trap.** With `-o json` doctl stops writing `Error: …` to stderr
+    /// and writes `{"errors":[{"detail":"…"}]}` to **stdout** instead. The
+    /// shared classifier reads stderr first and only falls back to stdout, so
+    /// without this it would be classifying a JSON envelope rather than the
+    /// message inside it — and `{"errors":…}` matches none of the markers, so
+    /// every failure would come back as "unclassified" with a brace for a
+    /// headline. The detail is hoisted into the stderr slot so both output
+    /// modes classify the same way.
+    fn surface_error(out: &crate::util::CmdOutput) -> crate::util::CmdOutput {
+        if !out.stderr.trim().is_empty() {
+            return out.clone();
+        }
+        let detail = serde_json::from_str::<serde_json::Value>(out.stdout.trim())
+            .ok()
+            .and_then(|v| {
+                v.get("errors")?
+                    .as_array()?
+                    .iter()
+                    .filter_map(|e| e.get("detail")?.as_str())
+                    .map(str::to_string)
+                    .next()
+            });
+        match detail {
+            Some(detail) => crate::util::CmdOutput {
+                ok: out.ok,
+                stdout: String::new(),
+                stderr: detail,
+            },
+            None => out.clone(),
+        }
+    }
+}
+
+/// The identity half of `doctl account get -o json`. Limits and counters are
+/// deliberately absent: they change hourly and say nothing about who you are.
+#[derive(Deserialize, Default)]
+struct Account {
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    uuid: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    team: Option<Team>,
+}
+
+#[derive(Deserialize, Default)]
+struct Team {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+impl Account {
+    /// doctl's displayer has emitted both a bare object and a one-element array
+    /// across versions; accept either rather than betting on one.
+    fn parse(stdout: &str) -> Option<Self> {
+        let value: serde_json::Value = serde_json::from_str(stdout).ok()?;
+        let value = match value {
+            serde_json::Value::Array(items) => items.into_iter().next()?,
+            other => other,
+        };
+        let account: Self = serde_json::from_value(value).ok()?;
+        // An object with none of the fields is not an answer.
+        (account.email.is_some() || account.uuid.is_some()).then_some(account)
+    }
+
+    fn describe(&self) -> String {
+        let who = self
+            .email
+            .clone()
+            .or_else(|| self.uuid.clone())
+            .unwrap_or_else(|| "an account it would not name".to_string());
+        let team = self.team.as_ref().and_then(|t| t.name.clone());
+        match (team, &self.status) {
+            (Some(team), Some(status)) => format!("{who} (team {team}, {status})"),
+            (Some(team), None) => format!("{who} (team {team})"),
+            (None, Some(status)) => format!("{who} ({status})"),
+            (None, None) => who,
+        }
     }
 }
 
@@ -171,11 +304,35 @@ impl Probe for DoctlProbe {
     }
 
     fn verify(&self) -> anyhow::Result<VerifyOutcome> {
-        Ok(unsupported_verify(
-            Self::TOOL,
-            "patchbay does not run doctl yet; `doctl account get` is a network call",
-            Some("doctl account get"),
-        ))
+        let status = self.status()?;
+        match status.active.clone() {
+            // Without --context doctl answers about whichever context the file
+            // names, so naming it explicitly is what keeps a per-row answer
+            // about that row.
+            Some(active) => self.verify_profile(&active),
+            None => self.run_account_get(None),
+        }
+    }
+
+    /// One named auth context, checked as itself.
+    ///
+    /// `--context` is a persistent flag: it selects the token for a single
+    /// invocation without rewriting config.yaml, which is exactly the
+    /// difference between checking a profile and switching to it.
+    fn verify_profile(&self, profile_id: &str) -> anyhow::Result<VerifyOutcome> {
+        let status = self.status()?;
+        if !status.profiles.is_empty() && !status.profiles.iter().any(|p| p.id == profile_id) {
+            let available: Vec<_> = status.profiles.iter().map(|p| p.id.as_str()).collect();
+            return Ok(unsupported_verify(
+                Self::TOOL,
+                &format!(
+                    "no auth context called `{profile_id}`; contexts: {}",
+                    available.join(", ")
+                ),
+                Some("doctl auth list"),
+            ));
+        }
+        self.run_account_get(Some(profile_id))
     }
 
     fn permissions(&self) -> anyhow::Result<PermissionsReport> {
@@ -319,5 +476,180 @@ mod tests {
             probe.switch("default").unwrap(),
             SwitchOutcome::Unsupported { .. }
         ));
+    }
+
+    // ---------------------------------------------------------------- verify
+
+    fn probe_with(
+        home: &std::path::Path,
+        exec: std::sync::Arc<crate::util::FakeExec>,
+    ) -> DoctlProbe {
+        DoctlProbe::new(Paths::for_test(home).with_exec(exec))
+    }
+
+    const ACCOUNT: &str = r#"{
+      "droplet_limit": 25,
+      "email": "dev@example.com",
+      "uuid": "0a1b2c3d0000444488880000abcdefab",
+      "email_verified": true,
+      "status": "active",
+      "team": { "name": "Pathors", "uuid": "team-0001" }
+    }"#;
+
+    const TWO_CONTEXTS: &str = "context: pathors-team\n\
+         access-token: dop_v1_fakefixturedefault\n\
+         auth-contexts:\n  pathors-team: dop_v1_fakefixtureteam\n";
+
+    #[test]
+    fn test_verify_asks_about_the_active_context_by_name() {
+        let (_dir, home) = fixture(TWO_CONTEXTS);
+        let exec =
+            std::sync::Arc::new(crate::util::FakeExec::new().on("account get", true, ACCOUNT, ""));
+        let outcome = probe_with(&home, exec.clone()).verify().unwrap();
+        // Without --context doctl answers about the file's context whatever row
+        // the panel thinks it is asking about.
+        assert_eq!(
+            exec.last().unwrap().line(),
+            "doctl account get -o json --context pathors-team"
+        );
+        match outcome {
+            VerifyOutcome::Valid { detail, .. } => {
+                assert!(detail.contains("dev@example.com"), "{detail}");
+                assert!(detail.contains("Pathors"), "{detail}");
+                assert!(detail.contains("pathors-team"), "{detail}");
+            }
+            other => panic!("expected Valid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_verify_profile_pins_the_context_it_was_asked_about() {
+        let (_dir, home) = fixture(TWO_CONTEXTS);
+        let exec =
+            std::sync::Arc::new(crate::util::FakeExec::new().on("account get", true, ACCOUNT, ""));
+        let probe = probe_with(&home, exec.clone());
+        probe.verify_profile("default").unwrap();
+        assert!(
+            exec.last().unwrap().args.contains(&"default".to_string()),
+            "{:?}",
+            exec.last().unwrap().args
+        );
+
+        match probe.verify_profile("ghost").unwrap() {
+            VerifyOutcome::Unsupported { reason, .. } => {
+                assert!(reason.contains("pathors-team"), "{reason}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_a_json_array_of_one_parses_like_the_bare_object() {
+        // doctl's displayer has emitted both across versions.
+        let wrapped = format!("[{ACCOUNT}]");
+        let (_dir, home) = fixture(TWO_CONTEXTS);
+        let exec =
+            std::sync::Arc::new(crate::util::FakeExec::new().on("account get", true, &wrapped, ""));
+        match probe_with(&home, exec).verify().unwrap() {
+            VerifyOutcome::Valid { detail, .. } => {
+                assert!(detail.contains("dev@example.com"), "{detail}")
+            }
+            other => panic!("expected Valid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_logged_out_revoked_and_offline_get_three_different_answers() {
+        let (_dir, home) = fixture(TWO_CONTEXTS);
+
+        let cases: [(&str, &dyn Fn(VerifyOutcome)); 3] = [
+            (
+                "Error: unable to initialize DigitalOcean API client: access token is required. (hint: run 'doctl auth init')\n",
+                &|outcome| match outcome {
+                    VerifyOutcome::Invalid { detail, .. } => {
+                        assert!(detail.contains("not logged in"), "{detail}");
+                        assert!(detail.contains("doctl auth init"), "{detail}");
+                    }
+                    other => panic!("expected Invalid, got {other:?}"),
+                },
+            ),
+            (
+                "Error: GET https://api.digitalocean.com/v2/account: 401 (request \"abc\") Unable to authenticate you\n",
+                &|outcome| match outcome {
+                    VerifyOutcome::Invalid { detail, .. } => {
+                        assert!(detail.contains("rejected"), "{detail}");
+                        assert!(detail.contains("doctl auth init"), "{detail}");
+                    }
+                    other => panic!("expected Invalid, got {other:?}"),
+                },
+            ),
+            (
+                "Error: Get \"https://api.digitalocean.com/v2/account\": dial tcp: lookup api.digitalocean.com: no such host\n",
+                &|outcome| match outcome {
+                    VerifyOutcome::Unsupported { reason, .. } => {
+                        assert!(reason.contains("could not reach DigitalOcean"), "{reason}");
+                    }
+                    other => panic!("expected Unsupported, got {other:?}"),
+                },
+            ),
+        ];
+
+        for (stderr, check) in cases {
+            let exec = std::sync::Arc::new(crate::util::FakeExec::new().on(
+                "account get",
+                false,
+                "",
+                stderr,
+            ));
+            check(probe_with(&home, exec).verify().unwrap());
+        }
+    }
+
+    #[test]
+    fn test_a_json_error_envelope_on_stdout_classifies_like_the_text_one() {
+        // With `-o json` doctl writes the error to stdout as JSON and leaves
+        // stderr empty; classifying the envelope instead of the message would
+        // turn every failure into an unreadable "unclassified" answer.
+        let (_dir, home) = fixture(TWO_CONTEXTS);
+        let exec = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "account get",
+            false,
+            "{\"errors\":[{\"detail\":\"GET https://api.digitalocean.com/v2/account: 401 (request \\\"abc\\\") Unable to authenticate you\"}]}",
+            "",
+        ));
+        match probe_with(&home, exec).verify().unwrap() {
+            VerifyOutcome::Invalid { detail, .. } => {
+                assert!(detail.contains("rejected"), "{detail}");
+                assert!(!detail.contains("errors"), "{detail}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_unparseable_json_degrades_instead_of_panicking() {
+        let (_dir, home) = fixture(TWO_CONTEXTS);
+        for junk in ["", "not json at all", "{}", "[]", "null", "[[[["] {
+            let exec =
+                std::sync::Arc::new(crate::util::FakeExec::new().on("account get", true, junk, ""));
+            match probe_with(&home, exec).verify().unwrap() {
+                VerifyOutcome::Valid { detail, .. } => {
+                    assert!(detail.contains("did not parse"), "{junk:?} -> {detail}");
+                }
+                other => panic!("expected Valid for {junk:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_verify_without_the_binary_stays_unsupported() {
+        let (_dir, home) = fixture(TWO_CONTEXTS);
+        match DoctlProbe::new(Paths::for_test(&home)).verify().unwrap() {
+            VerifyOutcome::Unsupported { reason, hint, .. } => {
+                assert!(reason.contains("not available on PATH"), "{reason}");
+                assert_eq!(hint.as_deref(), Some("doctl account get"));
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
     }
 }

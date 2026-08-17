@@ -27,6 +27,7 @@ use serde::Deserialize;
 
 use crate::paths::Paths;
 use crate::probe::{unsupported_switch, unsupported_verify, Probe};
+use crate::probes::cli_verify;
 use crate::types::{
     Expiry, Note, PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome,
 };
@@ -61,6 +62,54 @@ impl NeonProbe {
     fn scopes(raw: Option<&str>) -> Vec<String> {
         raw.map(|s| s.split_whitespace().map(str::to_string).collect())
             .unwrap_or_default()
+    }
+
+    /// Whichever of the two names is installed — see the rename trap in the
+    /// module header. `neon` first, because that is the current one.
+    fn binary(&self) -> Option<&'static str> {
+        if !self.paths.may_exec() {
+            return None;
+        }
+        ["neon", "neonctl"]
+            .into_iter()
+            .find(|bin| self.paths.has_binary(bin))
+    }
+}
+
+/// The half of `neon me --output json` worth naming. The response also carries
+/// an avatar URL per auth account, which is bulk with no bearing on identity,
+/// and `auth_accounts`, which repeats the same person once per provider.
+#[derive(Deserialize, Default)]
+struct Me {
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    login: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    plan: Option<String>,
+}
+
+impl Me {
+    /// The identity in one clause, however much of it Neon actually sent.
+    fn describe(&self) -> String {
+        let who = self
+            .email
+            .clone()
+            .or_else(|| self.login.clone())
+            .or_else(|| self.name.clone())
+            .or_else(|| self.id.clone())
+            .unwrap_or_else(|| "an account it would not name".to_string());
+        match (&self.login, &self.plan) {
+            (Some(login), Some(plan)) if Some(login) != self.email.as_ref() => {
+                format!("{who} (login {login}, {plan} plan)")
+            }
+            (_, Some(plan)) => format!("{who} ({plan} plan)"),
+            _ => who,
+        }
     }
 }
 
@@ -150,12 +199,57 @@ impl Probe for NeonProbe {
     }
 
     fn verify(&self) -> anyhow::Result<VerifyOutcome> {
-        Ok(unsupported_verify(
-            Self::TOOL,
-            "patchbay does not run neon yet; `neon me` is a network call and the local expiry is \
-             usually enough",
-            Some("neon me"),
-        ))
+        let Some(bin) = self.binary() else {
+            return Ok(unsupported_verify(
+                Self::TOOL,
+                "the neon CLI is not available on PATH",
+                Some("neon me"),
+            ));
+        };
+
+        // **The reason this gate exists.** `neon me` does not fail when there
+        // is no credential: the CLI starts its OAuth flow, opens a browser and
+        // waits for the callback. A verify that hangs a spinner until the user
+        // logs in is worse than no verify, so the one state that would trigger
+        // it is answered from tier 1 instead — exactly the shape gcloud uses
+        // for an uncredentialed account.
+        let credentialed = self.paths.neon_dir().join("credentials.json").is_file()
+            || self.paths.env("NEON_API_KEY").is_some();
+        if !credentialed {
+            return Ok(VerifyOutcome::Invalid {
+                tool: Self::TOOL.to_string(),
+                detail: "no stored Neon credential on this machine — run `neon auth`".to_string(),
+            });
+        }
+
+        let out = self.paths.run(bin, &["me", "--output", "json"])?;
+        if !out.ok {
+            return Ok(cli_verify::failure_outcome(
+                Self::TOOL,
+                &out,
+                "Neon",
+                "neon auth",
+            ));
+        }
+
+        let me: Me = match serde_json::from_str(&out.stdout) {
+            Ok(me) => me,
+            Err(e) => {
+                // Exit 0, so Neon answered and the grant works; only the shape
+                // of the answer is unfamiliar.
+                return Ok(VerifyOutcome::Valid {
+                    tool: Self::TOOL.to_string(),
+                    detail: format!(
+                        "Neon accepted the login, but `neon me --output json` did not parse ({e})"
+                    ),
+                });
+            }
+        };
+
+        Ok(VerifyOutcome::Valid {
+            tool: Self::TOOL.to_string(),
+            detail: format!("Neon accepted the login for {}", me.describe()),
+        })
     }
 
     fn permissions(&self) -> anyhow::Result<PermissionsReport> {
@@ -340,6 +434,140 @@ mod tests {
         assert!(status.notes.iter().any(|n| n.kind == NoteKind::Problem
             && n.text
                 .contains("expires_at is present but is not a usable timestamp")));
+    }
+
+    // ---------------------------------------------------------------- verify
+
+    fn probe_with(
+        home: &std::path::Path,
+        exec: std::sync::Arc<crate::util::FakeExec>,
+    ) -> NeonProbe {
+        NeonProbe::new(Paths::for_test(home).with_exec(exec))
+    }
+
+    /// `neon me --output json` on this machine, minus the avatar URLs.
+    const ME: &str = r#"{
+      "email": "dev@example.com",
+      "id": "0a1b2c3d-0000-4444-8888-abcdefabcdef",
+      "login": "devlogin",
+      "name": "Dev",
+      "projects_limit": 0,
+      "plan": "free"
+    }"#;
+
+    #[test]
+    fn test_verify_reports_the_account_neon_names() {
+        let (_dir, home) = fixture(&credentials(1785611828464));
+        let exec = std::sync::Arc::new(crate::util::FakeExec::new().on("me", true, ME, ""));
+        let outcome = probe_with(&home, exec.clone()).verify().unwrap();
+        assert_eq!(exec.last().unwrap().line(), "neon me --output json");
+        match outcome {
+            VerifyOutcome::Valid { detail, .. } => {
+                assert!(detail.contains("dev@example.com"), "{detail}");
+                assert!(detail.contains("devlogin"), "{detail}");
+                assert!(detail.contains("free"), "{detail}");
+            }
+            other => panic!("expected Valid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_no_stored_credential_is_answered_without_opening_a_browser() {
+        // `neon me` with nothing on disk starts the OAuth flow and waits for a
+        // browser callback. Tier 1 already knows the answer, so nothing runs.
+        let dir = tempfile::tempdir().unwrap();
+        let exec = std::sync::Arc::new(crate::util::FakeExec::new().on("me", true, ME, ""));
+        match probe_with(dir.path(), exec.clone()).verify().unwrap() {
+            VerifyOutcome::Invalid { detail, .. } => {
+                assert!(detail.contains("neon auth"), "{detail}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        assert!(exec.calls().is_empty(), "nothing may be executed here");
+    }
+
+    #[test]
+    fn test_an_api_key_in_the_environment_is_credential_enough_to_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let exec = std::sync::Arc::new(crate::util::FakeExec::new().on("me", true, ME, ""));
+        let paths = Paths::for_test(dir.path())
+            .with_env("NEON_API_KEY", "fake-fixture-key")
+            .with_exec(exec.clone());
+        assert!(matches!(
+            NeonProbe::new(paths).verify().unwrap(),
+            VerifyOutcome::Valid { .. }
+        ));
+        assert_eq!(exec.calls().len(), 1);
+    }
+
+    #[test]
+    fn test_a_revoked_grant_and_an_outage_get_different_answers() {
+        let (_dir, home) = fixture(&credentials(1785611828464));
+
+        let revoked = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "me",
+            false,
+            "",
+            "ERROR: Authentication failed: 401 Unauthorized\n",
+        ));
+        match probe_with(&home, revoked).verify().unwrap() {
+            VerifyOutcome::Invalid { detail, .. } => {
+                assert!(detail.contains("neon auth"), "{detail}");
+                assert_eq!(detail.lines().count(), 1, "{detail}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+
+        let offline = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "me",
+            false,
+            "",
+            "ERROR: request to https://console.neon.tech/api/v2/users/me failed: getaddrinfo EAI_AGAIN console.neon.tech\n",
+        ));
+        match probe_with(&home, offline).verify().unwrap() {
+            VerifyOutcome::Unsupported { reason, .. } => {
+                assert!(reason.contains("could not reach Neon"), "{reason}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_unparseable_json_degrades_instead_of_panicking() {
+        let (_dir, home) = fixture(&credentials(1785611828464));
+        let exec = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "me",
+            true,
+            "Warning: a new version is available\n{ not json",
+            "",
+        ));
+        match probe_with(&home, exec).verify().unwrap() {
+            VerifyOutcome::Valid { detail, .. } => {
+                assert!(detail.contains("did not parse"), "{detail}");
+            }
+            other => panic!("expected Valid, got {other:?}"),
+        }
+
+        // Valid JSON of an unexpected shape is not a crash either.
+        let exec = std::sync::Arc::new(crate::util::FakeExec::new().on("me", true, "{}", ""));
+        match probe_with(&home, exec).verify().unwrap() {
+            VerifyOutcome::Valid { detail, .. } => {
+                assert!(detail.contains("would not name"), "{detail}");
+            }
+            other => panic!("expected Valid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_verify_without_the_binary_stays_unsupported() {
+        let (_dir, home) = fixture(&credentials(1785611828464));
+        match NeonProbe::new(Paths::for_test(&home)).verify().unwrap() {
+            VerifyOutcome::Unsupported { reason, hint, .. } => {
+                assert!(reason.contains("not available on PATH"), "{reason}");
+                assert_eq!(hint.as_deref(), Some("neon me"));
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
     }
 
     #[test]

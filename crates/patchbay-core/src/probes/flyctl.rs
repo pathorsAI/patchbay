@@ -29,6 +29,7 @@ use serde::Deserialize;
 
 use crate::paths::Paths;
 use crate::probe::{unsupported_switch, unsupported_verify, Probe};
+use crate::probes::cli_verify;
 use crate::types::{
     ActiveConcept, Expiry, PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome,
 };
@@ -57,6 +58,44 @@ impl FlyctlProbe {
 
     pub fn new(paths: Paths) -> Self {
         Self { paths }
+    }
+
+    /// Whichever name is on PATH. `fly` is the one Fly's own docs and installer
+    /// use; `flyctl` is the package name and is still what some installs leave
+    /// behind, so both are tried.
+    fn binary(&self) -> Option<&'static str> {
+        if !self.paths.may_exec() {
+            return None;
+        }
+        ["fly", "flyctl"]
+            .into_iter()
+            .find(|bin| self.paths.has_binary(bin))
+    }
+
+    /// The identity out of `fly auth whoami`, in either shape.
+    ///
+    /// With `--json` the answer is `{"email": "…"}`; without it, or on a
+    /// version that ignores the flag, it is the bare address on one line. Both
+    /// are accepted so that the flag's real job — suppressing the interactive
+    /// login — does not also become a parsing dependency.
+    fn parse_whoami(stdout: &str) -> Option<String> {
+        if let Some(email) = serde_json::from_str::<serde_json::Value>(stdout.trim())
+            .ok()
+            .and_then(|v| v.get("email")?.as_str().map(str::to_string))
+            .filter(|e| !e.trim().is_empty())
+        {
+            return Some(email);
+        }
+        let line = stdout.lines().map(str::trim).find(|l| !l.is_empty())?;
+        let line = line
+            .split_once(':')
+            .map(|(_, rest)| rest.trim())
+            .filter(|rest| !rest.is_empty())
+            .unwrap_or(line);
+        // A line of pure punctuation is not a name.
+        line.chars()
+            .any(char::is_alphanumeric)
+            .then(|| line.to_string())
     }
 }
 
@@ -143,11 +182,44 @@ impl Probe for FlyctlProbe {
     }
 
     fn verify(&self) -> anyhow::Result<VerifyOutcome> {
-        Ok(unsupported_verify(
-            Self::TOOL,
-            "patchbay does not run flyctl yet; `fly auth whoami` is a network call",
-            Some("fly auth whoami"),
-        ))
+        let Some(bin) = self.binary() else {
+            return Ok(unsupported_verify(
+                Self::TOOL,
+                "the fly CLI is not available on PATH",
+                Some("fly auth whoami"),
+            ));
+        };
+
+        // **`--json` is here to stop a prompt, not to make parsing nicer.**
+        // `fly auth whoami` runs through `RequireSession`, which offers an
+        // interactive browser login when there is no token; the literal flag is
+        // one of the three things that disarm that gate (a non-TTY and `CI=1`
+        // being the others, neither of which patchbay can rely on). A verify
+        // that opens a browser and waits is worse than no verify.
+        let out = self.paths.run(bin, &["auth", "whoami", "--json"])?;
+        if !out.ok {
+            return Ok(cli_verify::failure_outcome(
+                Self::TOOL,
+                &out,
+                "Fly.io",
+                "fly auth login",
+            ));
+        }
+
+        Ok(match Self::parse_whoami(&out.stdout) {
+            Some(who) => VerifyOutcome::Valid {
+                tool: Self::TOOL.to_string(),
+                detail: format!("Fly.io accepted the macaroon for {who}"),
+            },
+            // Exit 0 means Fly answered, so the token is live; only the name is
+            // missing. `whoami` says nothing about org membership either way —
+            // the org comes from --org at run time, so none is claimed here.
+            None => VerifyOutcome::Valid {
+                tool: Self::TOOL.to_string(),
+                detail: "Fly.io accepted the macaroon, but `fly auth whoami` named no user"
+                    .to_string(),
+            },
+        })
     }
 
     fn permissions(&self) -> anyhow::Result<PermissionsReport> {
@@ -283,5 +355,127 @@ mod tests {
             .find(|n| n.text.contains("not logged in"))
             .expect("the logged-out state is explained");
         assert_eq!(logged_out.kind, NoteKind::Info);
+    }
+
+    // ---------------------------------------------------------------- verify
+
+    fn probe_with(
+        home: &std::path::Path,
+        exec: std::sync::Arc<crate::util::FakeExec>,
+    ) -> FlyctlProbe {
+        FlyctlProbe::new(Paths::for_test(home).with_exec(exec))
+    }
+
+    #[test]
+    fn test_verify_reports_the_account_fly_names() {
+        let (_dir, home) = fixture(CONFIG);
+        let exec = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "auth whoami",
+            true,
+            "{\n    \"email\": \"dev@example.com\"\n}\n",
+            "",
+        ));
+        let outcome = probe_with(&home, exec.clone()).verify().unwrap();
+        // The flag is load-bearing: without it `whoami` may offer a browser
+        // login instead of failing.
+        assert_eq!(exec.last().unwrap().line(), "fly auth whoami --json");
+        match outcome {
+            VerifyOutcome::Valid { detail, .. } => {
+                assert!(detail.contains("dev@example.com"), "{detail}");
+                // No org may be invented: fly records none, and --org decides
+                // it at run time.
+                assert!(!detail.to_lowercase().contains("org"), "{detail}");
+            }
+            other => panic!("expected Valid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_both_answer_shapes_reduce_to_the_identity() {
+        for shape in [
+            "{\"email\": \"dev@example.com\"}",
+            "Current user: dev@example.com\n",
+            "dev@example.com\n",
+        ] {
+            assert_eq!(
+                FlyctlProbe::parse_whoami(shape),
+                Some("dev@example.com".to_string()),
+                "{shape}"
+            );
+        }
+        assert_eq!(FlyctlProbe::parse_whoami("{\"email\": \"\"}"), None);
+    }
+
+    #[test]
+    fn test_logged_out_revoked_and_offline_get_three_different_answers() {
+        let (_dir, home) = fixture(CONFIG);
+
+        let logged_out = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "auth whoami",
+            false,
+            "",
+            "Error: No access token available. Please login with 'flyctl auth login'\n",
+        ));
+        match probe_with(&home, logged_out).verify().unwrap() {
+            VerifyOutcome::Invalid { detail, .. } => {
+                assert!(detail.contains("not logged in"), "{detail}");
+                assert!(detail.contains("fly auth login"), "{detail}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+
+        let revoked = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "auth whoami",
+            false,
+            "",
+            "Error: failed to fetch user: 401 Unauthorized\n",
+        ));
+        match probe_with(&home, revoked).verify().unwrap() {
+            VerifyOutcome::Invalid { detail, .. } => {
+                assert!(detail.contains("rejected"), "{detail}");
+                assert_eq!(detail.lines().count(), 1, "{detail}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+
+        let offline = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "auth whoami",
+            false,
+            "",
+            "Error: Post \"https://api.fly.io/graphql\": dial tcp: lookup api.fly.io: no such host\n",
+        ));
+        match probe_with(&home, offline).verify().unwrap() {
+            VerifyOutcome::Unsupported { reason, .. } => {
+                assert!(reason.contains("could not reach Fly.io"), "{reason}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_unreadable_output_degrades_instead_of_panicking() {
+        let (_dir, home) = fixture(CONFIG);
+        for junk in ["", "\n \n", ":"] {
+            let exec =
+                std::sync::Arc::new(crate::util::FakeExec::new().on("auth whoami", true, junk, ""));
+            match probe_with(&home, exec).verify().unwrap() {
+                VerifyOutcome::Valid { detail, .. } => {
+                    assert!(detail.contains("named no user"), "{junk:?} -> {detail}");
+                }
+                other => panic!("expected Valid for {junk:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_verify_without_the_binary_stays_unsupported() {
+        let (_dir, home) = fixture(CONFIG);
+        match FlyctlProbe::new(Paths::for_test(&home)).verify().unwrap() {
+            VerifyOutcome::Unsupported { reason, hint, .. } => {
+                assert!(reason.contains("not available on PATH"), "{reason}");
+                assert_eq!(hint.as_deref(), Some("fly auth whoami"));
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
     }
 }
