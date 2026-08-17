@@ -306,11 +306,12 @@ impl<'de> Deserialize<'de> for Expiry {
 /// destination as an argument. Those probes used to say so in a note, which
 /// meant the panel flagged a warning on a tool that was working exactly as
 /// designed. It is a property of the tool, so it lives on the status.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ActiveConcept {
     /// The tool selects one profile at a time. `active` names it, or is `None`
     /// because nothing has been selected yet — which is worth showing.
+    #[default]
     Selects,
     /// The tool keeps no selection to switch. `reason` is a short phrase for a
     /// tooltip; the panel shows it there rather than filing a warning.
@@ -323,12 +324,6 @@ pub enum ActiveConcept {
     /// is that it is a default rather than a choice, and that an empty slot
     /// here is the right answer instead of a missing one.
     NotApplicable { reason: String },
-}
-
-impl Default for ActiveConcept {
-    fn default() -> Self {
-        Self::Selects
-    }
 }
 
 impl ActiveConcept {
