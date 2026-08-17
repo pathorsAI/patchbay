@@ -2957,7 +2957,7 @@ dependencies = [
 
 [[package]]
 name = "patchbay-app"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2973,7 +2973,7 @@ dependencies = [
 
 [[package]]
 name = "patchbay-core"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "age",
  "anyhow",
