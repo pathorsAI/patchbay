@@ -1262,7 +1262,7 @@ checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 
 [[package]]
 name = "patchbay-cli"
-version = "0.3.4"
+version = "0.4.0"
 dependencies = [
  "anstyle",
  "anyhow",
@@ -1276,7 +1276,7 @@ dependencies = [
 
 [[package]]
 name = "patchbay-core"
-version = "0.3.4"
+version = "0.4.0"
 dependencies = [
  "age",
  "anyhow",
@@ -1295,7 +1295,7 @@ dependencies = [
 
 [[package]]
 name = "patchbay-mcp"
-version = "0.3.4"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chrono",
