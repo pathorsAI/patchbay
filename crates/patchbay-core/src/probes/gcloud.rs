@@ -28,7 +28,9 @@ use rusqlite::{Connection, OpenFlags};
 
 use crate::paths::Paths;
 use crate::probe::{unknown_profile, unsupported_switch, unsupported_verify, Probe};
-use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
+use crate::types::{
+    PermissionScope, PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome,
+};
 use crate::util::{read_text, CmdOutput, Ini};
 
 pub struct GcloudProbe {
@@ -103,6 +105,26 @@ impl GcloudProbe {
             account,
             credentialed,
         })
+    }
+
+    /// `core/account` and `core/project` of the active configuration.
+    ///
+    /// Both permission paths start here: an IAM question is only well-formed
+    /// once it names *who* and *where*, and gcloud keeps both in the same INI
+    /// file `status` already parses.
+    fn active_meta(&self) -> anyhow::Result<(Option<String>, Option<String>)> {
+        let status = self.status()?;
+        let active = status
+            .active
+            .as_ref()
+            .and_then(|a| status.profiles.iter().find(|p| &p.id == a));
+        let meta = |key: &str| {
+            active
+                .and_then(|p| p.meta.get(key))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        };
+        Ok((meta("account"), meta("project")))
     }
 
     fn read_adc(&self, notes: &mut Vec<String>) -> Option<Adc> {
@@ -457,38 +479,258 @@ impl Probe for GcloudProbe {
         })
     }
 
-    fn permissions(&self) -> anyhow::Result<PermissionsReport> {
-        // patchbay has no IAM reader yet, but it does know the two values the
-        // command needs — leaving `<project>` and `<account>` for the human to
-        // fill in from the row directly above is a hint that has not finished
-        // the job. The quoting is not decoration either: unquoted,
-        // `bindings[].members` is a glob, and zsh answers `no matches found`
-        // before gcloud ever runs.
-        let status = self.status()?;
-        let active = status
-            .active
-            .as_ref()
-            .and_then(|a| status.profiles.iter().find(|p| &p.id == a));
-        let meta = |key: &str| {
-            active
-                .and_then(|p| p.meta.get(key))
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
+    /// The projects an IAM question can be asked about.
+    ///
+    /// A Google account has no permissions of its own — the grants live on the
+    /// resource, so "what may I do" only becomes a question once a project is
+    /// named. This enumerates the ones this login can see, which is what lets
+    /// the panel offer a picker instead of a blank where the answer should be.
+    ///
+    /// Tier 2: it runs `gcloud projects list`, so nothing calls it on the way
+    /// in. An empty list is the honest answer to every way this can fail to
+    /// enumerate — no gcloud on PATH, a login that cannot list projects — and
+    /// [`Probe::permissions`] is what then says why out loud.
+    fn permission_scopes(&self) -> anyhow::Result<Vec<PermissionScope>> {
+        if !self.paths.may_exec() || !self.paths.has_binary("gcloud") {
+            return Ok(Vec::new());
+        }
+        let (_, active_project) = self.active_meta()?;
+
+        let out = self
+            .paths
+            .run("gcloud", &["projects", "list", "--format=json", "--quiet"])?;
+        let mut scopes: Vec<PermissionScope> = Vec::new();
+        if out.ok {
+            if let Ok(serde_json::Value::Array(items)) =
+                serde_json::from_str::<serde_json::Value>(&out.stdout)
+            {
+                for item in items {
+                    let Some(id) = item.get("projectId").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    // Projects pending deletion are still listed and cannot be
+                    // usefully inspected; offering one is offering a dead end.
+                    let live = item
+                        .get("lifecycleState")
+                        .and_then(|v| v.as_str())
+                        .is_none_or(|s| s == "ACTIVE");
+                    if !live {
+                        continue;
+                    }
+                    let label = item
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(id);
+                    scopes.push(PermissionScope {
+                        id: id.to_string(),
+                        label: label.to_string(),
+                        active: active_project.as_deref() == Some(id),
+                    });
+                }
+            }
+        }
+
+        // `resourcemanager.projects.list` is a separate grant from being able
+        // to read a project you already work in every day, so the configured
+        // project can be missing from its own list. It is the one the user is
+        // most likely to ask about, so it goes in regardless.
+        if let Some(project) = &active_project {
+            if !scopes.iter().any(|s| &s.id == project) {
+                scopes.insert(
+                    0,
+                    PermissionScope {
+                        id: project.clone(),
+                        label: project.clone(),
+                        active: true,
+                    },
+                );
+            }
+        }
+        Ok(scopes)
+    }
+
+    /// The active account's IAM roles on one project.
+    ///
+    /// Note what this is *not*: the roles are read for the account the active
+    /// configuration names, on the project named here. Those two are usually
+    /// the same project, and deliberately do not have to be — "what would I be
+    /// able to do over there" is the question worth being able to ask.
+    fn permissions_in(&self, scope_id: &str) -> anyhow::Result<PermissionsReport> {
+        let (account, _) = self.active_meta()?;
+        let Some(account) = account else {
+            return Ok(PermissionsReport::unsupported(
+                Self::TOOL,
+                "no active configuration with an account, so there is no identity to resolve roles for",
+                None,
+            ));
         };
-        let account = meta("account");
-        let hint = format!(
-            "gcloud projects get-iam-policy {} --flatten='bindings[].members' --filter='bindings.members:{}'",
-            meta("project").as_deref().unwrap_or("<project>"),
-            account.as_deref().unwrap_or("<account>"),
-        );
+
+        if !self.paths.may_exec() || !self.paths.has_binary("gcloud") {
+            // The one honest last resort: with no gcloud to run, patchbay
+            // cannot answer, so it hands over the line it would have run. The
+            // quoting matters here and only here — this string is for a shell,
+            // and unquoted `bindings[].members` is a glob that zsh refuses
+            // before gcloud ever starts. The exec path below passes the same
+            // values as argv, where no shell ever sees them.
+            let mut report = PermissionsReport::unsupported(
+                Self::TOOL,
+                "the gcloud CLI is not available on PATH, so patchbay cannot read the IAM policy itself",
+                Some(&format!(
+                    "gcloud projects get-iam-policy {scope_id} --flatten='bindings[].members' --filter='bindings.members:{account}'"
+                )),
+            );
+            report.subject = Some(account);
+            report.scope = Some(scope_id.to_string());
+            return Ok(report);
+        }
+
+        let out = self.paths.run(
+            "gcloud",
+            &[
+                "projects",
+                "get-iam-policy",
+                scope_id,
+                "--flatten=bindings[].members",
+                &format!("--filter=bindings.members:{account}"),
+                "--format=json",
+                "--quiet",
+            ],
+        )?;
+        if !out.ok {
+            // A refusal is an answer about this project — "you may not read
+            // its policy" is itself a permissions fact — so it comes back as a
+            // report naming the project, not as an error that blanks the pane.
+            //
+            // Through `auth_failure` for the same reason `verify` is: gcloud
+            // answers a reauth with four lines of shell instructions, and
+            // pasting those into a note is handing back someone else's error
+            // instead of an answer.
+            let detail = auth_failure(&account, &out);
+            return Ok(PermissionsReport {
+                tool: Self::TOOL.to_string(),
+                supported: false,
+                subject: Some(account),
+                scopes: Vec::new(),
+                notes: vec![format!(
+                    "could not read the IAM policy of {scope_id} — {detail}"
+                )],
+                hint: None,
+                scope: Some(scope_id.to_string()),
+            });
+        }
+
+        let mut roles = match serde_json::from_str::<serde_json::Value>(&out.stdout) {
+            Ok(json) => {
+                let mut roles = Vec::new();
+                collect_roles(&json, &account, &mut roles);
+                roles
+            }
+            Err(e) => {
+                return Ok(PermissionsReport {
+                    tool: Self::TOOL.to_string(),
+                    supported: false,
+                    subject: Some(account),
+                    scopes: Vec::new(),
+                    notes: vec![format!(
+                        "gcloud returned something that is not the IAM policy JSON patchbay expects ({e})"
+                    )],
+                    hint: None,
+                    scope: Some(scope_id.to_string()),
+                });
+            }
+        };
+        roles.sort();
+        roles.dedup();
+
+        let mut notes =
+            vec!["project-level bindings only; org/folder inheritance not shown".to_string()];
+        if roles.is_empty() {
+            notes.push(format!(
+                "{account} holds no role granted directly on {scope_id} — it may still reach it through a role inherited from the organisation or folder, or through a group"
+            ));
+        }
+        Ok(PermissionsReport {
+            tool: Self::TOOL.to_string(),
+            supported: true,
+            subject: Some(account),
+            scopes: roles,
+            notes,
+            hint: None,
+            scope: Some(scope_id.to_string()),
+        })
+    }
+
+    /// "What may this login do", with no project named.
+    ///
+    /// The active configuration already names one, so this resolves it and
+    /// hands over to [`Probe::permissions_in`] — the same move
+    /// [`Probe::verify`] makes with the active profile. Only a configuration
+    /// with no `core/project` has nothing to resolve, and that is the one case
+    /// this answers with a "pick one" rather than a reading.
+    fn permissions(&self) -> anyhow::Result<PermissionsReport> {
+        let (account, project) = self.active_meta()?;
+        if let Some(project) = project {
+            return self.permissions_in(&project);
+        }
 
         let mut report = PermissionsReport::unsupported(
             Self::TOOL,
-            "IAM roles are per-project and per-resource; patchbay does not resolve them yet",
-            Some(&hint),
+            "IAM roles are granted per project, and the active configuration sets no `core/project` — pick a project to read its policy",
+            (!self.paths.may_exec() || !self.paths.has_binary("gcloud")).then_some(
+                "gcloud projects get-iam-policy <project> --flatten='bindings[].members' --filter='bindings.members:<account>'",
+            ),
         );
         report.subject = account;
         Ok(report)
+    }
+}
+
+/// Every role the JSON grants `account`, at any nesting.
+///
+/// Two shapes arrive here. `--flatten=bindings[].members` yields one record per
+/// (role, member) pair with `bindings` an object; a policy read without it has
+/// `bindings` as an array of `{role, members[]}`. Rather than commit to either,
+/// this walks for objects carrying a `role` — and where a record still lists
+/// its members, checks them, so a role the account does not hold can never be
+/// reported as one it does even if the server-side `--filter` were dropped.
+fn collect_roles(value: &serde_json::Value, account: &str, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_roles(item, account, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            if let Some(role) = map.get("role").and_then(|v| v.as_str()) {
+                if members_include(map.get("members"), account) {
+                    out.push(role.to_string());
+                }
+            }
+            for nested in map.values() {
+                collect_roles(nested, account, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether an IAM `members` value names this account.
+///
+/// Members are prefixed by principal type — `user:a@example.com`,
+/// `serviceAccount:…` — so a bare comparison would match nothing. No members
+/// field at all means the record did not record them, not that it excludes the
+/// account: gcloud's own filter already made that call.
+fn members_include(members: Option<&serde_json::Value>, account: &str) -> bool {
+    fn one(member: &serde_json::Value, account: &str) -> bool {
+        member
+            .as_str()
+            .is_some_and(|m| m == account || m.ends_with(&format!(":{account}")))
+    }
+    match members {
+        None | Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::Array(items)) => items.iter().any(|m| one(m, account)),
+        Some(other) => one(other, account),
     }
 }
 
@@ -935,8 +1177,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_permissions_hint_carries_the_real_project_and_is_shell_safe() {
+    /// A configuration with a project, an account, and credentials — the shape
+    /// every IAM question is asked from.
+    fn with_project() -> Fixture {
         let fx = Fixture::new();
         fx.config(
             "work",
@@ -944,10 +1187,27 @@ mod tests {
         )
         .active("work")
         .credentials_db(&["b@example.com"]);
+        fx
+    }
+
+    /// The policy `gcloud projects get-iam-policy --flatten=bindings[].members
+    /// --format=json` actually prints: one record per (role, member) pair.
+    const FLATTENED_POLICY: &str = r#"[
+      {"bindings": {"members": "user:b@example.com", "role": "roles/viewer"},
+       "etag": "BwXyz", "version": 1},
+      {"bindings": {"members": "user:b@example.com", "role": "roles/run.admin"},
+       "etag": "BwXyz", "version": 1}
+    ]"#;
+
+    #[test]
+    fn test_permissions_without_gcloud_falls_back_to_a_shell_safe_line() {
+        // The one case a copyable command is the honest answer: nothing to run.
+        let fx = with_project();
 
         let report = fx.probe().permissions().unwrap();
         let hint = report.hint.unwrap();
         assert_eq!(report.subject.as_deref(), Some("b@example.com"));
+        assert_eq!(report.scope.as_deref(), Some("proj-b"));
         assert!(
             hint.contains("proj-b") && hint.contains("b@example.com"),
             "{hint}"
@@ -955,6 +1215,238 @@ mod tests {
         assert!(!hint.contains('<'), "{hint}");
         // Unquoted, `bindings[].members` is a glob and zsh refuses to run it.
         assert!(hint.contains("--flatten='bindings[].members'"), "{hint}");
+    }
+
+    #[test]
+    fn test_permission_scopes_lists_projects_and_flags_the_configured_one() {
+        let fx = with_project();
+        let exec = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "projects list",
+            true,
+            r#"[
+              {"projectId": "proj-a", "name": "Alpha", "lifecycleState": "ACTIVE"},
+              {"projectId": "proj-b", "name": "Beta", "lifecycleState": "ACTIVE"},
+              {"projectId": "proj-dead", "name": "Gone", "lifecycleState": "DELETE_REQUESTED"}
+            ]"#,
+            "",
+        ));
+
+        let scopes = probe_with(&fx, exec).permission_scopes().unwrap();
+        let ids: Vec<&str> = scopes.iter().map(|s| s.id.as_str()).collect();
+        // A project pending deletion is a dead end, not a choice.
+        assert_eq!(ids, vec!["proj-a", "proj-b"], "{scopes:?}");
+        assert_eq!(scopes[1].label, "Beta");
+        assert!(
+            scopes[1].active,
+            "the configured project is the default one"
+        );
+        assert!(!scopes[0].active);
+    }
+
+    #[test]
+    fn test_the_configured_project_is_offered_even_when_it_is_not_listable() {
+        // `resourcemanager.projects.list` is its own grant: an account can work
+        // in a project every day and never see it in `projects list`.
+        let fx = with_project();
+        let exec = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "projects list",
+            true,
+            r#"[{"projectId": "proj-a", "name": "Alpha", "lifecycleState": "ACTIVE"}]"#,
+            "",
+        ));
+
+        let scopes = probe_with(&fx, exec).permission_scopes().unwrap();
+        let configured = scopes.iter().find(|s| s.id == "proj-b").expect("proj-b");
+        assert!(configured.active);
+    }
+
+    #[test]
+    fn test_a_probe_with_no_scope_reader_reports_none_and_ignores_the_scope() {
+        // The 24 probes that never opted in: `permission_scopes` is empty, and
+        // `permissions_in` is `permissions` with the argument thrown away, so
+        // a scoped caller cannot get a different (or worse, a wrong) answer.
+        let dir = tempfile::tempdir().unwrap();
+        let probe = crate::probes::gh::GhProbe::new(Paths::for_test(dir.path()));
+        assert!(probe.permission_scopes().unwrap().is_empty());
+        assert_eq!(
+            probe.permissions_in("anything-at-all").unwrap(),
+            probe.permissions().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_permissions_reads_the_active_projects_roles_rather_than_handing_over_a_command() {
+        let fx = with_project();
+        let exec = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "get-iam-policy",
+            true,
+            FLATTENED_POLICY,
+            "",
+        ));
+
+        let report = probe_with(&fx, exec.clone()).permissions().unwrap();
+        assert!(report.supported);
+        assert_eq!(report.subject.as_deref(), Some("b@example.com"));
+        assert_eq!(report.scope.as_deref(), Some("proj-b"));
+        assert_eq!(report.scopes, vec!["roles/run.admin", "roles/viewer"]);
+        // The panel operates the tool; it does not hand out a line to paste.
+        assert_eq!(report.hint, None);
+        assert!(
+            report.notes.iter().any(|n| n.contains("org/folder")),
+            "{:?}",
+            report.notes
+        );
+
+        // No shell is involved, so the filter goes as one argv item, unquoted.
+        let call = exec.last().unwrap();
+        assert!(
+            call.args
+                .contains(&"--flatten=bindings[].members".to_string()),
+            "{:?}",
+            call.args
+        );
+        assert!(
+            call.args
+                .contains(&"--filter=bindings.members:b@example.com".to_string()),
+            "{:?}",
+            call.args
+        );
+        assert!(call.args.contains(&"proj-b".to_string()), "{:?}", call.args);
+    }
+
+    #[test]
+    fn test_permissions_in_reads_a_project_other_than_the_configured_one() {
+        let fx = with_project();
+        let exec = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "get-iam-policy",
+            true,
+            r#"[{"bindings": {"members": "user:b@example.com", "role": "roles/owner"}}]"#,
+            "",
+        ));
+
+        let report = probe_with(&fx, exec.clone())
+            .permissions_in("other-project")
+            .unwrap();
+        assert_eq!(report.scope.as_deref(), Some("other-project"));
+        assert_eq!(report.scopes, vec!["roles/owner"]);
+        assert!(exec
+            .last()
+            .unwrap()
+            .args
+            .contains(&"other-project".to_string()));
+    }
+
+    #[test]
+    fn test_a_role_held_by_somebody_else_is_never_reported_as_yours() {
+        // Belt and braces over gcloud's own `--filter`: the member list decides.
+        let fx = with_project();
+        let exec = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "get-iam-policy",
+            true,
+            r#"[
+              {"bindings": {"members": ["user:b@example.com"], "role": "roles/viewer"}},
+              {"bindings": {"members": ["user:someone-else@example.com"], "role": "roles/owner"}}
+            ]"#,
+            "",
+        ));
+
+        let report = probe_with(&fx, exec).permissions_in("proj-b").unwrap();
+        assert_eq!(report.scopes, vec!["roles/viewer"]);
+    }
+
+    #[test]
+    fn test_no_direct_binding_is_answered_as_a_fact_not_as_an_empty_pane() {
+        let fx = with_project();
+        let exec =
+            std::sync::Arc::new(crate::util::FakeExec::new().on("get-iam-policy", true, "[]", ""));
+
+        let report = probe_with(&fx, exec).permissions_in("proj-b").unwrap();
+        assert!(report.supported);
+        assert!(report.scopes.is_empty());
+        assert!(
+            report.notes.iter().any(|n| n.contains("no role granted")),
+            "{:?}",
+            report.notes
+        );
+    }
+
+    #[test]
+    fn test_a_refused_iam_read_is_a_report_about_that_project_not_an_error() {
+        let fx = with_project();
+        let stderr = "ERROR: (gcloud.projects.get-iam-policy) User [b@example.com] does not have permission to access projects instance [proj-b] (or it may not exist): Policy retrieval failed.\n";
+        let exec = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "get-iam-policy",
+            false,
+            "",
+            stderr,
+        ));
+
+        let report = probe_with(&fx, exec).permissions_in("proj-b").unwrap();
+        assert!(!report.supported);
+        assert_eq!(report.scope.as_deref(), Some("proj-b"));
+        assert!(report.scopes.is_empty());
+        let notes = report.notes.join("\n");
+        assert!(notes.contains("proj-b"), "{notes}");
+        assert!(notes.contains("does not have permission"), "{notes}");
+        // gcloud's own `ERROR: (command)` prefix only repeats what we ran.
+        assert!(!notes.contains("ERROR:"), "{notes}");
+    }
+
+    #[test]
+    fn test_a_reauth_during_an_iam_read_is_one_sentence_not_four_lines_of_shell() {
+        // The same four-line answer `verify` already flattens. Pasting it into
+        // a note would be handing back someone else's error, not an answer.
+        let fx = with_project();
+        let stderr = "ERROR: (gcloud.projects.get-iam-policy) There was a problem refreshing your current auth tokens: Reauthentication failed. cannot prompt during non-interactive execution.\nPlease run:\n\n  $ gcloud auth login\n\nto obtain new credentials.\n";
+        let exec = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "get-iam-policy",
+            false,
+            "",
+            stderr,
+        ));
+
+        let report = probe_with(&fx, exec).permissions_in("proj-b").unwrap();
+        let notes = report.notes.join("\n");
+        assert_eq!(notes.lines().count(), 1, "{notes}");
+        assert!(notes.contains("proj-b"), "{notes}");
+        assert!(notes.contains("gcloud auth login b@example.com"), "{notes}");
+        assert!(!notes.contains("Please run"), "{notes}");
+    }
+
+    #[test]
+    fn test_unparseable_iam_output_degrades_to_a_note() {
+        let fx = with_project();
+        let exec = std::sync::Arc::new(crate::util::FakeExec::new().on(
+            "get-iam-policy",
+            true,
+            "Updated IAM policy, probably",
+            "",
+        ));
+
+        let report = probe_with(&fx, exec).permissions_in("proj-b").unwrap();
+        assert!(!report.supported);
+        assert!(report.scopes.is_empty());
+        assert!(!report.notes.is_empty());
+    }
+
+    #[test]
+    fn test_a_configuration_with_no_project_asks_for_one_instead_of_guessing() {
+        let fx = Fixture::new();
+        fx.config("work", "[core]\naccount = b@example.com\n")
+            .active("work")
+            .credentials_db(&["b@example.com"]);
+        let exec = std::sync::Arc::new(crate::util::FakeExec::new());
+
+        let report = probe_with(&fx, exec.clone()).permissions().unwrap();
+        assert!(!report.supported);
+        assert!(
+            report.notes.iter().any(|n| n.contains("pick a project")),
+            "{:?}",
+            report.notes
+        );
+        // gcloud is available, so there is nothing to paste — the picker is it.
+        assert_eq!(report.hint, None);
+        assert!(exec.calls().is_empty(), "nothing to read a policy for");
     }
 
     #[test]

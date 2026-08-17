@@ -244,6 +244,7 @@ impl Probe for FirebaseProbe {
                     .to_string(),
             ],
             hint: Some("firebase login --reauth".to_string()),
+            scope: None,
         })
     }
 }

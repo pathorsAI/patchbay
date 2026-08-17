@@ -261,6 +261,7 @@ impl Probe for GhProbe {
                     out.message()
                 )],
                 hint: Some("gh auth login".to_string()),
+                scope: None,
             });
         }
 
@@ -282,6 +283,7 @@ impl Probe for GhProbe {
             hint: Some(
                 "add a missing scope with `gh auth refresh -s <scope>` (e.g. `gh auth refresh -s read:project`)".to_string(),
             ),
+            scope: None,
         })
     }
 }

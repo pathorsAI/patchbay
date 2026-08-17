@@ -148,6 +148,22 @@ pub struct VerifyParams {
     pub profile_id: Option<String>,
 }
 
+/// `{ "tool": "gcloud", "scope": "my-project" }` — one tool, optionally one
+/// scope of it.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct PermissionsParams {
+    /// Tool key, e.g. "gcloud". An unknown key returns an error listing every
+    /// valid key.
+    pub tool: String,
+    /// Optional: the scope to read permissions within, as listed by
+    /// `list_permission_scopes`. Required in practice for tools that grant per
+    /// resource rather than per credential — GCP IAM roles exist on a project,
+    /// so "what may this account do" has no answer until one is named.
+    /// Omitting it reads whatever the tool treats as the default (for gcloud,
+    /// the active configuration's project).
+    pub scope: Option<String>,
+}
+
 /// `{ "tool": "gcloud" }` — identifies one supported CLI.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ToolParams {
@@ -431,18 +447,52 @@ Call this when the user asks about permissions, or when an operation failed with
 looks like a scope or role problem and knowing the granted scopes changes your advice. It is not \
 part of a routine status check: use list_connections for that.
 
-Returns a PermissionsReport: { tool, supported, subject, scopes, notes, hint }.
+SCOPED MODE. Some tools grant per resource, not per credential: a Google account has no roles of \
+its own, only roles on a project. For those, pass `scope` — a project id from \
+list_permission_scopes — and the answer is about THAT resource. Omitting it reads the tool's \
+default (for gcloud, the active configuration's `core/project`), so a report about one project \
+says nothing about another: re-read with the right scope rather than generalising. Tools whose \
+credential carries one answer everywhere list no scopes and ignore the field.
 
-`supported: false` is a normal answer, not a failure: patchbay cannot enumerate permissions for \
-this tool yet, `scopes` will be empty, and `hint` tells the human where to look or what to run. \
-Relay the hint; do not retry.")]
+Returns a PermissionsReport: { tool, supported, subject, scopes, notes, hint, scope }. `scope` is \
+present only when the report is about one — always name it when relaying the result.
+
+`supported: false` is a normal answer, not a failure: it means patchbay cannot enumerate \
+permissions for this tool yet, or the login was refused the policy of that one resource (which is \
+itself a permissions fact worth relaying). `scopes` will be empty, and `hint` — where there is \
+one — tells the human where to look or what to run. Relay the notes and the hint; do not retry.")]
     async fn get_permissions(
+        &self,
+        Parameters(PermissionsParams { tool, scope }): Parameters<PermissionsParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let registry = self.registry.clone();
+        match offload(move || registry.permissions_in(&tool, scope.as_deref())).await? {
+            Ok(report) => Ok(json_ok(encode(&report)?)),
+            Err(err) => Ok(tool_error(err)),
+        }
+    }
+
+    #[tool(description = "\
+TIER 2, EXPENSIVE. List the scopes a tool's permissions can be read against, so get_permissions \
+can be given one. Executes the tool's own CLI (for gcloud, `gcloud projects list`) and may hit \
+the network — call it when you are about to ask about permissions, not as a warm-up.
+
+Returns an array of { id, label, active }. `id` is what get_permissions takes; `label` is the \
+human name; `active` marks the scope the tool's current configuration already points at, which \
+is also what get_permissions reads when no scope is given.
+
+An EMPTY array is a normal answer with a specific meaning: this tool's credential carries the \
+same permissions everywhere, so there is nothing to choose — call get_permissions with no scope. \
+It can also mean the login cannot enumerate scopes at all; get_permissions will say so. Never \
+invent an id: if the resource the user means is not listed, pass its id only if the user gave \
+it, otherwise say it was not found.")]
+    async fn list_permission_scopes(
         &self,
         Parameters(ToolParams { tool }): Parameters<ToolParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let registry = self.registry.clone();
-        match offload(move || registry.permissions(&tool)).await? {
-            Ok(report) => Ok(json_ok(encode(&report)?)),
+        match offload(move || registry.permission_scopes(&tool)).await? {
+            Ok(scopes) => Ok(json_ok(encode(&scopes)?)),
             Err(err) => Ok(tool_error(err)),
         }
     }

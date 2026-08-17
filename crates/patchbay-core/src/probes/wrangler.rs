@@ -191,6 +191,7 @@ impl Probe for WranglerProbe {
                 "scopes are read from the local OAuth grant; account-level API token permissions are not visible here".to_string(),
             ],
             hint: Some("re-run `wrangler login` to request a different scope set".to_string()),
+            scope: None,
         })
     }
 }

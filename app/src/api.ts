@@ -6,6 +6,7 @@ import type {
   McpSpec,
   McpWriteReport,
   NewKeyInput,
+  PermissionScope,
   PermissionsReport,
   RemovedKey,
   SwitchOutcome,
@@ -29,6 +30,24 @@ export const verifyProfile = (tool: string, profile: string) =>
   invoke<VerifyOutcome>("verify_profile", { tool, profile });
 
 export const permissions = (tool: string) => invoke<PermissionsReport>("permissions", { tool });
+
+/**
+ * The scopes this tool's permissions can be read against. Empty means the
+ * credential carries one answer everywhere — no picker, just read.
+ *
+ * Tier 2 like its neighbours: this executes the tool's CLI, so it belongs
+ * behind a click and never on a render.
+ */
+export const permissionScopes = (tool: string) =>
+  invoke<PermissionScope[]>("permission_scopes", { tool });
+
+/**
+ * Permissions within one scope. Same reason `verifyProfile` exists: where the
+ * grants live on the resource, a single answer filed under the tool is wrong
+ * everywhere but one place.
+ */
+export const permissionsIn = (tool: string, scope: string) =>
+  invoke<PermissionsReport>("permissions_in", { tool, scope });
 
 /** Vault metadata. There is no command that returns a value — see `keyAdd`. */
 export const keysList = () => invoke<KeyRow[]>("keys_list");

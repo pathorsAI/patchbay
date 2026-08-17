@@ -180,6 +180,7 @@ impl Probe for ClaudeProbe {
                     .to_string(),
             ],
             hint: Some("claude /status".to_string()),
+            scope: None,
         })
     }
 }
