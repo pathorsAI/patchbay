@@ -5,6 +5,26 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **The main pane no longer scrolls sideways.** 0.3.3 stopped the *window*
+  sliding as one sheet but left the board scrolling in both axes, so reaching
+  the last client column of the MCP matrix dragged the view's title, its notes
+  and its "Config paths" list off to the left with it — everything you needed
+  as a reference left the screen at the moment you needed it. The board now
+  scrolls down only; the tables scroll inside their own frame, which is what
+  that frame was always for. Errors wrap instead of running off the edge, since
+  a clipped error is worse than a wide one.
+
+  The MCP table also stopped asking for width it never used: its floor was
+  760px against the 686px of pane a 900px window gives, so the matrix scrolled
+  even when it would have fitted. Six client columns of one glyph each carried
+  10px of side padding around nothing; at 7px, and with the floor at 640px —
+  the same as the vault's, and above the ~613px the headers themselves need —
+  a typical matrix comes to 666px and fits the smallest window with room over.
+
 ## [0.3.3] - 2026-08-14
 
 ### Fixed
