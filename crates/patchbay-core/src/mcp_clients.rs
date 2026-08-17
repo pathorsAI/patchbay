@@ -35,6 +35,7 @@ use serde_json::{Map, Value};
 use toml_edit::{DocumentMut, Item, Table};
 
 use crate::paths::Paths;
+use crate::types::Note;
 // The write-safety machinery this module established now lives in `util`, so
 // the probes that edit another tool's config can use the same three steps.
 use crate::util::{backup, serialize_json_preserving_style, write_atomic};
@@ -108,7 +109,9 @@ pub struct McpClient {
     pub present: bool,
     pub servers: Vec<McpServerEntry>,
     /// Caveats: unreadable file, malformed config, entries patchbay skipped.
-    pub notes: Vec<String>,
+    /// Each carries its own [`crate::NoteKind`] — a config that will not parse
+    /// is a problem, "Cursor picks this up on its next start" is not.
+    pub notes: Vec<Note>,
 }
 
 /// What to register. Unlike [`McpServerEntry`] this *does* carry values — it is
@@ -205,7 +208,9 @@ pub struct WriteReport {
     /// Whether patchbay had to create the config file.
     pub created_file: bool,
     /// Things the caller must pass on: format limitations, restart hints.
-    pub notes: Vec<String>,
+    /// These explain how the target client's config works rather than
+    /// reporting damage, so they are [`crate::NoteKind::Info`].
+    pub notes: Vec<Note>,
 }
 
 /// The outcome of a copy: one source, several targets, and the names of the
@@ -418,8 +423,9 @@ impl McpClientRegistry {
             Ok(None) => return client,
             Err(e) => {
                 // Same rule as the probes: one broken client never blanks the
-                // board, it just explains itself.
-                client.notes.push(e);
+                // board, it just explains itself. A config patchbay cannot read
+                // is a broken machine, not a curiosity.
+                client.notes.push(Note::problem(e));
                 return client;
             }
         };
@@ -433,7 +439,9 @@ impl McpClientRegistry {
                 client.servers = servers;
                 client.notes.extend(notes);
             }
-            Err(e) => client.notes.push(format!("{}: {e}", path.display())),
+            Err(e) => client
+                .notes
+                .push(Note::problem(format!("{}: {e}", path.display()))),
         }
         client
     }
@@ -485,7 +493,7 @@ impl McpClientRegistry {
         let existed = path.is_file();
         let text = crate::util::read_text(&path).map_err(anyhow::Error::msg)?;
 
-        let mut notes = Vec::new();
+        let mut notes: Vec<Note> = Vec::new();
         let body = match def.format {
             Format::Json(dialect) => {
                 json_upsert(text.as_deref(), dialect, name, spec, overwrite, &mut notes)?
@@ -522,7 +530,7 @@ impl McpClientRegistry {
                 )
             })?;
 
-        let mut notes = Vec::new();
+        let mut notes: Vec<Note> = Vec::new();
         let body = match def.format {
             Format::Json(dialect) => json_remove(&text, dialect, name, def.label)?,
             Format::CodexToml => codex_remove(&text, name, def.label)?,
@@ -619,13 +627,15 @@ impl McpClientRegistry {
 }
 
 /// The one caveat every write shares: a client already running reads its config
-/// at startup, and some rewrite it on exit.
-fn restart_note(def: &ClientDef) -> String {
+/// at startup, and some rewrite it on exit. Nothing is wrong — this is how the
+/// client works — so it is [`crate::NoteKind::Info`].
+fn restart_note(def: &ClientDef) -> Note {
     match def.key {
-        "claude-code" => "Claude Code reads ~/.claude.json at startup and rewrites it on exit; \
-             restart it, and avoid editing while a session is open."
-            .to_string(),
-        _ => format!("{} picks this up on its next start.", def.label),
+        "claude-code" => Note::info(
+            "Claude Code reads ~/.claude.json at startup and rewrites it on exit; \
+             restart it, and avoid editing while a session is open.",
+        ),
+        _ => Note::info(format!("{} picks this up on its next start.", def.label)),
     }
 }
 
@@ -755,10 +765,7 @@ fn json_entry(name: &str, entry: &Map<String, Value>, scope: Option<String>) -> 
 }
 
 /// Read every server a JSON client has registered, user scope first.
-fn read_json(
-    text: &str,
-    dialect: JsonDialect,
-) -> anyhow::Result<(Vec<McpServerEntry>, Vec<String>)> {
+fn read_json(text: &str, dialect: JsonDialect) -> anyhow::Result<(Vec<McpServerEntry>, Vec<Note>)> {
     let root = parse_json(text)?;
     let root = as_object(&root, "the config file")?;
     let mut servers = Vec::new();
@@ -771,11 +778,20 @@ fn read_json(
                 for (name, entry) in map {
                     match entry.as_object() {
                         Some(entry) => servers.push(json_entry(name, entry, user_scope.clone())),
-                        None => notes.push(format!("skipped `{name}`: not a JSON object")),
+                        // A malformed entry is a server this client will not
+                        // launch: something here is already broken.
+                        None => {
+                            notes.push(Note::problem(format!(
+                                "skipped `{name}`: not a JSON object"
+                            )));
+                        }
                     }
                 }
             }
-            None => notes.push(format!("`{}` is not a JSON object", dialect.root_key)),
+            None => notes.push(Note::problem(format!(
+                "`{}` is not a JSON object",
+                dialect.root_key
+            ))),
         }
     }
 
@@ -847,7 +863,7 @@ fn json_spec(text: &str, dialect: JsonDialect, name: &str) -> anyhow::Result<Opt
 }
 
 /// Render a spec into one client's JSON dialect.
-fn spec_to_json(spec: &ServerSpec, dialect: JsonDialect, notes: &mut Vec<String>) -> Value {
+fn spec_to_json(spec: &ServerSpec, dialect: JsonDialect, notes: &mut Vec<Note>) -> Value {
     let mut entry = Map::new();
     match &spec.transport {
         TransportSpec::Stdio { command, args } => {
@@ -868,11 +884,11 @@ fn spec_to_json(spec: &ServerSpec, dialect: JsonDialect, notes: &mut Vec<String>
                     Value::String(if sse { "sse" } else { "http" }.into()),
                 );
             } else if sse {
-                notes.push(
+                // How this client's config works, not a fault in it.
+                notes.push(Note::info(
                     "this client does not record a transport type; the server was written as a \
-                     plain URL and the client will decide how to connect"
-                        .to_string(),
-                );
+                     plain URL and the client will decide how to connect",
+                ));
             }
             entry.insert(dialect.url_field.into(), Value::String(url.clone()));
         }
@@ -903,7 +919,7 @@ fn json_upsert(
     name: &str,
     spec: &ServerSpec,
     overwrite: bool,
-    notes: &mut Vec<String>,
+    notes: &mut Vec<Note>,
 ) -> anyhow::Result<String> {
     let mut root = parse_json(text.unwrap_or(""))?;
     if !root.is_object() {
@@ -1043,7 +1059,7 @@ fn codex_servers(doc: &DocumentMut) -> Vec<(String, &Table)> {
     }
 }
 
-fn read_codex(text: &str) -> anyhow::Result<(Vec<McpServerEntry>, Vec<String>)> {
+fn read_codex(text: &str) -> anyhow::Result<(Vec<McpServerEntry>, Vec<Note>)> {
     let doc = parse_toml(text)?;
     let mut servers = Vec::new();
     for (name, table) in codex_servers(&doc) {
@@ -1111,7 +1127,7 @@ fn pairs_to_toml(pairs: &[(String, String)]) -> Table {
     table
 }
 
-fn spec_to_codex(spec: &ServerSpec, notes: &mut Vec<String>) -> Table {
+fn spec_to_codex(spec: &ServerSpec, notes: &mut Vec<Note>) -> Table {
     let mut table = Table::new();
     match &spec.transport {
         TransportSpec::Stdio { command, args } => {
@@ -1127,11 +1143,12 @@ fn spec_to_codex(spec: &ServerSpec, notes: &mut Vec<String>) -> Table {
         }
         TransportSpec::Sse { url } => {
             table.insert("url", toml_edit::value(url.as_str()));
-            notes.push(
+            // A limitation of Codex's config format, explained. Nothing on this
+            // machine is broken by it.
+            notes.push(Note::info(
                 "Codex has no separate SSE transport; the endpoint was written as `url`. \
-                 Check that the server speaks streamable HTTP there."
-                    .to_string(),
-            );
+                 Check that the server speaks streamable HTTP there.",
+            ));
         }
     }
     if !spec.env.is_empty() {
@@ -1148,7 +1165,7 @@ fn codex_upsert(
     name: &str,
     spec: &ServerSpec,
     overwrite: bool,
-    notes: &mut Vec<String>,
+    notes: &mut Vec<Note>,
 ) -> anyhow::Result<String> {
     let mut doc = parse_toml(text.unwrap_or(""))?;
     let table = spec_to_codex(spec, notes);
@@ -1486,7 +1503,12 @@ trust_level = "trusted"
         let client = m.client("cursor");
         assert!(client.present);
         assert!(client.servers.is_empty());
-        assert!(client.notes[0].contains("not readable JSON"), "{client:?}");
+        assert!(
+            client.notes[0].text.contains("not readable JSON"),
+            "{client:?}"
+        );
+        // A config that will not parse is broken, not a curiosity.
+        assert_eq!(client.notes[0].kind, crate::NoteKind::Problem);
 
         // And one broken client does not take the others with it.
         m.write(".claude.json", CLAUDE_CODE);
@@ -1507,7 +1529,8 @@ trust_level = "trusted"
         m.write(".cursor/mcp.json", r#"{"mcpServers":{"bad":"nope"}}"#);
         let client = m.client("cursor");
         assert!(client.servers.is_empty());
-        assert!(client.notes[0].contains("skipped `bad`"), "{client:?}");
+        assert!(client.notes[0].text.contains("skipped `bad`"), "{client:?}");
+        assert_eq!(client.notes[0].kind, crate::NoteKind::Problem);
     }
 
     #[test]
@@ -1560,7 +1583,14 @@ trust_level = "trusted"
 
         assert!(!report.created_file);
         assert_eq!(report.backup_path, Some(backup_path(&report.config_path)));
-        assert!(report.notes.iter().any(|n| n.contains("restart")));
+        // The restart hint explains how Claude Code works; it must not read as
+        // an alarm.
+        let restart = report
+            .notes
+            .iter()
+            .find(|n| n.text.contains("restart"))
+            .expect("the write report carries a restart hint");
+        assert_eq!(restart.kind, crate::NoteKind::Info);
     }
 
     #[test]
@@ -1999,7 +2029,8 @@ trust_level = "trusted"
             report.written[0]
                 .notes
                 .iter()
-                .any(|n| n.contains("no separate SSE transport")),
+                .any(|n| n.text.contains("no separate SSE transport")
+                    && n.kind == crate::NoteKind::Info),
             "{report:?}"
         );
         assert!(m

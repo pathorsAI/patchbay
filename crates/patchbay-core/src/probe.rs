@@ -101,6 +101,27 @@ pub fn unsupported_verify(tool: &'static str, reason: &str, hint: Option<&str>) 
     }
 }
 
+/// Helper for the switch path of a probe running with execution switched off.
+///
+/// Distinct from [`unsupported_switch`] on purpose: "patchbay may not run
+/// commands here" is a fact about patchbay's own configuration, and dressing it
+/// up as a reason the *tool* cannot switch put patchbay's internals in front of
+/// the user as though their login were at fault.
+pub fn exec_disabled_switch(tool: &'static str, hint: Option<&str>) -> SwitchOutcome {
+    SwitchOutcome::ExecDisabled {
+        tool: tool.to_string(),
+        hint: hint.map(|h| h.to_string()),
+    }
+}
+
+/// [`exec_disabled_switch`] for the verify path.
+pub fn exec_disabled_verify(tool: &'static str, hint: Option<&str>) -> VerifyOutcome {
+    VerifyOutcome::ExecDisabled {
+        tool: tool.to_string(),
+        hint: hint.map(|h| h.to_string()),
+    }
+}
+
 /// `UnknownProfile` populated from the probe's own status, so callers get the
 /// list of ids they could have used.
 pub fn unknown_profile(tool: &'static str, profile_id: &str, status: &ToolStatus) -> SwitchOutcome {

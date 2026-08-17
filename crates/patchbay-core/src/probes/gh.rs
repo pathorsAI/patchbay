@@ -2,9 +2,9 @@
 //!
 //! `~/.config/gh/hosts.yml` lists every host, the accounts logged in to it, and
 //! which account is active per host. Tokens normally live in the OS keychain,
-//! so `expires_at` is `None` (unknown, not expired). When a token *is* stored
-//! in the file instead, patchbay detects the key's presence — never its value —
-//! and raises a note.
+//! so the expiry is [`Expiry::Unknown`] — unknown, never expired. When a token
+//! *is* stored in the file instead, patchbay detects the key's presence — never
+//! its value — and raises a note.
 //!
 //! Profile ids are `host/user` so multi-host setups stay unambiguous; `switch`
 //! also accepts a bare username when it is unique.
@@ -14,8 +14,10 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 
 use crate::paths::Paths;
-use crate::probe::{unknown_profile, unsupported_switch, unsupported_verify, Probe};
-use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
+use crate::probe::{exec_disabled_switch, unknown_profile, unsupported_verify, Probe};
+use crate::types::{
+    Expiry, Note, PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome,
+};
 use crate::util::read_text;
 
 pub struct GhProbe {
@@ -98,14 +100,14 @@ impl Probe for GhProbe {
         let installed = self.paths.has_binary("gh") || path.is_file();
         let mut status = ToolStatus::empty(Self::TOOL, installed);
         for note in self.paths.path_notes("gh") {
-            status.note(note);
+            status.push_note(note);
         }
 
         let text = match read_text(&path) {
             Ok(Some(text)) => text,
             Ok(None) => return Ok(status),
             Err(e) => {
-                status.note(e);
+                status.problem(e);
                 return Ok(status);
             }
         };
@@ -113,7 +115,7 @@ impl Probe for GhProbe {
         let hosts: BTreeMap<String, Host> = match serde_yaml_ng::from_str(&text) {
             Ok(hosts) => hosts,
             Err(e) => {
-                status.note(format!("hosts.yml is not valid YAML ({e})"));
+                status.problem(format!("hosts.yml is not valid YAML ({e})"));
                 return Ok(status);
             }
         };
@@ -121,7 +123,7 @@ impl Probe for GhProbe {
         let mut active_per_host: Vec<(String, String)> = Vec::new();
         for (host, config) in &hosts {
             if config.oauth_token.is_some() {
-                status.note(format!(
+                status.warn(format!(
                     "the token for {host} is stored in plain text in hosts.yml rather than the system keychain"
                 ));
             }
@@ -133,21 +135,26 @@ impl Probe for GhProbe {
                 }
                 active_per_host.push((host.clone(), active.clone()));
             }
+            // Where the token lives decides both facts, so they are read off
+            // the same condition: a keychain token is a date patchbay will not
+            // go and fetch, while a token sitting in hosts.yml is right there
+            // and simply has no date beside it. Saying "in the system keychain"
+            // for the second one would be a tooltip that lies.
+            let in_hosts_yml = config.oauth_token.is_some();
+            let (token_storage, expiry_reason) = if in_hosts_yml {
+                ("hosts.yml", "nowhere in hosts.yml; GitHub decides it")
+            } else {
+                ("keychain", "in the system keychain")
+            };
             for user in users {
                 status.profiles.push(
                     Profile::new(format!("{host}/{user}"))
                         .label(format!("{user} @ {host}"))
+                        .expiry(Expiry::unknown(expiry_reason))
                         .with_meta("host", host.as_str())
                         .with_meta("user", user.as_str())
                         .with_meta("git_protocol", config.git_protocol.clone())
-                        .with_meta(
-                            "token_storage",
-                            if config.oauth_token.is_some() {
-                                "hosts.yml"
-                            } else {
-                                "keychain"
-                            },
-                        ),
+                        .with_meta("token_storage", token_storage),
                 );
             }
         }
@@ -160,7 +167,7 @@ impl Probe for GhProbe {
             .map(|(host, user)| format!("{host}/{user}"));
 
         if active_per_host.len() > 1 {
-            status.note(format!(
+            status.info(format!(
                 "gh keeps one active account per host: {}",
                 active_per_host
                     .iter()
@@ -168,11 +175,6 @@ impl Probe for GhProbe {
                     .collect::<Vec<_>>()
                     .join(", ")
             ));
-        }
-        if !status.profiles.is_empty() {
-            status.note(
-                "token expiry is unknown because gh stores tokens in the system keychain; use `pb verify gh` to check them".to_string(),
-            );
         }
 
         Ok(status)
@@ -184,9 +186,8 @@ impl Probe for GhProbe {
             return Ok(unknown_profile(Self::TOOL, profile_id, &status));
         };
         if !self.paths.may_exec() {
-            return Ok(unsupported_switch(
+            return Ok(exec_disabled_switch(
                 Self::TOOL,
-                "command execution is disabled for this probe",
                 Some(&format!("gh auth switch --hostname {host} --user {user}")),
             ));
         }
@@ -256,10 +257,10 @@ impl Probe for GhProbe {
                 supported: true,
                 subject: None,
                 scopes: Vec::new(),
-                notes: vec![format!(
+                notes: vec![Note::problem(format!(
                     "gh could not report the active token: {}",
                     out.message()
-                )],
+                ))],
                 hint: Some("gh auth login".to_string()),
                 scope: None,
             });
@@ -270,9 +271,9 @@ impl Probe for GhProbe {
         let scopes = Self::parse_scopes(&text);
         let mut notes = Vec::new();
         if scopes.is_empty() {
-            notes.push(
-                "gh reported no token scopes; fine-grained personal access tokens do not expose classic scopes".to_string(),
-            );
+            notes.push(Note::info(
+                "gh reported no token scopes; fine-grained personal access tokens do not expose classic scopes",
+            ));
         }
         Ok(PermissionsReport {
             tool: Self::TOOL.to_string(),
@@ -291,6 +292,7 @@ impl Probe for GhProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::NoteKind;
     use std::fs;
     use std::path::PathBuf;
 
@@ -313,7 +315,12 @@ mod tests {
         assert_eq!(status.active.as_deref(), Some("github.com/alice"));
         assert_eq!(status.profiles[0].meta["git_protocol"], "https");
         assert_eq!(status.profiles[0].meta["token_storage"], "keychain");
-        assert!(status.profiles.iter().all(|p| p.expires_at.is_none()));
+        // The keychain does not hand back a date: unknown, never a deadline.
+        assert!(status.profiles.iter().all(|p| p.expires_at().is_none()));
+        assert!(status.profiles.iter().all(|p| matches!(
+            &p.expiry,
+            Expiry::Unknown { reason } if reason == "in the system keychain"
+        )));
     }
 
     #[test]
@@ -327,7 +334,7 @@ mod tests {
         assert!(status
             .notes
             .iter()
-            .any(|n| n.contains("one active account per host")));
+            .any(|n| n.kind == NoteKind::Info && n.text.contains("one active account per host")));
         // A bare, ambiguous username must not resolve.
         assert!(GhProbe::resolve(&status, "alice").is_none());
         assert!(GhProbe::resolve(&status, "github.com/alice").is_some());
@@ -340,7 +347,11 @@ mod tests {
         );
         let status = GhProbe::new(Paths::for_test(&home)).status().unwrap();
         let json = serde_json::to_string(&status).unwrap();
-        assert!(status.notes.iter().any(|n| n.contains("plain text")));
+        // A secret in plain text is a real risk, not a broken machine.
+        assert!(status
+            .notes
+            .iter()
+            .any(|n| n.kind == NoteKind::Warn && n.text.contains("plain text")));
         assert!(!json.contains("gho_fakefixturetokenvalue"), "{json}");
         assert_eq!(status.profiles[0].meta["token_storage"], "hosts.yml");
     }
@@ -355,7 +366,29 @@ mod tests {
         let (_dir, home) = fixture("github.com:\n  - this is a list not a map\n");
         let status = GhProbe::new(Paths::for_test(&home)).status().unwrap();
         assert!(status.profiles.is_empty());
-        assert!(status.notes.iter().any(|n| n.contains("not valid YAML")));
+        assert!(status
+            .notes
+            .iter()
+            .any(|n| n.kind == NoteKind::Problem && n.text.contains("not valid YAML")));
+    }
+
+    #[test]
+    fn test_a_disabled_exec_is_its_own_outcome_not_a_caveat_about_the_login() {
+        let (_dir, home) = fixture("github.com:\n    users:\n        alice: {}\n    user: alice\n");
+        // Paths::for_test disallows exec, which is exactly the state under test.
+        match GhProbe::new(Paths::for_test(&home))
+            .switch("github.com/alice")
+            .unwrap()
+        {
+            SwitchOutcome::ExecDisabled { tool, hint } => {
+                assert_eq!(tool, "gh");
+                assert_eq!(
+                    hint.as_deref(),
+                    Some("gh auth switch --hostname github.com --user alice")
+                );
+            }
+            other => panic!("expected ExecDisabled, got {other:?}"),
+        }
     }
 
     #[test]

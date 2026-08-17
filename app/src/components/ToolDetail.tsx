@@ -1,14 +1,20 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
-import { countdown, levelOf } from "../expiry";
+import { expiryLevel, expiryText, expiryTitle } from "../expiry";
 import { profileMatches } from "../filters";
 import { metaEntries, rowKey, verdictText, type Panel, type SwitchNote } from "../panel";
 import {
+  isBlockingAdvisory,
   KEY_EXPIRY_LABEL,
   KEY_EXPIRY_LEVEL,
+  sourceLabel,
+  updateAvailable,
+  type Advisory,
+  type Note,
   type PermissionScope,
   type PermissionsReport,
   type Profile,
   type ToolStatus,
+  type VersionInfo,
 } from "../types";
 import { Copyable } from "./Copyable";
 import { ToolLogo } from "./ToolLogo";
@@ -141,6 +147,20 @@ export function ToolDetail({
 
         <PermissionsSection tool={status.tool} report={report} panel={panel} />
 
+        {status.advisories.length > 0 && (
+          <section className="section">
+            <span className="field-key">advisories</span>
+            <AdvisoryList advisories={status.advisories} />
+          </section>
+        )}
+
+        {status.version && (
+          <section className="section">
+            <span className="field-key">version</span>
+            <VersionRow version={status.version} />
+          </section>
+        )}
+
         {status.notes.length > 0 && (
           <section className="section">
             <span className="field-key">notes</span>
@@ -162,21 +182,122 @@ function subtitle(status: ToolStatus): string {
  * The notes core attached to a tool or a permission report. Keyed by the text
  * itself — a note has no id, and its content is what makes it that note, so it
  * survives reordering in a way an array index does not.
+ *
+ * Loud notes first, and only the loud ones get a glyph: an `info` note keeps
+ * the gutter (so every line still aligns) but draws nothing in it, because a
+ * warning triangle on "docker has no active registry" is a lie about a tool
+ * that is working.
  */
-function NoteList({ tool, notes }: Readonly<{ tool: string; notes: readonly string[] }>) {
+export function NoteList({ tool, notes }: Readonly<{ tool: string; notes: readonly Note[] }>) {
+  const ordered = [...notes].sort((a, b) => RANK[b.kind] - RANK[a.kind]);
   return (
     <ul className="notes notes-full">
-      {notes.map((n) => (
-        <li key={`${tool}:${n}`}>
-          <span className="glyph">△</span>
-          <span>{n}</span>
+      {ordered.map((n) => (
+        <li className={`note-${n.kind}`} key={`${tool}:${n.kind}:${n.text}`}>
+          <NoteGlyph kind={n.kind} />
+          {/* Clamped at six lines; the title carries anything longer, which is
+              the same bargain the card's notes already strike. */}
+          <span title={n.text}>{n.text}</span>
         </li>
       ))}
     </ul>
   );
 }
 
+const RANK: Record<Note["kind"], number> = { problem: 2, warn: 1, info: 0 };
+
+/** The gutter is always there so the text edges line up; only the loud kinds
+ *  put anything in it. */
+export function NoteGlyph({ kind }: Readonly<{ kind: Note["kind"] }>) {
+  if (kind === "info") return <span className="glyph glyph-info" aria-hidden="true" />;
+  return (
+    <span className={`glyph glyph-${kind}`} title={kind === "problem" ? "problem" : "warning"}>
+      {kind === "problem" ? "\u25B2" : "\u25B3"}
+    </span>
+  );
+}
+
+/**
+ * Curated notices: this tool was renamed, removed, or is unmaintained. Core has
+ * always shipped these and the CLI has always shown them; the panel dropped
+ * them on the floor by not declaring the field, which meant a *removed* tool
+ * looked exactly like a healthy one.
+ *
+ * Above the notes, because an advisory outranks any caveat about your login:
+ * there is no point fixing a credential for a CLI that no longer exists.
+ */
+function AdvisoryList({ advisories }: Readonly<{ advisories: readonly Advisory[] }>) {
+  return (
+    <ul className="advisories">
+      {advisories.map((a) => (
+        <li className={isBlockingAdvisory(a) ? "advisory is-blocking" : "advisory"} key={a.message}>
+          <span className="advisory-kind">{a.kind.kind}</span>
+          <span className="advisory-text">
+            {a.message}
+            {a.url && (
+              <>
+                {" "}
+                <a href={a.url} target="_blank" rel="noreferrer noopener">
+                  source
+                </a>
+              </>
+            )}
+          </span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/**
+ * What is installed, and whether something newer exists.
+ *
+ * The board deliberately shows a version only when it is behind — 23 rows of
+ * version numbers drown the one that matters. A drawer holds one tool, so the
+ * installed version is context rather than noise and is always shown.
+ *
+ * `latest: null` is not "up to date": the update line only appears when both
+ * versions are known and differ, and `note` explains an absence in the same
+ * quiet register as the rest of the section. The update command is offered as
+ * a copyable rather than a button because upgrading is a mutation of the
+ * machine, not a read patchbay should make on its own.
+ */
+function VersionRow({ version }: Readonly<{ version: VersionInfo }>) {
+  const behind = updateAvailable(version);
+  return (
+    <div className="dversion">
+      <span className="dversion-line">
+        <span className="dversion-num">{version.installed ?? "not installed"}</span>
+        {behind && (
+          <>
+            <span className="dversion-arrow">→</span>
+            <span className="dversion-num is-latest">{version.latest}</span>
+          </>
+        )}
+        {/* An unknown source says nothing about where the tool came from, so
+            it earns no chip — the note below already explains the gap. */}
+        {version.source !== "unknown" && (
+          <span className="chip chip-scope">{sourceLabel(version.source)}</span>
+        )}
+      </span>
+      {version.note && <span className="muted small">{version.note}</span>}
+      {behind && version.update_command && <Copyable text={version.update_command} />}
+    </div>
+  );
+}
+
 function SwitchNoteBlock({ note }: Readonly<{ note: SwitchNote }>) {
+  // Execution being off is patchbay's own configuration. Quiet line, plus the
+  // command you can run yourself — never the "last resort" lecture below,
+  // which is about a shell variable no child process can reach.
+  if (note.execDisabled) {
+    return (
+      <div className="switch-note">
+        <span>{note.text}</span>
+        {note.hint && <Copyable text={note.hint} />}
+      </div>
+    );
+  }
   if (!note.hint) {
     return (
       <div className={`switch-note${note.bad ? " bad" : ""}`}>
@@ -192,8 +313,7 @@ function SwitchNoteBlock({ note }: Readonly<{ note: SwitchNote }>) {
   return (
     <div className="last-resort">
       <span className="last-resort-why">
-        {note.text} patchbay cannot do this one for you: it changes a variable in the shell that
-        launched it, and a program cannot reach back into its parent shell.
+        {note.text} patchbay cannot reach back into the shell that launched it.
       </span>
       <Copyable text={note.hint} />
     </div>
@@ -473,7 +593,7 @@ function ProfileRow({
   panel: Panel;
 }>) {
   const entries = metaEntries(profile.meta);
-  const level = levelOf(profile.expires_at, panel.now);
+  const level = expiryLevel(profile.expiry, panel.now);
   const key = rowKey(tool, profile.id);
   const busy = panel.switching === key;
 
@@ -519,7 +639,9 @@ function ProfileRow({
             {profile.label}
           </span>
           {matched && <span className="match-tag">match</span>}
-          <span className={`chip chip-${level}`}>{countdown(profile.expires_at, panel.now)}</span>
+          <span className={`chip chip-${level}`} title={expiryTitle(profile.expiry)}>
+            {expiryText(profile.expiry, panel.now)}
+          </span>
           {active && <span className="active-tag">active</span>}
         </span>
         {profile.label !== profile.id && <span className="dprofile-id">{profile.id}</span>}
@@ -559,6 +681,13 @@ function ProfileFoot({
 }>) {
   const verdict = panel.verdicts[rowKey(tool, profile.id)];
   const verifying = verdict === null;
+  // patchbay's own execution switch, not anything about this login. Pressing
+  // again cannot help, so the button says so by going grey — this used to
+  // arrive as a note in the list, which put patchbay's internals in front of
+  // the user as though their credentials were at fault.
+  const cannotExec = verdict?.result === "exec_disabled";
+  const switchOff = panel.switchNotes[tool]?.execDisabled ?? false;
+  const EXEC_OFF_TITLE = "patchbay is running with command execution switched off";
 
   let verifyLabel: string;
   if (verifying) verifyLabel = "checking…";
@@ -571,7 +700,8 @@ function ProfileFoot({
         type="button"
         className="row-action"
         onClick={() => panel.verifyRow(tool, profile.id)}
-        disabled={verifying}
+        disabled={verifying || cannotExec}
+        title={cannotExec ? EXEC_OFF_TITLE : undefined}
       >
         {verifying ? <span className="spinner" /> : null}
         {verifyLabel}
@@ -587,7 +717,13 @@ function ProfileFoot({
       )}
 
       {armed && (
-        <button type="button" className="row-switch" onClick={go} disabled={blocked}>
+        <button
+          type="button"
+          className="row-switch"
+          onClick={go}
+          disabled={blocked || switchOff}
+          title={switchOff ? EXEC_OFF_TITLE : undefined}
+        >
           {busy ? (
             <>
               <span className="spinner" />

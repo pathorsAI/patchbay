@@ -1,21 +1,24 @@
 //! `ssh` — `Host` blocks in `~/.ssh/config`, and what the agent is holding.
 //!
 //! Verified **empirically** against this machine's `~/.ssh/config`: `Host`
-//! blocks (including `Include` lines pulling in other files, e.g. colima's),
-//! plus a directory of key pairs. Profiles are the `Host` aliases — labels
-//! only. Nothing inside a key file is read; a private key is exactly the kind
-//! of material patchbay refuses to touch, so the probe counts key *pairs* by
-//! looking for `<name>.pub` and never opens either half.
+//! blocks (including `Include` lines pulling in other files, e.g. colima's).
+//! Profiles are the `Host` aliases — labels only. Nothing inside a key file is
+//! ever read: a private key is exactly the kind of material patchbay refuses to
+//! touch, so a key reaches the output as the `IdentityFile` path its `Host`
+//! block names, and never as bytes.
 //!
 //! ssh has no active host: the host is an argument to every command. `active`
-//! is therefore always `None`, like the rclone and docker probes.
+//! is therefore always `None` — [`crate::types::ActiveConcept::NotApplicable`],
+//! like the rclone and docker probes.
 //!
 //! `verify` runs `ssh-add -l`, which talks to the local agent only — no
 //! network, but it is still tier 2 because it executes a binary.
 
 use crate::paths::Paths;
 use crate::probe::{unsupported_switch, unsupported_verify, Probe};
-use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
+use crate::types::{
+    ActiveConcept, Expiry, PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome,
+};
 use crate::util::read_text;
 
 pub struct SshProbe {
@@ -101,8 +104,14 @@ impl SshProbe {
         (hosts, includes)
     }
 
-    /// Count key pairs in `~/.ssh` by their `.pub` half, so no private key is
-    /// ever opened. Returns the names, sorted.
+    /// Names of the key pairs in `~/.ssh`, found by their `.pub` half so no
+    /// private key is ever opened. Sorted.
+    ///
+    /// Not derivable from the profile list: profiles here are `Host` aliases
+    /// out of `~/.ssh/config`, which is a different set of things entirely — a
+    /// key only shows up there if some `Host` block happens to name it as an
+    /// `IdentityFile`. So this is the only inventory of what is actually on the
+    /// machine, which is why it survived the note cull as an `Info`.
     fn key_names(&self) -> Vec<String> {
         let Ok(entries) = std::fs::read_dir(self.paths.ssh_dir()) else {
             return Vec::new();
@@ -143,14 +152,14 @@ impl Probe for SshProbe {
         let installed = self.paths.has_binary("ssh") || path.is_file();
         let mut status = ToolStatus::empty(Self::TOOL, installed);
         for note in self.paths.path_notes("ssh") {
-            status.note(note);
+            status.push_note(note);
         }
 
         let text = match read_text(&path) {
             Ok(Some(text)) => text,
             Ok(None) => {
                 if installed {
-                    status.note(format!(
+                    status.info(format!(
                         "no {} on this machine, so there are no host aliases to list",
                         path.display()
                     ));
@@ -158,7 +167,7 @@ impl Probe for SshProbe {
                 return Ok(status);
             }
             Err(e) => {
-                status.note(e);
+                status.problem(e);
                 return Ok(status);
             }
         };
@@ -171,6 +180,9 @@ impl Probe for SshProbe {
                         Some(hostname) => format!("{} -> {hostname}", host.alias),
                         None => host.alias.clone(),
                     })
+                    // A host alias is a destination, and the key behind it is a
+                    // key pair — neither carries a deadline.
+                    .expiry(Expiry::NoExpiry)
                     .with_meta("hostname", host.hostname)
                     .with_meta("user", host.user)
                     .with_meta("port", host.port)
@@ -182,25 +194,24 @@ impl Probe for SshProbe {
 
         let keys = self.key_names();
         if !keys.is_empty() {
-            status.note(format!(
-                "{} key pair(s) in {}: {}",
+            status.info(format!(
+                "{} key pair{} in {}: {}",
                 keys.len(),
+                if keys.len() == 1 { "" } else { "s" },
                 self.paths.ssh_dir().display(),
                 keys.join(", ")
             ));
         }
         if !includes.is_empty() {
-            status.note(format!(
+            status.info(format!(
                 "the config pulls in more hosts patchbay has not expanded: Include {}",
                 includes.join(", ")
             ));
         }
         if !status.profiles.is_empty() {
-            status.note(
-                "ssh has no active host; the destination is an argument to each command. Key \
-                 material is never read — run `pb verify ssh` to see what the agent is holding"
-                    .to_string(),
-            );
+            status.active_concept =
+                ActiveConcept::not_applicable("the destination is an argument to each ssh command");
+            status.info("key material is never read: patchbay identifies a key by its path");
         }
 
         Ok(status)
@@ -259,6 +270,7 @@ impl Probe for SshProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::NoteKind;
     use std::fs;
     use std::path::PathBuf;
 
@@ -303,20 +315,41 @@ Host bastion jump.example.com
         assert_eq!(db.meta["port"], "2222");
         assert_eq!(db.meta["identity_file"], "~/.ssh/id_ed25519");
         assert_eq!(db.meta["proxy_jump"], "bastion");
-        assert!(db.expires_at.is_none());
+        assert_eq!(db.expiry, Expiry::NoExpiry);
+        assert!(db.expires_at().is_none());
 
         // One `Host` line, two patterns: the directives apply to both, and
         // `User=admin` is the same directive with the other separator.
         assert_eq!(status.profiles[1].meta["user"], "admin");
         assert_eq!(status.profiles[2].meta["user"], "admin");
         assert_eq!(status.profiles[1].meta["hostname"], "bastion.example.com");
-        assert!(status.notes.iter().any(|n| n.contains("Include")));
+        assert!(status
+            .notes
+            .iter()
+            .any(|n| n.kind == NoteKind::Info && n.text.contains("Include")));
+
+        // An empty active slot is the right answer for ssh, not a missing one,
+        // so it is a property rather than a note.
+        assert_eq!(
+            status.active_concept,
+            ActiveConcept::not_applicable("the destination is an argument to each ssh command")
+        );
+        // The reassurance survives; the `pb verify ssh` instruction does not —
+        // the panel has a verify button.
+        let reassurance = status
+            .notes
+            .iter()
+            .find(|n| n.text.contains("key material is never read"))
+            .unwrap();
+        assert_eq!(reassurance.kind, NoteKind::Info);
+        assert!(!status.notes.iter().any(|n| n.text.contains("pb verify")));
     }
 
     #[test]
-    fn test_keys_are_counted_never_read() {
-        let (_dir, home) = fixture("Host a\n  HostName a.example.com\n");
-        // A private key and its public half. Only the name is ever used.
+    fn test_key_material_never_reaches_the_output() {
+        let (_dir, home) =
+            fixture("Host a\n  HostName a.example.com\n  IdentityFile ~/.ssh/id_ed25519\n");
+        // A private key and its public half, both sitting where ssh keeps them.
         fs::write(
             home.join(".ssh/id_ed25519"),
             "PRIVATE-KEY-FIXTURE-DO-NOT-READ",
@@ -326,13 +359,25 @@ Host bastion jump.example.com
         fs::write(home.join(".ssh/known_hosts"), "").unwrap();
 
         let status = SshProbe::new(Paths::for_test(&home)).status().unwrap();
-        assert!(status
-            .notes
-            .iter()
-            .any(|n| n.contains("1 key pair(s)") && n.contains("id_ed25519")));
+        // The path the config names is a fact; the bytes behind it are not.
+        assert_eq!(
+            status.profiles[0].meta["identity_file"],
+            "~/.ssh/id_ed25519"
+        );
         let json = serde_json::to_string(&status).unwrap();
         assert!(!json.contains("PRIVATE-KEY-FIXTURE"), "{json}");
         assert!(!json.contains("AAAAfixture"), "{json}");
+
+        // The inventory itself is a name, found by the `.pub` half, and quiet:
+        // what keys exist is not a complaint about any of them.
+        let keys = status
+            .notes
+            .iter()
+            .find(|n| n.text.contains("key pair"))
+            .expect("the key inventory is the only place these names appear");
+        assert_eq!(keys.kind, NoteKind::Info);
+        assert!(keys.text.starts_with("1 key pair in "), "{keys:?}");
+        assert!(keys.text.contains("id_ed25519"), "{keys:?}");
     }
 
     #[test]

@@ -22,7 +22,9 @@
 
 use crate::paths::Paths;
 use crate::probe::{unsupported_switch, unsupported_verify, Probe};
-use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
+use crate::types::{
+    ActiveConcept, Expiry, PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome,
+};
 use crate::util::read_text;
 
 pub struct SupabaseProbe {
@@ -50,7 +52,7 @@ impl Probe for SupabaseProbe {
         let installed = self.paths.has_binary("supabase") || home.is_dir();
         let mut status = ToolStatus::empty(Self::TOOL, installed);
         for note in self.paths.path_notes("supabase") {
-            status.note(note);
+            status.push_note(note);
         }
 
         if !installed {
@@ -65,7 +67,7 @@ impl Probe for SupabaseProbe {
             }
             Ok(None) => None,
             Err(e) => {
-                status.note(e);
+                status.problem(e);
                 None
             }
         };
@@ -76,10 +78,9 @@ impl Probe for SupabaseProbe {
         let in_env = self.paths.env("SUPABASE_ACCESS_TOKEN").is_some();
 
         if in_env {
-            status.note(
+            status.warn(
                 "SUPABASE_ACCESS_TOKEN is set in the environment and wins over both the keyring \
-                 and the fallback file"
-                    .to_string(),
+                 and the fallback file",
             );
         }
 
@@ -87,6 +88,8 @@ impl Probe for SupabaseProbe {
             status.profiles.push(
                 Profile::new(&profile_name)
                     .label(format!("{profile_name} environment"))
+                    // Long-lived with server-side revocation (ADR 0008).
+                    .expiry(Expiry::NoExpiry)
                     .with_meta(
                         "token_storage",
                         if in_env {
@@ -99,25 +102,21 @@ impl Probe for SupabaseProbe {
             );
             status.active = Some(profile_name.clone());
             if on_disk {
-                status.note(
+                status.warn(
                     "the access token is in the plaintext fallback file rather than the OS \
-                     keyring; the CLI only falls back like this when the keyring is unavailable"
-                        .to_string(),
+                     keyring; the CLI only falls back like this when the keyring is unavailable",
                 );
             }
         } else {
-            status.note(
+            status.info(
                 "supabase keeps its access token in the OS keyring (service `Supabase CLI`), \
                  which patchbay does not read; a missing fallback file is the normal, healthy \
-                 case rather than a logged-out one"
-                    .to_string(),
+                 case rather than a logged-out one",
             );
         }
 
-        status.note(
-            "a supabase `profile` selects an API environment, not an account; there is no \
-             multi-account concept and tokens carry no expiry on disk"
-                .to_string(),
+        status.active_concept = ActiveConcept::not_applicable(
+            "a supabase profile selects an API environment, not an account",
         );
 
         Ok(status)
@@ -157,6 +156,7 @@ impl Probe for SupabaseProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::NoteKind;
     use std::fs;
 
     #[test]
@@ -168,7 +168,14 @@ mod tests {
             .unwrap();
         assert!(status.installed);
         assert!(status.profiles.is_empty());
-        assert!(status.notes.iter().any(|n| n.contains("OS keyring")));
+        // The healthy case must not read as an alarm.
+        let keyring = status
+            .notes
+            .iter()
+            .find(|n| n.text.contains("OS keyring"))
+            .expect("the keyring path is explained");
+        assert_eq!(keyring.kind, NoteKind::Info);
+        assert_eq!(status.alarming_notes().count(), 0);
     }
 
     #[test]
@@ -190,11 +197,25 @@ mod tests {
             status.profiles[0].meta["token_storage"],
             "~/.supabase/access-token"
         );
-        assert!(status.profiles[0].expires_at.is_none());
-        assert!(status
+        // Supabase tokens are revoked, not expired.
+        assert_eq!(status.profiles[0].expiry, Expiry::NoExpiry);
+        let fallback = status
             .notes
             .iter()
-            .any(|n| n.contains("plaintext fallback")));
+            .find(|n| n.text.contains("plaintext fallback"))
+            .expect("the plaintext fallback file is called out");
+        assert_eq!(fallback.kind, NoteKind::Warn);
+        // "a profile is an environment, not an account" is a property now.
+        assert_eq!(
+            status.active_concept,
+            ActiveConcept::not_applicable(
+                "a supabase profile selects an API environment, not an account"
+            )
+        );
+        assert!(!status
+            .notes
+            .iter()
+            .any(|n| n.text.contains("not an account")));
 
         let json = serde_json::to_string(&status).unwrap();
         assert!(!json.contains("sbp_fakefixture"), "{json}");
@@ -209,6 +230,12 @@ mod tests {
         let status = SupabaseProbe::new(paths).status().unwrap();
         assert_eq!(status.active.as_deref(), Some("supabase"));
         assert_eq!(status.profiles[0].meta["token_storage"], "environment");
+        let env = status
+            .notes
+            .iter()
+            .find(|n| n.text.contains("SUPABASE_ACCESS_TOKEN"))
+            .expect("the env token is called out");
+        assert_eq!(env.kind, NoteKind::Warn);
         let json = serde_json::to_string(&status).unwrap();
         assert!(!json.contains("sbp_fakefixtureenvtoken"), "{json}");
     }

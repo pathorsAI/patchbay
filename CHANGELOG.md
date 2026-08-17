@@ -5,6 +5,72 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Notes carry a severity.** `ToolStatus.notes` was a `Vec<String>` — an
+  untyped dumping ground that the panel rendered one way: every line behind the
+  same amber warning triangle. So "docker has no active registry (normal for
+  docker)" looked exactly like "credentials.db is unreadable", and a board of
+  healthy tools read as a wall of complaints. Each note is now a `Note` with a
+  `kind` of `info`, `warn` or `problem`. `info` draws no glyph and does not
+  count towards the card's badge; `warn` keeps the amber triangle; `problem`
+  gets a red one. `ToolStatus::note()` is gone, replaced by `info()`, `warn()`
+  and `problem()` so the judgement has to be made at every call site.
+
+  **Breaking JSON change.** `notes` in `pb --json`, in every MCP tool result,
+  and on `PermissionsReport` and the MCP-client report, is now an array of
+  `{"kind": "info"|"warn"|"problem", "text": "…"}` rather than an array of
+  strings. There is deliberately no back-compat shim: a consumer that keeps
+  treating notes as strings should fail loudly rather than print `[object
+  Object]`.
+
+- **Expiry carries its own state.** `expires_at: null` meant three unrelated
+  things — this never expires, this expires but the timestamp is somewhere
+  patchbay will not read, and this expires but the CLI renews it silently — and
+  thirteen probes each wrote their own paragraph of prose explaining which one
+  applied. `Profile.expiry` is now an `Expiry`: `at`, `no_expiry`,
+  `unknown { reason }` or `refreshable { access_token_expires }`. The panel
+  shows "no expiry", "expiry unknown" or "auto-renewed" accordingly, with the
+  reason as the chip's tooltip, and only a real deadline takes a colour.
+
+  `Profile.expires_at` is still in the JSON, unchanged in meaning: a timestamp
+  for a real deadline, `null` for the other three. It is now *derived* from
+  `expiry` rather than stored beside it, so the two can never disagree.
+
+- **"This tool has no active X" is a property, not a note.** New
+  `ToolStatus.active_concept`. rclone, npm, docker, ssh, stripe, flyctl, op and
+  supabase say it once, in the type; the panel renders an em dash with the
+  explanation as a tooltip instead of eight tools each filing a warning about
+  working as designed.
+
+- **patchbay's own execution switch no longer surfaces as a caveat about your
+  login.** Five sites reported `command execution is disabled for this probe`
+  as a user-facing reason. New `SwitchOutcome::ExecDisabled` /
+  `VerifyOutcome::ExecDisabled` states instead: the panel greys the button and
+  explains in a tooltip, and the CLI prints one short line.
+
+- Notes that only restated something already on the row are gone: profile
+  counts, tunnel-name counts, MCP-server counts, "AWS_PROFILE is not set, so
+  the default profile is in effect" (inverted — it now speaks up only when the
+  variable *is* set), and the neon config-directory trivia the advisory already
+  covers.
+
+### Fixed
+
+- **The panel was silently dropping every advisory.** Core has always
+  serialized `advisories` on `ToolStatus` and the CLI has always rendered them,
+  but the panel's TypeScript `ToolStatus` did not declare the field — so a tool
+  that had been *removed* or abandoned looked identical to a healthy one. The
+  drawer now has an advisories section above the notes, with the source link
+  and a louder treatment for the blocking kinds.
+
+- **A purely informational MCP message was wearing the red error banner.** The
+  project-scope note in the MCP server drawer explains that patchbay declines
+  to write another project's config — a deliberate boundary, not a failure. It
+  now renders as a quiet notice.
+
 ## [0.3.4] - 2026-08-17
 
 ### Added

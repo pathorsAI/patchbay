@@ -194,7 +194,10 @@ impl Exporter<'_> {
                 carried: Vec::new(),
                 subject: None,
                 scopes: Vec::new(),
-                notes: status.notes.clone(),
+                // The bundle is a portable record, not a live board: its notes
+                // are prose for whoever reads the manifest on the new machine,
+                // so the severity a probe attached here does not travel.
+                notes: status.notes.iter().map(|n| n.text.clone()).collect(),
             };
 
             if let Some(policy) = policy {

@@ -20,7 +20,7 @@
 
 use crate::paths::Paths;
 use crate::probe::{unsupported_switch, unsupported_verify, Probe};
-use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
+use crate::types::{Expiry, PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
 
 pub struct OllamaProbe {
     paths: Paths,
@@ -65,7 +65,7 @@ impl Probe for OllamaProbe {
         let installed = self.paths.has_binary("ollama") || dir.is_dir();
         let mut status = ToolStatus::empty(Self::TOOL, installed);
         for note in self.paths.path_notes("ollama") {
-            status.note(note);
+            status.push_note(note);
         }
 
         if !installed {
@@ -83,6 +83,9 @@ impl Probe for OllamaProbe {
         status.profiles.push(
             Profile::new(Self::PROFILE_ID)
                 .label("this machine's ollama identity")
+                // Nothing token-shaped is stored: requests are signed with the
+                // local key pair, which has no lifetime to run out.
+                .expiry(Expiry::NoExpiry)
                 .with_meta("has_signing_key", has_key)
                 .with_meta("models", models)
                 .with_meta(
@@ -93,24 +96,17 @@ impl Probe for OllamaProbe {
         status.active = Some(Self::PROFILE_ID.to_string());
 
         if !has_key {
-            status.note(
+            status.info(
                 "no id_ed25519 key pair yet; ollama creates one on first use and registers its \
-                 public half when you run `ollama signin`"
-                    .to_string(),
+                 public half when you run `ollama signin`",
             );
         }
         if self.paths.env("OLLAMA_API_KEY").is_some() {
-            status.note(
+            status.warn(
                 "OLLAMA_API_KEY is set in the environment; that is the headless path and bypasses \
-                 the local key pair"
-                    .to_string(),
+                 the local key pair",
             );
         }
-        status.note(
-            "ollama stores no token and no expiry: requests are signed with the local key pair, \
-             so `pb verify ollama` (is the daemon up?) is the only liveness answer"
-                .to_string(),
-        );
 
         Ok(status)
     }
@@ -164,6 +160,7 @@ impl Probe for OllamaProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::NoteKind;
     use std::fs;
     use std::path::Path;
 
@@ -201,7 +198,10 @@ mod tests {
         assert_eq!(status.active.as_deref(), Some("default"));
         assert_eq!(status.profiles[0].meta["models"], 3);
         assert_eq!(status.profiles[0].meta["has_signing_key"], true);
-        assert!(status.profiles[0].expires_at.is_none());
+        // There is no credential with a lifetime here at all.
+        assert_eq!(status.profiles[0].expiry, Expiry::NoExpiry);
+        // Which the type says, so the note that used to say it is gone.
+        assert!(!status.notes.iter().any(|n| n.text.contains("no expiry")));
 
         let json = serde_json::to_string(&status).unwrap();
         assert!(!json.contains("PRIVATE-KEY-FIXTURE"), "{json}");
@@ -255,7 +255,14 @@ mod tests {
             .unwrap();
         assert!(status.installed);
         assert_eq!(status.profiles[0].meta["models"], 0);
-        assert!(status.notes.iter().any(|n| n.contains("no id_ed25519")));
+        // A key pair ollama will make for itself is not worth alarming about.
+        let keyless = status
+            .notes
+            .iter()
+            .find(|n| n.text.contains("no id_ed25519"))
+            .expect("the missing key pair is explained");
+        assert_eq!(keyless.kind, NoteKind::Info);
+        assert_eq!(status.alarming_notes().count(), 0);
     }
 
     #[test]

@@ -301,18 +301,20 @@ impl Paths {
     /// Human-readable note for a non-default location, empty when the default
     /// is in force. Every probe forwards this into its `ToolStatus.notes`, so
     /// "why is it reading *that* file" is answered on the board.
-    pub fn path_notes(&self, key: &str) -> Vec<String> {
+    /// Provenance, not a complaint: reading from a non-default location is
+    /// something the user asked for, so these are [`NoteKind::Info`].
+    pub fn path_notes(&self, key: &str) -> Vec<crate::types::Note> {
         if let Some((var, value)) = env_var_for(key).and_then(|var| Some((var, self.env(var)?))) {
-            return vec![format!(
+            return vec![crate::types::Note::info(format!(
                 "reading {key} state from ${var}={value} rather than the default location"
-            )];
+            ))];
         }
         if let Some(path) = self.overrides.get(key) {
-            return vec![format!(
+            return vec![crate::types::Note::info(format!(
                 "reading {key} state from {} (set by the [paths] table of {})",
                 path.display(),
                 self.patchbay_dir().join("config.toml").display()
-            )];
+            ))];
         }
         Vec::new()
     }
@@ -867,15 +869,18 @@ mod tests {
 
         let gcloud = paths.path_notes("gcloud");
         assert_eq!(gcloud.len(), 1);
+        // Provenance, not a complaint.
+        assert_eq!(gcloud[0].kind, crate::types::NoteKind::Info);
         assert!(
-            gcloud[0].contains("$CLOUDSDK_CONFIG=/from/env/gcloud"),
+            gcloud[0].text.contains("$CLOUDSDK_CONFIG=/from/env/gcloud"),
             "{gcloud:?}"
         );
 
         let aws = paths.path_notes("aws_config");
         assert_eq!(aws.len(), 1);
-        assert!(aws[0].contains("/from/config/aws"), "{aws:?}");
-        assert!(aws[0].contains("[paths]"), "{aws:?}");
+        assert_eq!(aws[0].kind, crate::types::NoteKind::Info);
+        assert!(aws[0].text.contains("/from/config/aws"), "{aws:?}");
+        assert!(aws[0].text.contains("[paths]"), "{aws:?}");
 
         // The default location is not worth a note.
         assert!(paths.path_notes("docker").is_empty());

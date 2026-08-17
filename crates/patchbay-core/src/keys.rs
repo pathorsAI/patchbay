@@ -99,7 +99,7 @@ pub fn tool_for_provider(provider: &str) -> Option<&'static str> {
 /// Lives beside [`tool_for_provider`] because it is the same piece of
 /// knowledge: what the link between a provider and a CLI does *not* mean. Only
 /// Cloudflare has one today — the case that prompted it is real and expensive.
-pub fn key_link_note(tool: &str, count: usize) -> Option<String> {
+pub fn key_link_note(tool: &str, count: usize) -> Option<crate::types::Note> {
     if count == 0 {
         return None;
     }
@@ -109,13 +109,13 @@ pub fn key_link_note(tool: &str, count: usize) -> Option<String> {
         // different reach: it can do things wrangler cannot, it survives a
         // `wrangler logout`, and it is invisible to every `wrangler whoami`.
         // Reading the row as "Cloudflare: logged in" hides both halves of that.
-        "wrangler" => Some(format!(
+        "wrangler" => Some(crate::types::Note::warn(format!(
             "{count} standalone Cloudflare API token{} registered here. That is a different \
              credential from wrangler's OAuth login, with different reach: it is not limited to \
              wrangler's scopes, `wrangler logout` does not revoke it, and `wrangler whoami` \
              cannot see it. Check it with `pb key verify <id>`",
             if count == 1 { " is" } else { "s are" }
-        )),
+        ))),
         _ => None,
     }
 }

@@ -4,14 +4,16 @@
 //! `isDefault` is active. Azure writes this file with a UTF-8 BOM, which
 //! [`read_text`] strips.
 //!
-//! Tokens live in a separate MSAL cache (keychain-backed on macOS), so
-//! `expires_at` is unknown rather than absent.
+//! Tokens live in a separate MSAL cache (keychain-backed on macOS), so every
+//! subscription's expiry is [`Expiry::Unknown`] — there is a deadline, it is
+//! simply not written anywhere this probe reads. That is the whole of what the
+//! probe used to say in a note.
 
 use serde::Deserialize;
 
 use crate::paths::Paths;
-use crate::probe::{unknown_profile, unsupported_switch, Probe};
-use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
+use crate::probe::{exec_disabled_switch, unknown_profile, Probe};
+use crate::types::{Expiry, PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
 use crate::util::read_text;
 
 pub struct AzProbe {
@@ -86,14 +88,14 @@ impl Probe for AzProbe {
         let installed = self.paths.has_binary("az") || path.is_file();
         let mut status = ToolStatus::empty(Self::TOOL, installed);
         for note in self.paths.path_notes("azure") {
-            status.note(note);
+            status.push_note(note);
         }
 
         let text = match read_text(&path) {
             Ok(Some(text)) => text,
             Ok(None) => return Ok(status),
             Err(e) => {
-                status.note(e);
+                status.problem(e);
                 return Ok(status);
             }
         };
@@ -101,7 +103,7 @@ impl Probe for AzProbe {
         let profile: AzureProfile = match serde_json::from_str(&text) {
             Ok(profile) => profile,
             Err(e) => {
-                status.note(format!("azureProfile.json is not valid JSON ({e})"));
+                status.problem(format!("azureProfile.json is not valid JSON ({e})"));
                 return Ok(status);
             }
         };
@@ -123,6 +125,7 @@ impl Probe for AzProbe {
             status.profiles.push(
                 Profile::new(&id)
                     .label(&name)
+                    .expiry(Expiry::unknown("in the Azure MSAL cache"))
                     .with_meta(
                         "user",
                         subscription.user.as_ref().and_then(|u| u.name.clone()),
@@ -140,20 +143,16 @@ impl Probe for AzProbe {
 
         if !status.profiles.is_empty() {
             if status.active.is_none() {
-                status.note(
-                    "no subscription is marked as default; `az` commands will need --subscription"
-                        .to_string(),
+                status.warn(
+                    "no subscription is marked as default; `az` commands will need --subscription",
                 );
             }
             if !disabled.is_empty() {
-                status.note(format!(
+                status.warn(format!(
                     "subscriptions not in the Enabled state: {}",
                     disabled.join(", ")
                 ));
             }
-            status.note(
-                "token expiry is unknown because the Azure CLI keeps tokens in a separate MSAL cache".to_string(),
-            );
         }
 
         Ok(status)
@@ -165,9 +164,8 @@ impl Probe for AzProbe {
             return Ok(unknown_profile(Self::TOOL, profile_id, &status));
         };
         if !self.paths.may_exec() {
-            return Ok(unsupported_switch(
+            return Ok(exec_disabled_switch(
                 Self::TOOL,
-                "command execution is disabled for this probe",
                 Some(&format!("az account set --subscription {id}")),
             ));
         }
@@ -230,8 +228,19 @@ impl Probe for AzProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::NoteKind;
     use std::fs;
     use std::path::PathBuf;
+
+    /// Every note's text on one blob, for `contains` assertions.
+    fn note_text(status: &ToolStatus) -> String {
+        status
+            .notes
+            .iter()
+            .map(|n| n.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
     fn fixture(body: &str) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -258,11 +267,21 @@ mod tests {
         assert_eq!(status.profiles[0].label, "Students");
         assert_eq!(status.profiles[0].meta["user"], "a@example.com");
         assert_eq!(status.profiles[0].meta["tenant_domain"], "example.com");
-        assert!(status.profiles.iter().all(|p| p.expires_at.is_none()));
+        // The expiry exists; it lives in the MSAL cache. That is now the
+        // profile's own state rather than a sentence in `notes`.
         assert!(status
+            .profiles
+            .iter()
+            .all(|p| p.expiry == Expiry::unknown("in the Azure MSAL cache")));
+        assert!(status.profiles.iter().all(|p| p.expires_at().is_none()));
+        assert!(!note_text(&status).contains("MSAL"), "{:?}", status.notes);
+
+        let disabled = status
             .notes
             .iter()
-            .any(|n| n.contains("not in the Enabled state")));
+            .find(|n| n.text.contains("not in the Enabled state"))
+            .expect("expected the disabled subscription to be named");
+        assert_eq!(disabled.kind, NoteKind::Warn);
     }
 
     #[test]
@@ -305,10 +324,13 @@ mod tests {
         );
         let status = AzProbe::new(Paths::for_test(&home)).status().unwrap();
         assert!(status.active.is_none());
-        assert!(status
+        let note = status
             .notes
             .iter()
-            .any(|n| n.contains("no subscription is marked as default")));
+            .find(|n| n.text.contains("no subscription is marked as default"))
+            .expect("expected the missing default to be flagged");
+        // Nothing is broken — every command just has to name a subscription.
+        assert_eq!(note.kind, NoteKind::Warn);
     }
 
     #[test]
@@ -321,6 +343,29 @@ mod tests {
         let (_dir, home) = fixture("{\"subscriptions\": [ truncated");
         let status = AzProbe::new(Paths::for_test(&home)).status().unwrap();
         assert!(status.profiles.is_empty());
-        assert!(status.notes.iter().any(|n| n.contains("not valid JSON")));
+        let note = status
+            .notes
+            .iter()
+            .find(|n| n.text.contains("not valid JSON"))
+            .expect("expected the unparseable profile to be flagged");
+        assert_eq!(note.kind, NoteKind::Problem);
+    }
+
+    #[test]
+    fn test_execution_being_switched_off_is_not_a_reason_az_cannot_switch() {
+        let (_dir, home) = fixture(PROFILE);
+        match AzProbe::new(Paths::for_test(&home))
+            .switch("Students")
+            .unwrap()
+        {
+            SwitchOutcome::ExecDisabled { tool, hint } => {
+                assert_eq!(tool, "az");
+                assert_eq!(
+                    hint.as_deref(),
+                    Some("az account set --subscription 11111111-1111-1111-1111-111111111111")
+                );
+            }
+            other => panic!("expected ExecDisabled, got {other:?}"),
+        }
     }
 }

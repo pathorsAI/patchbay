@@ -18,14 +18,18 @@
 //! probe checks whether the value *is* a `${...}` reference without keeping it.
 //!
 //! npm has no active registry (`registry=` sets a default, scopes route the
-//! rest) and no OS keychain integration, so `active` is `None` and `expires_at`
-//! is always unknown.
+//! rest) and no OS keychain integration, so `active` is `None` — which is the
+//! correct answer rather than a missing one, hence
+//! [`crate::types::ActiveConcept::NotApplicable`] — and the token on disk
+//! carries no deadline of its own.
 
 use std::collections::BTreeMap;
 
 use crate::paths::Paths;
 use crate::probe::{unsupported_switch, unsupported_verify, Probe};
-use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
+use crate::types::{
+    ActiveConcept, Expiry, PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome,
+};
 use crate::util::read_text;
 
 pub struct NpmProbe {
@@ -130,14 +134,14 @@ impl Probe for NpmProbe {
         let installed = self.paths.has_binary("npm") || path.is_file();
         let mut status = ToolStatus::empty(Self::TOOL, installed);
         for note in self.paths.path_notes("npm") {
-            status.note(note);
+            status.push_note(note);
         }
 
         let text = match read_text(&path) {
             Ok(Some(text)) => text,
             Ok(None) => return Ok(status),
             Err(e) => {
-                status.note(e);
+                status.problem(e);
                 return Ok(status);
             }
         };
@@ -164,6 +168,9 @@ impl Probe for NpmProbe {
             status.profiles.push(
                 Profile::new(registry.as_str())
                     .label(registry.trim_start_matches("//").trim_end_matches('/'))
+                    // An .npmrc line is a bare token: nothing in the file dates
+                    // it, and npm never asks you to renew it.
+                    .expiry(Expiry::NoExpiry)
                     .with_meta("auth_fields", auth.fields.clone())
                     .with_meta(
                         "credential_storage",
@@ -183,23 +190,16 @@ impl Probe for NpmProbe {
             return Ok(status);
         }
 
-        status.note(
-            "npm has no active registry: the default comes from `registry=` and scoped packages \
-             route by `@scope:registry`"
-                .to_string(),
+        status.active_concept = ActiveConcept::not_applicable(
+            "the default comes from `registry=` and scoped packages route by `@scope:registry`",
         );
         if !plaintext.is_empty() {
-            status.note(format!(
+            status.warn(format!(
                 "tokens for {} are stored in plain text in .npmrc (npm has no keychain \
                  integration); `${{VAR}}` values are read from the environment instead",
                 plaintext.join(", ")
             ));
         }
-        status.note(
-            "npm records no expiry; classic npm tokens were retired at the end of 2025, so a \
-             long-lived token here is most likely a granular one with a server-side expiry"
-                .to_string(),
-        );
 
         Ok(status)
     }
@@ -233,6 +233,7 @@ impl Probe for NpmProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::NoteKind;
     use std::fs;
     use std::path::PathBuf;
 
@@ -267,7 +268,12 @@ registry=https://registry.npmjs.org/
             ]
         );
         assert!(status.active.is_none());
-        assert!(status.profiles.iter().all(|p| p.expires_at.is_none()));
+        // Empty by design: npm routes by scope, it does not select a registry.
+        assert!(status.active_concept.is_not_applicable());
+        assert!(status
+            .profiles
+            .iter()
+            .all(|p| p.expiry == Expiry::NoExpiry && p.expires_at().is_none()));
 
         let npmjs = status
             .profiles
@@ -298,10 +304,14 @@ registry=https://registry.npmjs.org/
         let warning = status
             .notes
             .iter()
-            .find(|n| n.contains("plain text"))
+            .find(|n| n.text.contains("plain text"))
             .unwrap();
-        assert!(warning.contains("//registry.npmjs.org/"), "{warning}");
-        assert!(!warning.contains("myorg/"), "{warning}");
+        assert_eq!(warning.kind, NoteKind::Warn);
+        assert!(
+            warning.text.contains("//registry.npmjs.org/"),
+            "{warning:?}"
+        );
+        assert!(!warning.text.contains("myorg/"), "{warning:?}");
     }
 
     #[test]
@@ -345,7 +355,7 @@ registry=https://registry.npmjs.org/
         assert!(status
             .notes
             .iter()
-            .any(|n| n.contains("$NPM_CONFIG_USERCONFIG=")));
+            .any(|n| n.text.contains("$NPM_CONFIG_USERCONFIG=")));
     }
 
     #[test]

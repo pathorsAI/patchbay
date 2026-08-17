@@ -27,7 +27,9 @@ use serde::Deserialize;
 
 use crate::paths::Paths;
 use crate::probe::{unsupported_switch, unsupported_verify, Probe};
-use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
+use crate::types::{
+    ActiveConcept, Expiry, PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome,
+};
 use crate::util::read_text;
 
 pub struct StripeProbe {
@@ -82,14 +84,14 @@ impl Probe for StripeProbe {
         let installed = self.paths.has_binary("stripe") || path.is_file();
         let mut status = ToolStatus::empty(Self::TOOL, installed);
         for note in self.paths.path_notes("stripe") {
-            status.note(note);
+            status.push_note(note);
         }
 
         let text = match read_text(&path) {
             Ok(Some(text)) => text,
             Ok(None) => return Ok(status),
             Err(e) => {
-                status.note(e);
+                status.problem(e);
                 return Ok(status);
             }
         };
@@ -99,7 +101,7 @@ impl Probe for StripeProbe {
         let root: BTreeMap<String, toml::Value> = match toml::from_str(&text) {
             Ok(root) => root,
             Err(e) => {
-                status.note(format!("stripe config.toml is not valid TOML ({e})"));
+                status.problem(format!("stripe config.toml is not valid TOML ({e})"));
                 return Ok(status);
             }
         };
@@ -135,7 +137,12 @@ impl Probe for StripeProbe {
             status.profiles.push(
                 Profile::new(name.as_str())
                     .label(profile.display_name.clone().unwrap_or_else(|| name.clone()))
-                    .expires_at(expires_at)
+                    // The CLI writes a 90-day date at login. When it is absent
+                    // the key still has a life, patchbay just cannot see it.
+                    .expiry(match expires_at {
+                        Some(at) => Expiry::At(at),
+                        None => Expiry::unknown("not recorded in config.toml"),
+                    })
                     .with_meta("account_id", profile.account_id.clone())
                     .with_meta("device_name", profile.device_name.clone())
                     .with_meta("has_test_mode_key", profile.test_mode_api_key.is_some())
@@ -149,10 +156,9 @@ impl Probe for StripeProbe {
 
         if status.profiles.is_empty() {
             if !root.is_empty() {
-                status.note(
+                status.info(
                     "stripe config.toml has no profile tables; a table counts as a profile only \
-                     once it has a display_name"
-                        .to_string(),
+                     once it has a display_name",
                 );
             }
             return Ok(status);
@@ -162,25 +168,23 @@ impl Probe for StripeProbe {
         if status.profiles.iter().any(|p| p.id == Self::ACTIVE_TABLE) {
             status.active = Some(Self::ACTIVE_TABLE.to_string());
         }
-        status.note(
-            "stripe has no active-profile pointer: the `[default]` table is the active profile, \
-             and `stripe config --switch` rewrites the file to move tables in and out of it"
-                .to_string(),
+        status.active_concept = ActiveConcept::not_applicable(
+            "the [default] table is the active profile; stripe has no pointer to move",
         );
         if let Some(project) = self.paths.env("STRIPE_PROJECT_NAME") {
-            status.note(format!(
-                "STRIPE_PROJECT_NAME={project} is set and overrides that choice for every command"
+            status.warn(format!(
+                "STRIPE_PROJECT_NAME={project} is set and overrides the [default] table for every \
+                 command"
             ));
         }
         if self.paths.env("STRIPE_API_KEY").is_some() {
-            status.note(
+            status.warn(
                 "STRIPE_API_KEY is set in the environment and takes precedence over every stored \
-                 profile"
-                    .to_string(),
+                 profile",
             );
         }
         if !plaintext_test_keys.is_empty() {
-            status.note(format!(
+            status.warn(format!(
                 "the test-mode key for {} is stored in plain text in config.toml (the live-mode \
                  key is redacted there and kept in the keychain)",
                 plaintext_test_keys.join(", ")
@@ -191,10 +195,9 @@ impl Probe for StripeProbe {
             .map(|dir| dir.join("credentials.json").is_file())
             .unwrap_or(false)
         {
-            status.note(
+            status.warn(
                 "credentials.json sits next to config.toml: that is the plaintext fallback secret \
-                 store the CLI uses when the OS keyring is unavailable"
-                    .to_string(),
+                 store the CLI uses when the OS keyring is unavailable",
             );
         }
 
@@ -233,6 +236,7 @@ impl Probe for StripeProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::NoteKind;
     use std::fs;
     use std::path::PathBuf;
 
@@ -279,11 +283,28 @@ test_mode_key_expires_at = "2020-01-01"
         assert_eq!(default.meta["has_live_mode_key"], true);
         // End of day UTC, not midnight, so a key is not called expired early.
         assert_eq!(
-            default.expires_at.unwrap().to_rfc3339(),
+            default.expires_at().unwrap().to_rfc3339(),
             "2030-11-11T23:59:59+00:00"
         );
-        assert!(status.notes.iter().any(|n| n.contains("no active-profile")));
-        assert!(status.notes.iter().any(|n| n.contains("plain text")));
+        // "which one is active" is not a question stripe answers with a
+        // pointer, so it is a property of the status rather than a note.
+        assert_eq!(
+            status.active_concept,
+            ActiveConcept::not_applicable(
+                "the [default] table is the active profile; stripe has no pointer to move"
+            )
+        );
+        assert!(!status
+            .notes
+            .iter()
+            .any(|n| n.text.contains("no active-profile")));
+        // A secret in plain text is a warning, not a remark.
+        let plaintext = status
+            .notes
+            .iter()
+            .find(|n| n.text.contains("plain text"))
+            .expect("the plaintext test key is called out");
+        assert_eq!(plaintext.kind, NoteKind::Warn);
 
         let json = serde_json::to_string(&status).unwrap();
         for secret in [
@@ -302,11 +323,15 @@ test_mode_key_expires_at = "2020-01-01"
             .with_env("STRIPE_PROJECT_NAME", "staging")
             .with_env("STRIPE_API_KEY", "sk_test_fakefixtureenv");
         let status = StripeProbe::new(paths).status().unwrap();
-        assert!(status
-            .notes
-            .iter()
-            .any(|n| n.contains("STRIPE_PROJECT_NAME=staging")));
-        assert!(status.notes.iter().any(|n| n.contains("STRIPE_API_KEY")));
+        // An env var silently outranking the stored login is a warning.
+        for text in ["STRIPE_PROJECT_NAME=staging", "STRIPE_API_KEY"] {
+            let note = status
+                .notes
+                .iter()
+                .find(|n| n.text.contains(text))
+                .unwrap_or_else(|| panic!("no note about {text}"));
+            assert_eq!(note.kind, NoteKind::Warn, "{text}");
+        }
         let json = serde_json::to_string(&status).unwrap();
         assert!(!json.contains("sk_test_fakefixtureenv"), "{json}");
     }
@@ -320,10 +345,12 @@ test_mode_key_expires_at = "2020-01-01"
         )
         .unwrap();
         let status = StripeProbe::new(Paths::for_test(&home)).status().unwrap();
-        assert!(status
+        let note = status
             .notes
             .iter()
-            .any(|n| n.contains("plaintext fallback secret store")));
+            .find(|n| n.text.contains("plaintext fallback secret store"))
+            .expect("credentials.json is called out");
+        assert_eq!(note.kind, NoteKind::Warn);
     }
 
     #[test]
@@ -337,12 +364,23 @@ test_mode_key_expires_at = "2020-01-01"
 
         let (_dir, home) = fixture("this is not = = toml [[[");
         let status = StripeProbe::new(Paths::for_test(&home)).status().unwrap();
-        assert!(status.notes.iter().any(|n| n.contains("not valid TOML")));
+        // A file that will not parse is broken, not a remark.
+        let malformed = status
+            .notes
+            .iter()
+            .find(|n| n.text.contains("not valid TOML"))
+            .expect("the parse failure is reported");
+        assert_eq!(malformed.kind, NoteKind::Problem);
 
         let (_dir, home) = fixture("color = \"auto\"\n\n[scratch]\ndevice_name = \"x\"\n");
         let status = StripeProbe::new(Paths::for_test(&home)).status().unwrap();
         assert!(status.profiles.is_empty());
-        assert!(status.notes.iter().any(|n| n.contains("display_name")));
+        let explanation = status
+            .notes
+            .iter()
+            .find(|n| n.text.contains("display_name"))
+            .expect("the profile rule is explained");
+        assert_eq!(explanation.kind, NoteKind::Info);
     }
 
     #[test]

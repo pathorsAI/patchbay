@@ -142,7 +142,8 @@ READS both and WRITES only 'user' — a project's servers belong to that project
 - `env_keys` and `header_keys` are NAMES ONLY. Values are deliberately not returned: on a real \
 machine those fields hold API keys. `args_len` is a count for the same reason — a command's \
 arguments routinely carry `--api-key=…`.
-- `notes` explains anything patchbay could not parse. A malformed config never blanks the board.")]
+- `notes` are { kind, text }. A `problem` note is a config patchbay could not read or parse and \
+is worth raising; `info` is background. A malformed config never blanks the board.")]
     async fn list_mcp_clients(&self) -> Result<CallToolResult, ErrorData> {
         let clients = self.clients.clone();
         let found = offload(move || clients.clients()).await?;
@@ -171,8 +172,9 @@ Safety: the config file is copied to <path>.patchbay-bak first, the write is ato
 other key in the file — other servers, unrelated settings, TOML comments — is preserved. An \
 existing name is an error unless `overwrite: true`.
 
-Returns { client, label, name, config_path, backup_path, created_file, notes }. Relay `notes` \
-verbatim: they carry the restart requirement and any limitation of the target format.")]
+Returns { client, label, name, config_path, backup_path, created_file, notes }. Each note is \
+{ kind, text }; relay the `text` verbatim, because these carry the restart requirement and any \
+limitation of the target format.")]
     async fn add_mcp_server(
         &self,
         Parameters(params): Parameters<AddMcpServerParams>,

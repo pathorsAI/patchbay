@@ -130,7 +130,7 @@ export default function App() {
                 supported: false,
                 subject: null,
                 scopes: [],
-                notes: [String(e)],
+                notes: [{ kind: "problem" as const, text: String(e) }],
                 hint: null,
                 scope,
               },

@@ -1,9 +1,12 @@
 //! `aws` — shared config/credentials INI plus the SSO token cache.
 //!
 //! Profiles come from `~/.aws/config` (`[default]` and `[profile NAME]`) and
-//! `~/.aws/credentials` (`[NAME]`). Only SSO profiles have a knowable expiry:
-//! it lives in `~/.aws/sso/cache/*.json`. Static access keys never expire, so
-//! their `expires_at` is `None` — which is not the same as "unknown".
+//! `~/.aws/credentials` (`[NAME]`). Only SSO profiles have a knowable deadline:
+//! it lives in `~/.aws/sso/cache/*.json`, and is the one case here that is a
+//! real [`Expiry::At`]. Static access keys are [`Expiry::NoExpiry`] — they do
+//! not expire by design, which is a different claim from "patchbay could not
+//! find out". An assumed-role profile is neither: the CLI mints the session
+//! itself and caches it where this probe does not look.
 //!
 //! The AWS CLI has no persistent "active profile" on disk: it is the
 //! `AWS_PROFILE` environment variable, defaulting to `default`. That is why
@@ -17,7 +20,9 @@ use chrono::{DateTime, Utc};
 
 use crate::paths::Paths;
 use crate::probe::{unsupported_switch, unsupported_verify, Probe};
-use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
+use crate::types::{
+    Expiry, Note, PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome,
+};
 use crate::util::{parse_timestamp, read_text, Ini};
 
 pub struct AwsProbe {
@@ -66,12 +71,12 @@ impl AwsProbe {
         Self { paths }
     }
 
-    fn load_ini(path: &Path, notes: &mut Vec<String>) -> Option<Ini> {
+    fn load_ini(path: &Path, notes: &mut Vec<Note>) -> Option<Ini> {
         match read_text(path) {
             Ok(Some(text)) => Some(Ini::parse(&text)),
             Ok(None) => None,
             Err(e) => {
-                notes.push(e);
+                notes.push(Note::problem(e));
                 None
             }
         }
@@ -119,10 +124,10 @@ impl Probe for AwsProbe {
             self.paths.has_binary("aws") || config_path.is_file() || credentials_path.is_file();
         let mut status = ToolStatus::empty(Self::TOOL, installed);
         for note in self.paths.path_notes("aws_config") {
-            status.note(note);
+            status.push_note(note);
         }
         for note in self.paths.path_notes("aws_credentials") {
-            status.note(note);
+            status.push_note(note);
         }
 
         // BTreeMap so the board is stable across runs.
@@ -169,7 +174,7 @@ impl Probe for AwsProbe {
         for (name, entry) in entries {
             // Only SSO profiles have a cached session that expires. Match on
             // the start URL when we can, else fall back to the newest token.
-            let expires_at = if entry.has_sso {
+            let sso_expires_at = if entry.has_sso {
                 let matched = entry.sso_start_url.as_ref().and_then(|url| {
                     cache
                         .iter()
@@ -180,6 +185,23 @@ impl Probe for AwsProbe {
                 None
             };
 
+            // One credential kind, one expiry state. Reading them all as
+            // `None` used to make a static key that never expires and an SSO
+            // profile nobody has logged into today indistinguishable.
+            let expiry = match entry.kind() {
+                "sso" => match sso_expires_at {
+                    Some(at) => Expiry::At(at),
+                    // Configured for SSO with nothing in the token cache: there
+                    // is no session yet, so there is no date to report.
+                    None => Expiry::unknown("no cached SSO session"),
+                },
+                // The CLI assumes the role itself and caches the short-lived
+                // session in ~/.aws/cli/cache, which this probe does not read.
+                "assume-role" => Expiry::unknown("in the CLI's assumed-role credential cache"),
+                "static-keys" => Expiry::NoExpiry,
+                _ => Expiry::unknown("no credential for this profile in ~/.aws"),
+            };
+
             let source = match (entry.in_config, entry.in_credentials) {
                 (true, true) => "config+credentials",
                 (true, false) => "config",
@@ -188,7 +210,7 @@ impl Probe for AwsProbe {
 
             status.profiles.push(
                 Profile::new(&name)
-                    .expires_at(expires_at)
+                    .expiry(expiry)
                     .with_meta("type", entry.kind())
                     .with_meta("source", source)
                     .with_meta("region", entry.region.clone())
@@ -200,12 +222,19 @@ impl Probe for AwsProbe {
             );
         }
 
-        // Active profile is environment state, not file state.
+        // Active profile is environment state, not file state. Only the
+        // override is worth a note: `AWS_PROFILE` unset and `default` in effect
+        // is how the CLI is supposed to behave, and saying so made the ordinary
+        // path look like something had happened.
         match self.paths.env("AWS_PROFILE") {
             Some(name) => {
                 status.active = Some(name.to_string());
-                if !status.profiles.iter().any(|p| p.id == name) {
-                    status.note(format!(
+                if status.profiles.iter().any(|p| p.id == name) {
+                    status.warn(format!(
+                        "AWS_PROFILE is set to `{name}`, so that profile is in effect rather than `default`"
+                    ));
+                } else {
+                    status.problem(format!(
                         "AWS_PROFILE is set to `{name}` but no such profile exists in ~/.aws"
                     ));
                 }
@@ -213,26 +242,12 @@ impl Probe for AwsProbe {
             None => {
                 if status.profiles.iter().any(|p| p.id == "default") {
                     status.active = Some("default".to_string());
-                    status.note(
-                        "AWS_PROFILE is not set, so the `default` profile is in effect".to_string(),
-                    );
                 } else if !status.profiles.is_empty() {
-                    status.note(
-                        "AWS_PROFILE is not set and there is no `default` profile; aws commands will fail until you export one".to_string(),
+                    status.problem(
+                        "AWS_PROFILE is not set and there is no `default` profile; aws commands will fail until you export one",
                     );
                 }
             }
-        }
-
-        if status.profiles.iter().any(|p| p.expires_at.is_none())
-            && status
-                .profiles
-                .iter()
-                .any(|p| p.meta.get("type").and_then(|v| v.as_str()) == Some("static-keys"))
-        {
-            status.note(
-                "static access keys do not expire; patchbay cannot tell whether they were revoked without `pb verify aws`".to_string(),
-            );
         }
 
         Ok(status)
@@ -288,6 +303,7 @@ impl Probe for AwsProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::NoteKind;
     use std::fs;
     use std::path::PathBuf;
 
@@ -335,7 +351,9 @@ mod tests {
         let default = &status.profiles[0];
         assert_eq!(default.meta["source"], "config+credentials");
         assert_eq!(default.meta["type"], "static-keys");
-        assert!(default.expires_at.is_none());
+        // Not "we could not find out": a static key does not expire at all.
+        assert_eq!(default.expiry, Expiry::NoExpiry);
+        assert!(default.expires_at().is_none());
 
         let work = &status.profiles[1];
         assert_eq!(work.meta["type"], "sso");
@@ -370,12 +388,14 @@ mod tests {
         let status = fx.probe().status().unwrap();
         let work = status.profiles.iter().find(|p| p.id == "work").unwrap();
         let other = status.profiles.iter().find(|p| p.id == "other").unwrap();
+        // A cached SSO session is the one aws credential with a real deadline.
         assert_eq!(
-            work.expires_at.unwrap().to_rfc3339(),
+            work.expires_at().unwrap().to_rfc3339(),
             "2030-01-01T00:00:00+00:00"
         );
+        assert!(matches!(work.expiry, Expiry::At(_)));
         assert_eq!(
-            other.expires_at.unwrap().to_rfc3339(),
+            other.expires_at().unwrap().to_rfc3339(),
             "2029-01-01T00:00:00+00:00"
         );
 
@@ -388,22 +408,83 @@ mod tests {
         let fx = Fixture::new();
         fx.write(".aws/config", "[default]\n\n[profile work]\n");
 
+        // Set -> that profile wins, and an environment variable quietly
+        // overriding the stored default is worth an amber note.
         let probe = AwsProbe::new(Paths::for_test(&fx.home).with_env("AWS_PROFILE", "work"));
-        assert_eq!(probe.status().unwrap().active.as_deref(), Some("work"));
-
-        // Unset -> default, with a note explaining why.
-        let status = fx.probe().status().unwrap();
-        assert_eq!(status.active.as_deref(), Some("default"));
-        assert!(status
+        let status = probe.status().unwrap();
+        assert_eq!(status.active.as_deref(), Some("work"));
+        let override_note = status
             .notes
             .iter()
-            .any(|n| n.contains("AWS_PROFILE is not set")));
+            .find(|n| n.text.contains("AWS_PROFILE is set to `work`"))
+            .expect("expected the override to be named");
+        assert_eq!(override_note.kind, NoteKind::Warn);
 
-        // Set to something that does not exist -> flagged.
+        // Unset -> default, silently: that is how the CLI is meant to behave.
+        let status = fx.probe().status().unwrap();
+        assert_eq!(status.active.as_deref(), Some("default"));
+        assert!(
+            !status.notes.iter().any(|n| n.text.contains("AWS_PROFILE")),
+            "{:?}",
+            status.notes
+        );
+
+        // Set to something that does not exist -> a dangling reference.
         let probe = AwsProbe::new(Paths::for_test(&fx.home).with_env("AWS_PROFILE", "ghost"));
         let status = probe.status().unwrap();
         assert_eq!(status.active.as_deref(), Some("ghost"));
-        assert!(status.notes.iter().any(|n| n.contains("no such profile")));
+        let dangling = status
+            .notes
+            .iter()
+            .find(|n| n.text.contains("no such profile"))
+            .expect("expected the dangling profile to be flagged");
+        assert_eq!(dangling.kind, NoteKind::Problem);
+    }
+
+    #[test]
+    fn test_no_profile_at_all_is_a_problem_not_a_shrug() {
+        let fx = Fixture::new();
+        fx.write(".aws/config", "[profile work]\n");
+        let status = fx.probe().status().unwrap();
+        assert!(status.active.is_none());
+        let note = status
+            .notes
+            .iter()
+            .find(|n| n.text.contains("aws commands will fail"))
+            .expect("expected the missing default to be flagged");
+        assert_eq!(note.kind, NoteKind::Problem);
+    }
+
+    #[test]
+    fn test_each_credential_kind_gets_the_expiry_state_that_is_true_of_it() {
+        let fx = Fixture::new();
+        fx.write(
+            ".aws/config",
+            "[profile keys]\nregion = us-east-1\n\n[profile role]\nrole_arn = arn:aws:iam::111122223333:role/Admin\nsource_profile = keys\n\n[profile sso]\nsso_start_url = https://example.awsapps.com/start\nsso_role_name = Admin\n\n[profile empty]\nregion = us-east-1\n",
+        )
+        .write(
+            ".aws/credentials",
+            "[keys]\naws_access_key_id = AKIAFAKEFIXTUREKEY\naws_secret_access_key = fake-fixture-secret\n",
+        );
+
+        let status = fx.probe().status().unwrap();
+        let expiry = |id: &str| {
+            status
+                .profiles
+                .iter()
+                .find(|p| p.id == id)
+                .unwrap_or_else(|| panic!("no profile {id}"))
+                .expiry
+                .clone()
+        };
+        assert_eq!(expiry("keys"), Expiry::NoExpiry);
+        // No token cached, so an SSO profile has no deadline to report yet —
+        // which is unknown, not "never".
+        assert_eq!(expiry("sso"), Expiry::unknown("no cached SSO session"));
+        assert!(matches!(expiry("role"), Expiry::Unknown { .. }));
+        assert!(matches!(expiry("empty"), Expiry::Unknown { .. }));
+        // None of the three non-`At` states is ever reported as a deadline.
+        assert!(status.soonest_expiry().is_none());
     }
 
     #[test]

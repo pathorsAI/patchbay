@@ -37,7 +37,9 @@ use serde::Deserialize;
 
 use crate::paths::Paths;
 use crate::probe::{unsupported_switch, unsupported_verify, Probe};
-use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
+use crate::types::{
+    Expiry, Note, PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome,
+};
 use crate::util::read_text;
 
 pub struct CloudflaredProbe {
@@ -114,7 +116,7 @@ impl CloudflaredProbe {
     }
 
     /// Every tunnel credential in the directory, secret-free.
-    fn tunnels(&self, notes: &mut Vec<String>) -> Vec<TunnelRef> {
+    fn tunnels(&self, notes: &mut Vec<Note>) -> Vec<TunnelRef> {
         let dir = self.paths.cloudflared_dir();
         let Ok(entries) = std::fs::read_dir(&dir) else {
             return Vec::new();
@@ -133,7 +135,7 @@ impl CloudflaredProbe {
                 Ok(Some(text)) => text,
                 Ok(None) => continue,
                 Err(e) => {
-                    notes.push(e);
+                    notes.push(Note::problem(e));
                     continue;
                 }
             };
@@ -162,19 +164,22 @@ impl CloudflaredProbe {
     }
 
     /// `config.yml`, when there is one.
-    fn config(&self, notes: &mut Vec<String>) -> Option<TunnelConfig> {
+    fn config(&self, notes: &mut Vec<Note>) -> Option<TunnelConfig> {
         let path = self.paths.cloudflared_config();
         match read_text(&path) {
             Ok(Some(text)) => match serde_yaml_ng::from_str::<TunnelConfig>(&text) {
                 Ok(config) => Some(config),
                 Err(e) => {
-                    notes.push(format!("{} is not valid YAML ({e})", path.display()));
+                    notes.push(Note::problem(format!(
+                        "{} is not valid YAML ({e})",
+                        path.display()
+                    )));
                     None
                 }
             },
             Ok(None) => None,
             Err(e) => {
-                notes.push(e);
+                notes.push(Note::problem(e));
                 None
             }
         }
@@ -191,10 +196,10 @@ impl Probe for CloudflaredProbe {
         let installed = self.paths.has_binary("cloudflared") || dir.is_dir();
         let mut status = ToolStatus::empty(Self::TOOL, installed);
         for note in self.paths.path_notes("cloudflared") {
-            status.note(note);
+            status.push_note(note);
         }
         for note in self.paths.path_notes("cloudflared_config") {
-            status.note(note);
+            status.push_note(note);
         }
 
         let mut notes = Vec::new();
@@ -202,7 +207,7 @@ impl Probe for CloudflaredProbe {
         let tunnels = self.tunnels(&mut notes);
         let config = self.config(&mut notes);
         for note in notes {
-            status.note(note);
+            status.push_note(note);
         }
 
         // The certificate in force. When `TUNNEL_ORIGIN_CERT` points outside
@@ -217,7 +222,7 @@ impl Probe for CloudflaredProbe {
 
         if certs.is_empty() && !active_cert.is_file() {
             if installed {
-                status.note(format!(
+                status.info(format!(
                     "no origin certificate in {}; run `cloudflared tunnel login`",
                     dir.display()
                 ));
@@ -251,8 +256,9 @@ impl Probe for CloudflaredProbe {
             status.profiles.push(
                 Profile::new(name)
                     .label(format!("origin certificate {name}"))
-                    // No expiry: an origin certificate records none on disk.
-                    .expires_at(None)
+                    // An origin certificate does not expire: it stays valid
+                    // until it is revoked in the Cloudflare dashboard.
+                    .expiry(Expiry::NoExpiry)
                     .with_meta("path", path.display().to_string())
                     .with_meta(
                         "modified",
@@ -270,13 +276,15 @@ impl Probe for CloudflaredProbe {
         if active_cert.is_file() {
             status.active = Some(active_name.clone());
         } else if explicit {
-            status.note(format!(
+            status.problem(format!(
                 "TUNNEL_ORIGIN_CERT points at {}, which does not exist; every cloudflared \
                  command will fail until it does",
                 active_cert.display()
             ));
         } else {
-            status.note(format!(
+            // Certificates are here but none of them is the one cloudflared
+            // reaches for by default, so a bare command fails.
+            status.problem(format!(
                 "no {} in {}; cloudflared needs `--origincert` or TUNNEL_ORIGIN_CERT to name \
                  one of the certificates that are there",
                 Self::DEFAULT_CERT,
@@ -291,7 +299,7 @@ impl Probe for CloudflaredProbe {
                 .map(|(n, _)| n.as_str())
                 .filter(|n| *n != active_name)
                 .collect();
-            status.note(format!(
+            status.warn(format!(
                 "{} origin certificates here, one per Cloudflare account: `{}` is in force and \
                  {} only applies when TUNNEL_ORIGIN_CERT or --origincert names it. cloudflared \
                  has no persistent account selection, so a command run without either operates \
@@ -307,7 +315,7 @@ impl Probe for CloudflaredProbe {
             ));
         }
         if explicit {
-            status.note(format!(
+            status.warn(format!(
                 "TUNNEL_ORIGIN_CERT is set, so this shell operates as `{active_name}` — other \
                  shells, launchd jobs and editors on this machine do not inherit it"
             ));
@@ -324,7 +332,7 @@ impl Probe for CloudflaredProbe {
             if config.credentials_file.is_some() {
                 parts.push("and names a credentials file".to_string());
             }
-            status.note(parts.join(" "));
+            status.info(parts.join(" "));
             for profile in &mut status.profiles {
                 profile.meta["config_tunnel"] = config
                     .tunnel
@@ -336,17 +344,13 @@ impl Probe for CloudflaredProbe {
         }
 
         if !tunnels.is_empty() {
-            status.note(format!(
+            status.info(format!(
                 "{} tunnel credential{} in this directory — per-tunnel run secrets, not logins; \
                  patchbay reads their ids and account tags and never their TunnelSecret",
                 tunnels.len(),
                 if tunnels.len() == 1 { "" } else { "s" }
             ));
         }
-        status.note(
-            "origin certificates record no expiry on disk, so patchbay cannot date them; one \
-             stays valid until it is revoked in the Cloudflare dashboard",
-        );
         Ok(status)
     }
 
@@ -444,6 +448,7 @@ impl Probe for CloudflaredProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::NoteKind;
     use std::fs;
     use std::path::PathBuf;
 
@@ -502,7 +507,9 @@ mod tests {
 
         let default = status.profiles.iter().find(|p| p.id == "cert.pem").unwrap();
         assert_eq!(default.meta["is_default"], true);
-        assert_eq!(default.expires_at, None);
+        // Revoked at the dashboard or not at all — never dated here.
+        assert_eq!(default.expiry, Expiry::NoExpiry);
+        assert_eq!(default.expires_at(), None);
         assert!(default.meta["modified"].is_string());
     }
 
@@ -516,11 +523,16 @@ mod tests {
         let warning = status
             .notes
             .iter()
-            .find(|n| n.contains("one per Cloudflare account"))
+            .find(|n| n.text.contains("one per Cloudflare account"))
             .unwrap_or_else(|| panic!("no multi-cert warning in {:?}", status.notes));
-        assert!(warning.contains("`cert.pem` is in force"), "{warning}");
-        assert!(warning.contains("cert-pathors.pem"), "{warning}");
-        assert!(warning.contains("TUNNEL_ORIGIN_CERT"), "{warning}");
+        // The whole point of this probe: a real risk, nothing broken yet.
+        assert_eq!(warning.kind, NoteKind::Warn);
+        assert!(
+            warning.text.contains("`cert.pem` is in force"),
+            "{warning:?}"
+        );
+        assert!(warning.text.contains("cert-pathors.pem"), "{warning:?}");
+        assert!(warning.text.contains("TUNNEL_ORIGIN_CERT"), "{warning:?}");
     }
 
     #[test]
@@ -534,10 +546,8 @@ mod tests {
 
         assert_eq!(status.active.as_deref(), Some("cert-pathors.pem"));
         assert!(
-            status
-                .notes
-                .iter()
-                .any(|n| n.contains("other shells, launchd jobs and editors")),
+            status.notes.iter().any(|n| n.kind == NoteKind::Warn
+                && n.text.contains("other shells, launchd jobs and editors")),
             "{:?}",
             status.notes
         );
@@ -569,8 +579,32 @@ mod tests {
         let status = CloudflaredProbe::new(paths).status().unwrap();
 
         assert_eq!(status.active, None);
+        // A dangling pointer breaks every command: the loudest kind.
         assert!(
-            status.notes.iter().any(|n| n.contains("does not exist")),
+            status
+                .notes
+                .iter()
+                .any(|n| n.kind == NoteKind::Problem && n.text.contains("does not exist")),
+            "{:?}",
+            status.notes
+        );
+    }
+
+    #[test]
+    fn test_certificates_without_the_default_one_are_a_problem() {
+        // cloudflared reaches for cert.pem and there is none, so a command run
+        // without --origincert fails even though certificates are right there.
+        let (_dir, home) = fixture();
+        write_cert(&home, "cert-pathors.pem");
+        let status = CloudflaredProbe::new(Paths::for_test(&home))
+            .status()
+            .unwrap();
+        assert_eq!(status.active, None);
+        assert!(
+            status
+                .notes
+                .iter()
+                .any(|n| n.kind == NoteKind::Problem && n.text.contains("no cert.pem in")),
             "{:?}",
             status.notes
         );
@@ -625,10 +659,8 @@ mod tests {
             assert_eq!(profile.meta["tunnel_names"].as_array().unwrap().len(), 4);
         }
         assert!(
-            status
-                .notes
-                .iter()
-                .any(|n| n.contains("per-tunnel run secrets, not logins")),
+            status.notes.iter().any(|n| n.kind == NoteKind::Info
+                && n.text.contains("per-tunnel run secrets, not logins")),
             "{:?}",
             status.notes
         );
@@ -671,10 +703,9 @@ mod tests {
         assert_eq!(status.profiles[0].meta["config_tunnel"], "prod-ingress");
         assert_eq!(status.profiles[0].meta["config_ingress_rules"], 2);
         assert!(
-            status
-                .notes
-                .iter()
-                .any(|n| n.contains("tunnel `prod-ingress`") && n.contains("2 ingress rule(s)")),
+            status.notes.iter().any(|n| n.kind == NoteKind::Info
+                && n.text.contains("tunnel `prod-ingress`")
+                && n.text.contains("2 ingress rule(s)")),
             "{:?}",
             status.notes
         );
@@ -690,7 +721,10 @@ mod tests {
         let paths = Paths::for_test(&home).with_env("TUNNEL_CONFIG", custom.to_str().unwrap());
         let status = CloudflaredProbe::new(paths).status().unwrap();
         assert_eq!(status.profiles[0].meta["config_tunnel"], "from-env");
-        assert!(status.notes.iter().any(|n| n.contains("TUNNEL_CONFIG")));
+        assert!(status
+            .notes
+            .iter()
+            .any(|n| n.text.contains("TUNNEL_CONFIG")));
     }
 
     #[test]
@@ -704,7 +738,10 @@ mod tests {
             .unwrap();
         assert_eq!(status.active.as_deref(), Some("cert.pem"));
         assert!(
-            status.notes.iter().any(|n| n.contains("not valid YAML")),
+            status
+                .notes
+                .iter()
+                .any(|n| n.kind == NoteKind::Problem && n.text.contains("not valid YAML")),
             "{:?}",
             status.notes
         );
@@ -739,7 +776,10 @@ mod tests {
         assert!(status.profiles.is_empty());
         assert_eq!(status.active, None);
         assert!(
-            status.notes.iter().any(|n| n.contains("tunnel login")),
+            status
+                .notes
+                .iter()
+                .any(|n| n.kind == NoteKind::Info && n.text.contains("tunnel login")),
             "{:?}",
             status.notes
         );

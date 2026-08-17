@@ -20,7 +20,7 @@
 //!   different thing entirely.
 //! * **`last_login` is not an expiry.** Fly tokens are macaroons that may carry
 //!   their own expiry *inside the token string*, and reading that would mean
-//!   reading the secret. So `expires_at` stays `None`.
+//!   reading the secret. So the expiry is `Unknown`, pointing at the token.
 //!
 //! The binary is installed as `flyctl` and almost always aliased to `fly`;
 //! both names are checked.
@@ -29,7 +29,9 @@ use serde::Deserialize;
 
 use crate::paths::Paths;
 use crate::probe::{unsupported_switch, unsupported_verify, Probe};
-use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
+use crate::types::{
+    ActiveConcept, Expiry, PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome,
+};
 use crate::util::{parse_timestamp, read_text};
 
 pub struct FlyctlProbe {
@@ -69,14 +71,14 @@ impl Probe for FlyctlProbe {
             self.paths.has_binary("flyctl") || self.paths.has_binary("fly") || path.is_file();
         let mut status = ToolStatus::empty(Self::TOOL, installed);
         for note in self.paths.path_notes("fly") {
-            status.note(note);
+            status.push_note(note);
         }
 
         let text = match read_text(&path) {
             Ok(Some(text)) => text,
             Ok(None) => return Ok(status),
             Err(e) => {
-                status.note(e);
+                status.problem(e);
                 return Ok(status);
             }
         };
@@ -84,20 +86,18 @@ impl Probe for FlyctlProbe {
         let config: Config = match serde_yaml_ng::from_str(&text) {
             Ok(config) => config,
             Err(e) => {
-                status.note(format!("fly config.yml is not valid YAML ({e})"));
+                status.problem(format!("fly config.yml is not valid YAML ({e})"));
                 return Ok(status);
             }
         };
 
         if self.paths.env("FLY_ACCESS_TOKEN").is_some() || self.paths.env("FLY_API_TOKEN").is_some()
         {
-            status.note(
-                "a Fly token is set in the environment and overrides the stored one".to_string(),
-            );
+            status.warn("a Fly token is set in the environment and overrides the stored one");
         }
 
         if config.access_token.is_none() {
-            status.note(format!(
+            status.info(format!(
                 "{} exists but holds no access_token; flyctl is not logged in",
                 path.display()
             ));
@@ -110,24 +110,25 @@ impl Probe for FlyctlProbe {
             Profile::new(Self::PROFILE_ID)
                 .label("fly.io login")
                 // Deliberately not last_login: see the module docs.
-                .expires_at(None)
+                .expiry(Expiry::unknown("inside the macaroon token"))
                 .with_meta("last_login", last_login.map(|at| at.to_rfc3339()))
                 .with_meta("has_metrics_token", config.metrics_token.is_some())
                 .with_meta("auto_update", config.auto_update)
                 .with_meta("source", path.display().to_string()),
         );
         status.active = Some(Self::PROFILE_ID.to_string());
+        status.active_concept = ActiveConcept::not_applicable(
+            "flyctl has one flat config with no profiles to choose between",
+        );
 
-        status.note(
-            "flyctl has one flat config with no profiles and no organisation: the org comes from \
-             --org or FLY_ORG at run time, not from disk"
-                .to_string(),
+        // Not the same claim as the one above: the org is a fact about what is
+        // *absent* from the file, and a reader who sees no org needs to know
+        // patchbay did not lose it.
+        status.info(
+            "no organisation is recorded on disk; the org comes from --org or FLY_ORG at run \
+             time",
         );
-        status.note(
-            "the token is a macaroon stored in plain text in config.yml; any expiry is encoded \
-             inside the token itself, which patchbay will not read"
-                .to_string(),
-        );
+        status.warn("the Fly token is a macaroon stored in plain text in config.yml");
 
         Ok(status)
     }
@@ -162,6 +163,7 @@ impl Probe for FlyctlProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::NoteKind;
     use std::fs;
     use std::path::PathBuf;
 
@@ -185,14 +187,35 @@ mod tests {
         let status = FlyctlProbe::new(Paths::for_test(&home)).status().unwrap();
         assert_eq!(status.active.as_deref(), Some("default"));
         let profile = &status.profiles[0];
-        assert!(profile.expires_at.is_none(), "last_login is not an expiry");
+        // last_login is not an expiry, and the real one is inside the macaroon.
+        assert_eq!(profile.expires_at(), None, "last_login is not an expiry");
+        assert_eq!(
+            profile.expiry,
+            Expiry::unknown("inside the macaroon token"),
+            "the reason has to name where the deadline actually lives"
+        );
         assert_eq!(
             profile.meta["last_login"],
             "2026-08-11T01:14:22.481773+00:00"
         );
         assert_eq!(profile.meta["has_metrics_token"], true);
         assert!(profile.meta.get("org").is_none());
-        assert!(status.notes.iter().any(|n| n.contains("no organisation")));
+        let org = status
+            .notes
+            .iter()
+            .find(|n| n.text.contains("no organisation"))
+            .expect("the absent org is still explained");
+        assert_eq!(org.kind, NoteKind::Info);
+        // A plaintext macaroon on disk is a warning.
+        let plaintext = status
+            .notes
+            .iter()
+            .find(|n| n.text.contains("plain text"))
+            .expect("the plaintext token is called out");
+        assert_eq!(plaintext.kind, NoteKind::Warn);
+        // "there is only one login" is a property now, not a note.
+        assert!(status.active_concept.is_not_applicable());
+        assert!(!status.notes.iter().any(|n| n.text.contains("no profiles")));
 
         let json = serde_json::to_string(&status).unwrap();
         assert!(!json.contains("fm2_fakefixturemacaroon"), "{json}");
@@ -204,7 +227,12 @@ mod tests {
         let (_dir, home) = fixture(CONFIG);
         let paths = Paths::for_test(&home).with_env("FLY_ACCESS_TOKEN", "fake-fixture-env");
         let status = FlyctlProbe::new(paths).status().unwrap();
-        assert!(status.notes.iter().any(|n| n.contains("environment")));
+        let note = status
+            .notes
+            .iter()
+            .find(|n| n.text.contains("environment"))
+            .expect("the env token is called out");
+        assert_eq!(note.kind, NoteKind::Warn);
         let json = serde_json::to_string(&status).unwrap();
         assert!(!json.contains("fake-fixture-env"), "{json}");
     }
@@ -219,7 +247,10 @@ mod tests {
             Paths::for_test(dir.path()).with_env("FLY_CONFIG_DIR", elsewhere.to_str().unwrap());
         let status = FlyctlProbe::new(paths).status().unwrap();
         assert_eq!(status.profiles.len(), 1);
-        assert!(status.notes.iter().any(|n| n.contains("$FLY_CONFIG_DIR=")));
+        assert!(status
+            .notes
+            .iter()
+            .any(|n| n.text.contains("$FLY_CONFIG_DIR=")));
     }
 
     #[test]
@@ -234,11 +265,23 @@ mod tests {
 
         let (_dir, home) = fixture("access_token: [unclosed\n");
         let status = FlyctlProbe::new(Paths::for_test(&home)).status().unwrap();
-        assert!(status.notes.iter().any(|n| n.contains("not valid YAML")));
+        let malformed = status
+            .notes
+            .iter()
+            .find(|n| n.text.contains("not valid YAML"))
+            .expect("the parse failure is reported");
+        assert_eq!(malformed.kind, NoteKind::Problem);
 
         let (_dir, home) = fixture("send_metrics: true\n");
         let status = FlyctlProbe::new(Paths::for_test(&home)).status().unwrap();
         assert!(status.profiles.is_empty());
-        assert!(status.notes.iter().any(|n| n.contains("not logged in")));
+        // Logged out is a state, not a fault: the board already says
+        // Disconnected, so the note stays quiet.
+        let logged_out = status
+            .notes
+            .iter()
+            .find(|n| n.text.contains("not logged in"))
+            .expect("the logged-out state is explained");
+        assert_eq!(logged_out.kind, NoteKind::Info);
     }
 }

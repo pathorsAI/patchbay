@@ -20,7 +20,9 @@ use serde::Deserialize;
 
 use crate::paths::Paths;
 use crate::probe::{unsupported_switch, unsupported_verify, Probe};
-use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
+use crate::types::{
+    ActiveConcept, Expiry, PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome,
+};
 use crate::util::read_text;
 
 pub struct DockerProbe {
@@ -90,14 +92,14 @@ impl Probe for DockerProbe {
         let installed = self.paths.has_binary("docker") || path.is_file();
         let mut status = ToolStatus::empty(Self::TOOL, installed);
         for note in self.paths.path_notes("docker") {
-            status.note(note);
+            status.push_note(note);
         }
 
         let text = match read_text(&path) {
             Ok(Some(text)) => text,
             Ok(None) => return Ok(status),
             Err(e) => {
-                status.note(e);
+                status.problem(e);
                 return Ok(status);
             }
         };
@@ -105,7 +107,7 @@ impl Probe for DockerProbe {
         let config: Config = match serde_json::from_str(&text) {
             Ok(config) => config,
             Err(e) => {
-                status.note(format!("docker config.json is not valid JSON ({e})"));
+                status.problem(format!("docker config.json is not valid JSON ({e})"));
                 return Ok(status);
             }
         };
@@ -122,6 +124,9 @@ impl Probe for DockerProbe {
                         "https://index.docker.io/v1/" => "Docker Hub".to_string(),
                         other => other.to_string(),
                     })
+                    // A registry login is a stored username/password or a
+                    // helper-held token; neither records a deadline.
+                    .expiry(Expiry::NoExpiry)
                     .with_meta("registry", registry.as_str())
                     .with_meta("credential_storage", storage)
                     .with_meta(
@@ -145,6 +150,7 @@ impl Probe for DockerProbe {
             status.profiles.push(
                 Profile::new(registry)
                     .label(format!("{registry} (via {helper})"))
+                    .expiry(Expiry::NoExpiry)
                     .with_meta("registry", registry.as_str())
                     .with_meta("credential_storage", "credential helper")
                     .with_meta("helper", helper.as_str()),
@@ -157,39 +163,34 @@ impl Probe for DockerProbe {
 
         // Deliberately left as None: see the module docs.
         status.active = None;
-        status.note(
-            "docker has no active registry: every logged-in registry is used concurrently, \
-             chosen by the image reference"
-                .to_string(),
+        status.active_concept = ActiveConcept::not_applicable(
+            "every logged-in registry is used at once, chosen by the image reference",
         );
         if !plaintext.is_empty() {
-            status.note(format!(
+            status.warn(format!(
                 "credentials for {} are base64 in config.json rather than in a credential \
                  helper — base64 is encoding, not encryption",
                 plaintext.join(", ")
             ));
         }
         if let Some(context) = &config.current_context {
-            status.note(format!(
+            status.info(format!(
                 "the active docker *context* (daemon endpoint) is `{context}`; that is a \
                  different thing from a registry login"
             ));
         }
-        status.note(
-            "registry logins do not record an expiry; a helper-backed token may still have been \
-             revoked server-side"
-                .to_string(),
-        );
+        // The "no expiry is recorded" half of this now lives in `Expiry::NoExpiry`.
+        // Revocation is a separate fact and nothing on this machine can see it.
+        status.info("a helper-backed registry token may still have been revoked server-side");
         if status
             .profiles
             .iter()
             .any(|p| p.meta.get("credential_storage") == Some(&"platform default helper".into()))
         {
-            status.note(
+            status.info(
                 "some entries name no credential store, so the secret is held by whichever helper \
                  the platform installs (docker-credential-osxkeychain on macOS) — or the entry is \
-                 a leftover from a logout"
-                    .to_string(),
+                 a leftover from a logout",
             );
         }
 
@@ -225,6 +226,7 @@ impl Probe for DockerProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::NoteKind;
     use std::fs;
     use std::path::PathBuf;
 
@@ -259,11 +261,21 @@ mod tests {
         assert_eq!(status.profiles[0].meta["helper"], "osxkeychain");
         assert_eq!(status.profiles[1].meta["helper"], "gcloud");
         assert!(status.active.is_none());
-        assert!(status
+        // The empty active slot is a property of docker, not a caveat to warn about.
+        assert_eq!(
+            status.active_concept,
+            ActiveConcept::not_applicable(
+                "every logged-in registry is used at once, chosen by the image reference"
+            )
+        );
+        assert!(!status
             .notes
             .iter()
-            .any(|n| n.contains("no active registry")));
-        assert!(status.profiles.iter().all(|p| p.expires_at.is_none()));
+            .any(|n| n.text.contains("no active registry")));
+        assert!(status
+            .profiles
+            .iter()
+            .all(|p| p.expiry == Expiry::NoExpiry && p.expires_at().is_none()));
     }
 
     #[test]
@@ -274,10 +286,11 @@ mod tests {
         let status = DockerProbe::new(Paths::for_test(&home)).status().unwrap();
         assert_eq!(status.profiles[0].meta["credential_storage"], "config.json");
         assert_eq!(status.profiles[0].meta["email"], "dev@example.com");
+        // A secret sitting in plain text is a risk, not a fact of life.
         assert!(status
             .notes
             .iter()
-            .any(|n| n.contains("base64 is encoding")));
+            .any(|n| n.kind == NoteKind::Warn && n.text.contains("base64 is encoding")));
         let json = serde_json::to_string(&status).unwrap();
         assert!(!json.contains("ZmFrZWZpeHR1cmU="), "{json}");
     }
@@ -287,7 +300,10 @@ mod tests {
         let (_dir, home) =
             fixture(r#"{ "auths": { "registry.example.com": {} }, "currentContext": "colima" }"#);
         let status = DockerProbe::new(Paths::for_test(&home)).status().unwrap();
-        assert!(status.notes.iter().any(|n| n.contains("`colima`")));
+        assert!(status
+            .notes
+            .iter()
+            .any(|n| n.kind == NoteKind::Info && n.text.contains("`colima`")));
     }
 
     #[test]
@@ -303,7 +319,10 @@ mod tests {
         let (_dir, home) = fixture("{ \"auths\": ");
         let status = DockerProbe::new(Paths::for_test(&home)).status().unwrap();
         assert!(status.installed);
-        assert!(status.notes.iter().any(|n| n.contains("not valid JSON")));
+        assert!(status
+            .notes
+            .iter()
+            .any(|n| n.kind == NoteKind::Problem && n.text.contains("not valid JSON")));
 
         // A config with no logins at all is a normal, quiet state.
         let (_dir, home) = fixture(r#"{ "features": { "buildkit": true } }"#);

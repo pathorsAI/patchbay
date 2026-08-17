@@ -563,7 +563,9 @@ button {
   display: block;
 }
 
-/* Count only — the note text itself belongs to the detail view. */
+/* Count only — the note text itself belongs to the detail view. Info notes are
+   deliberately not counted: a badge on a tool that is working as designed is
+   how the whole board came to read as a list of complaints. */
 .warn-badge {
   flex: none;
   margin-left: auto;
@@ -573,6 +575,10 @@ button {
   font-family: var(--mono);
   font-size: 10px;
   color: var(--warn);
+}
+
+.warn-badge.is-problem {
+  color: var(--risk);
 }
 
 /* chips */
@@ -614,6 +620,71 @@ button {
   color: var(--ink-2);
 }
 
+/* Curated notices — a rename, a removal, an end-of-life. Above the notes in
+   the drawer, because there is no point fixing a credential for a CLI that no
+   longer exists. Quiet by default; only a blocking advisory takes a colour. */
+.advisories {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.advisory {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  min-width: 0;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--muted);
+}
+
+.advisory-kind {
+  flex: none;
+  padding: 1px 5px;
+  border-radius: 3px;
+  background: var(--neutral-wash);
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  text-transform: lowercase;
+}
+
+.advisory-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.advisory.is-blocking {
+  color: var(--ink-2);
+}
+
+.advisory.is-blocking .advisory-kind {
+  background: var(--warn-wash);
+  color: var(--warn);
+}
+
+/* Something true and worth saying, with nothing wrong. Shares the banner's
+   geometry so the two read as one family, but never its risk colour — the
+   red banner is for failures, and a deliberate boundary is not one. */
+.notice {
+  display: flex;
+  gap: 8px;
+  padding: 9px 11px;
+  margin-bottom: 10px;
+  border: 1px solid var(--line-soft);
+  border-left: 2px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel-2);
+  color: var(--ink-2);
+  font-size: 11.5px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
 /* notes */
 
 .notes {
@@ -650,6 +721,39 @@ button {
   color: var(--warn);
   font-size: 10px;
   line-height: 1.55;
+}
+
+/* The triangle has to mean something. It used to sit on every note, so it
+   meant nothing: "docker has no active registry" wore the same alarm as
+   "credentials.db is unreadable". Now only the loud kinds draw in the gutter —
+   info keeps the space so the text still lines up, and draws nothing. */
+/* One fixed gutter for all three kinds, so a list that mixes them still has
+   one left edge. A triangle glyph measures ~7.8px and an empty span measures
+   0, which is how "keep the gutter" turned into a 2px stagger. */
+.glyph-info,
+.glyph-warn,
+.glyph-problem {
+  width: 10px;
+}
+
+.glyph-problem {
+  color: var(--risk);
+}
+
+.glyph-warn {
+  color: var(--warn);
+}
+
+.notes li.note-info {
+  color: var(--muted);
+}
+
+.notes li.note-warn > span:last-child {
+  color: var(--ink-2);
+}
+
+.notes li.note-problem > span:last-child {
+  color: var(--ink);
 }
 
 .switch-note {
@@ -1302,11 +1406,12 @@ dialog.detail {
   overflow-wrap: anywhere;
 }
 
-/* Notes are clamped on cards; in the detail view they are the point. */
+/* Notes are clamped hard on cards. The drawer is where they are read, so it
+   gets a looser clamp — but still a clamp: removing it entirely is what turned
+   the drawer into a wall of text. Six lines covers every note core ships, and
+   anything longer opens on click. */
 .notes-full li > span:last-child {
-  display: block;
-  -webkit-line-clamp: none;
-  overflow: visible;
+  -webkit-line-clamp: 6;
 }
 
 .field {
@@ -1839,5 +1944,40 @@ dialog.detail {
 .write-note {
   display: flex;
   gap: 6px;
+  color: var(--muted);
+}
+
+/* The version section of the detail drawer. Quiet by construction: this is
+   context about the tool, not a claim about your credential, so nothing here
+   takes a warning colour — an out-of-date tool is a fact, not a fault. */
+.dversion {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+
+.dversion-line {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.dversion-num {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink-2);
+}
+
+/* The newer one is the only thing here worth the eye's attention, and it earns
+   emphasis by weight rather than by colour. */
+.dversion-num.is-latest {
+  color: var(--ink);
+}
+
+.dversion-arrow {
+  font-size: 11px;
   color: var(--muted);
 }
