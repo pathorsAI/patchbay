@@ -1308,7 +1308,7 @@ mod tests {
 
     #[test]
     fn test_a_probe_with_no_scope_reader_reports_none_and_ignores_the_scope() {
-        // The 24 probes that never opted in: `permission_scopes` is empty, and
+        // The probes that never opted in: `permission_scopes` is empty, and
         // `permissions_in` is `permissions` with the argument thrown away, so
         // a scoped caller cannot get a different (or worse, a wrong) answer.
         let dir = tempfile::tempdir().unwrap();

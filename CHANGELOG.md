@@ -35,6 +35,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tier-1 read without executing anything; and `fly auth whoami` offers an
   interactive login unless `--json` is passed, so it is.
 
+- **kubectl, az and aws answer what a credential can do.** The scoped
+  permissions seam gcloud opened is now filled by three more probes, and
+  because the panel, `pb perms` and the MCP tools discover the capability from
+  the probe rather than from a list, all three arrive with a picker and a
+  reading and no wiring of their own.
+
+  `kubectl` asks per namespace: the picker merges the namespaces the kubeconfig
+  names with `kubectl get namespaces` when the cluster answers — the kubeconfig
+  half matters because where `~/.kube/config` is a directory of per-cluster
+  files, kubectl's own loader refuses it and patchbay's parse is the only thing
+  that still has the list. The reading is `kubectl auth can-i --list`, tried in
+  `-o json` and falling back to parsing the table for the versions that have no
+  such flag, rendered as `get,list,watch pods`. `az` asks per subscription, and
+  that list costs nothing: `azureProfile.json` already holds it, so unlike
+  gcloud's the picker needs no grant to populate. Roles come from `az role
+  assignment list --all --include-inherited`, and one granted on a single
+  resource group is labelled `Contributor on resourceGroups/web` rather than
+  being flattened into the subscription it is not held across.
+
+  `aws` has no picker, because an AWS credential's permissions are not asked
+  *about* anywhere — the identity is what it is. It resolves that identity
+  through `sts:GetCallerIdentity`, which needs no permission, then reads the
+  attached and inline policies. When that read is refused the report says so
+  exactly: the identity is known, and listing its policies needs
+  `iam:ListAttachedUserPolicies`, which is itself a permission most keys lack.
+  An empty list would have read as "this credential can do nothing", which is
+  the opposite of what is known. An SSO or assumed-role identity is named as
+  the role it is instead of being asked a user-policy question it cannot
+  answer.
+
+  Every failure on these paths comes back as one actionable sentence. That is
+  not cosmetic: a GKE context whose gcloud login has gone stale answers `auth
+  can-i` with twenty lines of klog headers, a nested `config-helper`
+  transcript, and gcloud's own four-line "Please run:" block, none of which is
+  the answer.
+
 ### Changed
 
 - **Notes carry a severity.** `ToolStatus.notes` was a `Vec<String>` — an
@@ -84,6 +120,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the default profile is in effect" (inverted — it now speaks up only when the
   variable *is* set), and the neon config-directory trivia the advisory already
   covers.
+
+
+- `infisical` still reports no permissions, but says why in one clause — its
+  CLI has no command that reports a member's role — instead of sending you off
+  to click around in a dashboard.
 
 ### Fixed
 
