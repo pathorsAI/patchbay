@@ -6,9 +6,12 @@
 
 use chrono::{DateTime, NaiveDate, NaiveTime, TimeZone, Utc};
 use patchbay_core::keys::NewKey;
+// `CopyReport` and `WriteReport` are not in core's prelude re-exports; the
+// module is public and they belong to the write layer this file wraps.
+use patchbay_core::mcp_clients::{CopyReport, WriteReport};
 use patchbay_core::{
     KeyEntry, KeyExpiryState, KeyRegistry, McpClient, McpClientRegistry, PermissionsReport,
-    Registry, SwitchOutcome, ToolStatus, VerifyOutcome,
+    Registry, ServerSpec, SwitchOutcome, ToolStatus, TransportSpec, VerifyOutcome,
 };
 
 /// Probe errors are surfaced to the panel as strings; the panel renders them,
@@ -223,6 +226,124 @@ async fn mcp_list() -> CmdResult<Vec<McpClient>> {
     off_thread(|| Ok(McpClientRegistry::detect()?.clients())).await
 }
 
+/// Serde mirror of [`TransportSpec`], tagged the same way the value-free
+/// [`patchbay_core::McpTransport`] on the matrix is, so the panel has one
+/// spelling of "how a client reaches a server" rather than two.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "transport", rename_all = "snake_case")]
+enum McpTransportWire {
+    Stdio { command: String, args: Vec<String> },
+    Http { url: String },
+    Sse { url: String },
+}
+
+/// Serde mirror of [`ServerSpec`]: the one shape crossing this boundary that
+/// carries MCP **values**.
+///
+/// That is deliberate and it is fenced. [`mcp_list`] — the call that fills the
+/// matrix, runs on load and refreshes after every write — stays value-free:
+/// names of env vars and headers, an argument *count*. Values are read only by
+/// [`mcp_read_spec`], for one named server of one named client, because the
+/// user opened its drawer, and they exist to be put back by [`mcp_add`]. An
+/// MCP entry's `env`, `headers` and stdio arguments are exactly where the API
+/// keys live, so nothing here may be logged and nothing may widen the list.
+///
+/// `env` and `headers` are ordered pairs rather than maps: file order is what
+/// the round-trip has to preserve, and JSON objects do not promise it.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct McpSpecWire {
+    #[serde(flatten)]
+    transport: McpTransportWire,
+    #[serde(default)]
+    env: Vec<(String, String)>,
+    #[serde(default)]
+    headers: Vec<(String, String)>,
+}
+
+impl From<ServerSpec> for McpSpecWire {
+    fn from(spec: ServerSpec) -> Self {
+        let transport = match spec.transport {
+            TransportSpec::Stdio { command, args } => McpTransportWire::Stdio { command, args },
+            TransportSpec::Http { url } => McpTransportWire::Http { url },
+            TransportSpec::Sse { url } => McpTransportWire::Sse { url },
+        };
+        Self {
+            transport,
+            env: spec.env,
+            headers: spec.headers,
+        }
+    }
+}
+
+impl From<McpSpecWire> for ServerSpec {
+    fn from(wire: McpSpecWire) -> Self {
+        let transport = match wire.transport {
+            McpTransportWire::Stdio { command, args } => TransportSpec::Stdio { command, args },
+            McpTransportWire::Http { url } => TransportSpec::Http { url },
+            McpTransportWire::Sse { url } => TransportSpec::Sse { url },
+        };
+        Self {
+            transport,
+            env: wire.env,
+            headers: wire.headers,
+        }
+    }
+}
+
+/// One server as one client has it written down, values included — what the
+/// edit form is prefilled from.
+///
+/// Fetched on demand, for the single server whose drawer was opened. Core reads
+/// the user scope only, so a Claude Code entry that lives under a project comes
+/// back as an error naming the file; the panel shows it verbatim.
+#[tauri::command]
+async fn mcp_read_spec(client: String, name: String) -> CmdResult<McpSpecWire> {
+    off_thread(move || {
+        let registry = McpClientRegistry::detect()?;
+        Ok(registry.read_spec(&client, &name)?.into())
+    })
+    .await
+}
+
+/// Register (or, with `overwrite`, replace) a server in one client's config.
+///
+/// Editing is spelled as an overwriting add on purpose: core has one write
+/// path, and it is the one with the rolling backup, the parse–modify–serialize
+/// round trip and the atomic rename. A second "update" entry point would be a
+/// second chance to lose someone's config.
+#[tauri::command]
+async fn mcp_add(
+    client: String,
+    name: String,
+    spec: McpSpecWire,
+    overwrite: bool,
+) -> CmdResult<WriteReport> {
+    off_thread(move || {
+        let registry = McpClientRegistry::detect()?;
+        registry.add_server(&client, name.trim(), &spec.into(), overwrite)
+    })
+    .await
+}
+
+/// Unregister a server from one client. It stops that client launching it; the
+/// server itself is untouched, and the backup named in the report is the undo.
+#[tauri::command]
+async fn mcp_remove(client: String, name: String) -> CmdResult<WriteReport> {
+    off_thread(move || McpClientRegistry::detect()?.remove_server(&client, &name)).await
+}
+
+/// Copy one server into other clients, translating formats on the way. Core
+/// validates every target before writing any of them.
+#[tauri::command]
+async fn mcp_copy(
+    name: String,
+    from: String,
+    to: Vec<String>,
+    overwrite: bool,
+) -> CmdResult<CopyReport> {
+    off_thread(move || McpClientRegistry::detect()?.copy_server(&name, &from, &to, overwrite)).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -260,8 +381,63 @@ pub fn run() {
             keys_list,
             key_add,
             key_remove,
-            mcp_list
+            mcp_list,
+            mcp_read_spec,
+            mcp_add,
+            mcp_remove,
+            mcp_copy
         ])
         .run(tauri::generate_context!())
         .expect("error while running patchbay");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The wire shape the panel's `McpSpec` is typed against. `#[serde(flatten)]`
+    /// over an internally tagged enum is the one thing here that could silently
+    /// change spelling under a serde bump, and it is the shape a save is built
+    /// from — a mismatch would look like "the drawer will not write".
+    #[test]
+    fn spec_round_trips_through_the_panel_shape() {
+        let json = serde_json::json!({
+            "transport": "stdio",
+            "command": "npx",
+            "args": ["-y", "@upstash/context7-mcp"],
+            "env": [["API_KEY", "s3cret"]],
+            "headers": [],
+        });
+        let wire: McpSpecWire = serde_json::from_value(json.clone()).expect("deserializes");
+        let spec: ServerSpec = wire.into();
+        assert_eq!(
+            spec.transport,
+            TransportSpec::Stdio {
+                command: "npx".into(),
+                args: vec!["-y".into(), "@upstash/context7-mcp".into()],
+            }
+        );
+        assert_eq!(
+            spec.env,
+            vec![("API_KEY".to_string(), "s3cret".to_string())]
+        );
+        assert_eq!(serde_json::to_value(McpSpecWire::from(spec)).unwrap(), json);
+    }
+
+    /// Remote transports keep their tag, so an SSE entry does not come back as
+    /// HTTP — the two are written differently by every client that has a `type`.
+    #[test]
+    fn sse_keeps_its_tag() {
+        let wire = McpSpecWire {
+            transport: McpTransportWire::Sse {
+                url: "https://mcp.example.com/sse".into(),
+            },
+            env: Vec::new(),
+            headers: vec![("Authorization".into(), "Bearer t".into())],
+        };
+        let text = serde_json::to_string(&wire).unwrap();
+        let back: ServerSpec = serde_json::from_str::<McpSpecWire>(&text).unwrap().into();
+        assert!(matches!(back.transport, TransportSpec::Sse { .. }));
+        assert_eq!(back.headers.len(), 1);
+    }
 }

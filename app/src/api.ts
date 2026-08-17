@@ -2,6 +2,9 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   KeyRow,
   McpClient,
+  McpCopyReport,
+  McpSpec,
+  McpWriteReport,
   NewKeyInput,
   PermissionsReport,
   RemovedKey,
@@ -45,4 +48,36 @@ export const keyAdd = (key: NewKeyInput, secret: string) =>
 /** Unregister a key: metadata row and keychain item both. Not a revocation. */
 export const keyRemove = (id: string) => invoke<RemovedKey>("key_remove", { id });
 
+/**
+ * The matrix. Value-free by construction: env var and header *names*, and a
+ * count of a stdio command's arguments. Nothing that comes back from here is a
+ * secret, which is why it can be held in view state and refreshed on a timer.
+ */
 export const mcpList = () => invoke<McpClient[]>("mcp_list");
+
+/**
+ * One server's full definition from one client's config, values included.
+ *
+ * The single read path in the panel that returns MCP secrets, and it is scoped
+ * to the one server whose drawer the user opened. Its answer belongs to that
+ * drawer's form state and nowhere else — never in the list state the matrix
+ * renders from, never in a log line.
+ */
+export const mcpReadSpec = (client: string, name: string) =>
+  invoke<McpSpec>("mcp_read_spec", { client, name });
+
+/**
+ * Write a server into one client's config. `overwrite` is the difference
+ * between adding and editing: core refuses a name that already exists without
+ * it, and an edit is a read-modify-write of the entry that is already there.
+ */
+export const mcpAdd = (client: string, name: string, spec: McpSpec, overwrite: boolean) =>
+  invoke<McpWriteReport>("mcp_add", { client, name, spec, overwrite });
+
+/** Unregister a server from one client. Not a deletion of the server itself. */
+export const mcpRemove = (client: string, name: string) =>
+  invoke<McpWriteReport>("mcp_remove", { client, name });
+
+/** Copy a server into other clients, translating JSON ↔ TOML on the way. */
+export const mcpCopy = (name: string, from: string, to: string[], overwrite: boolean) =>
+  invoke<McpCopyReport>("mcp_copy", { name, from, to, overwrite });
