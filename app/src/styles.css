@@ -1584,3 +1584,173 @@ dialog.detail {
   font-size: 10px;
   color: var(--muted);
 }
+
+/* ---------- MCP server drawer ---------- */
+
+/* A matrix row is a way into the server, the way a board card is a way into a
+   tool. The <tr> carries the click and the hover; the name cell holds a real
+   button so the keyboard gets the same door. */
+.row-open {
+  cursor: pointer;
+}
+
+.table tbody tr.row-open:hover,
+.table tbody tr.row-open:focus-within {
+  background: var(--panel-2);
+}
+
+.row-open-name {
+  padding: 0;
+  border: 0;
+  background: none;
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+
+.table tbody tr.row-open:hover .row-open-name {
+  color: var(--accent);
+}
+
+/* Which client's copy is on screen. A chip you can press, so it wears the
+   chip's shape rather than inventing a second one. */
+.chip-pick {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid transparent;
+  color: var(--ink-2);
+  cursor: pointer;
+  transition: border-color 90ms linear, color 90ms linear;
+}
+
+.chip-pick:hover {
+  color: var(--ink);
+  border-color: var(--accent);
+}
+
+.chip-pick.is-on {
+  background: var(--ok-wash);
+  color: var(--ok);
+  border-color: var(--ok);
+}
+
+/* A project-scope copy is shown, and shown as the thing patchbay will not
+   write — pressing it opens the explanation rather than a form. */
+.chip-pick.is-proj {
+  font-style: italic;
+}
+
+.chip-tag {
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+/* Three transports, one of them true: a row of buttons rather than a select,
+   because the choice changes which fields are below it and a select hides
+   that behind a press. */
+.segmented {
+  display: inline-flex;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  overflow: hidden;
+  align-self: flex-start;
+}
+
+.segment {
+  padding: 3px 12px;
+  border: 0;
+  border-right: 1px solid var(--line);
+  background: transparent;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  cursor: pointer;
+  transition: color 90ms linear, background 90ms linear;
+}
+
+.segment:last-child {
+  border-right: 0;
+}
+
+.segment:hover {
+  color: var(--ink);
+}
+
+.segment.is-on {
+  background: var(--panel-2);
+  color: var(--accent);
+}
+
+/* One env var, header or argument per row: name, value, and the button that
+   takes the row away. */
+.pair {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.pair .field-input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.pair-key {
+  flex: 0 1 38%;
+}
+
+/* The clients that do not have this server, and the one action that changes
+   that. */
+.copy-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.copy-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.copy-label {
+  flex: none;
+  width: 92px;
+  font-size: 11px;
+  color: var(--ink-2);
+}
+
+.copy-path {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The vault's confirm row, outside a table: same shape, same restraint. */
+.confirm-standalone {
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-2);
+}
+
+/* A caveat core attached to a write — the restart hint, a format limitation.
+   Indented under the report it belongs to. */
+.write-note {
+  display: flex;
+  gap: 6px;
+  color: var(--muted);
+}
