@@ -190,7 +190,9 @@ button {
    is content-driven even where its items may shrink, so one wide card row or
    one long unbroken path in a note sized this column past the window and took
    the whole document scrolling sideways with it. `overflow: hidden` then makes
-   the containment structural rather than a thing each child remembers. */
+   the containment structural rather than a thing each child remembers. The
+   board below carries the same rule one level in: it may scroll down, never
+   sideways. */
 .body {
   display: flex;
   min-width: 0;
@@ -198,11 +200,17 @@ button {
   overflow: hidden;
 }
 
+/* Down, never sideways. Reading a view is a vertical act; dragging the pane
+   right to reach the last column of a table would take the view's title, its
+   notes and its config paths along for the ride and leave nothing anchored.
+   So the one thing here that is genuinely wider than the pane — a table —
+   scrolls inside its own `.scroller`, and everything else wraps or clips. */
 .board {
   flex: 1 1 auto;
   min-width: 0;
   min-height: 0;
-  overflow: auto;
+  overflow-y: auto;
+  overflow-x: hidden;
   padding: 16px 18px 22px;
 }
 
@@ -404,6 +412,11 @@ button {
   margin: 24px 2px;
 }
 
+/* `overflow-wrap: anywhere` for the same reason `.notes li` has it, and now
+   load-bearing: an error string is whatever a CLI handed back, and one
+   unbroken token — a path, a key id — used to size this row past the pane and
+   scroll it. The pane no longer scrolls sideways, so an unbroken token would
+   simply be lost instead. Break it. */
 .banner {
   display: flex;
   gap: 8px;
@@ -414,6 +427,7 @@ button {
   background: var(--risk-wash);
   color: var(--ink);
   font-size: 12px;
+  overflow-wrap: anywhere;
 }
 
 /* A newer patchbay is news, not a fault: same row, accent instead of risk. */
@@ -1399,8 +1413,12 @@ dialog.detail {
   background: transparent;
 }
 
-/* Wide tables scroll inside their own frame; the pane never scrolls sideways. */
+/* Wide tables scroll inside their own frame; the pane never scrolls sideways.
+   `min-width: 0` because this is a flex item of `.view`: without it the box
+   would take its min-content width from the table and push past the pane
+   instead of scrolling, which is the whole thing it exists to prevent. */
 .scroller {
+  min-width: 0;
   overflow-x: auto;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -1445,8 +1463,14 @@ dialog.detail {
   min-width: 640px;
 }
 
+/* Same floor as the vault, and it is a floor rather than a target: the six
+   client headers alone need ~476px and "SERVER"/"TRANSPORT" another ~137, so
+   613px is the narrowest the matrix can be drawn at all. 640 leaves a little
+   slack without inventing width the table does not use — the old 760 padded it
+   past the 686px pane a 900px window gives, so the matrix scrolled sideways
+   even when it would have fitted. */
 .table-mcp {
-  min-width: 760px;
+  min-width: 640px;
 }
 
 .cell-id {
@@ -1480,6 +1504,18 @@ dialog.detail {
 .col-client,
 .cell-mark {
   text-align: center;
+}
+
+/* Six columns whose content is one glyph and whose width is set entirely by
+   the header label, so the side padding is space around nothing. Trimming it
+   to 7px buys 36px back across the row — enough that a typical matrix (666px)
+   fits the 686px pane a 900px window gives instead of scrolling. Qualified by
+   `.table` because `.table th`/`.table td` set the default padding and would
+   otherwise outrank a bare class. */
+.table th.col-client,
+.table td.cell-mark {
+  padding-left: 7px;
+  padding-right: 7px;
 }
 
 /* A client with no config file keeps its column: an empty column is the answer

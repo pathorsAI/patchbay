@@ -204,7 +204,10 @@ export default function App() {
           {view === "mcp" && <McpView />}
 
           {view === "board" && (
-            <>
+            /* Same wrapper the other two views use: one idiom for "a view",
+               and `min-width: 0` on it is what keeps a wide child scrolling
+               inside its own frame rather than pushing the pane. */
+            <div className="view">
               {error && (
                 <div className="banner">
                   <span className="glyph">△</span>
@@ -234,7 +237,7 @@ export default function App() {
                   ))}
                 </div>
               )}
-            </>
+            </div>
           )}
         </main>
       </div>
