@@ -235,7 +235,54 @@ export interface ToolStatus {
    * warm.
    */
   advisories: Advisory[];
+  /**
+   * Installed version, latest version and how to update. `null` on a cold
+   * cache — `check_updates` fills it. Dropped by the panel until 0.4.0 for the
+   * same reason advisories were: the field was simply never declared here.
+   */
+  version: VersionInfo | null;
   connection_state: ConnectionState;
+}
+
+/**
+ * `latest: null` is always "patchbay did not find out", never "you are up to
+ * date" — `note` says which of the two it was. Same rule as core's doc comment;
+ * the UI must not turn an unknown into a reassurance.
+ */
+export interface VersionInfo {
+  tool: string;
+  installed: string | null;
+  latest: string | null;
+  source: string;
+  update_command: string | null;
+  checked_at: string;
+  note: string | null;
+}
+
+/** True only when both versions are known and they differ. */
+export function updateAvailable(v: VersionInfo): boolean {
+  return v.installed !== null && v.latest !== null && v.installed !== v.latest;
+}
+
+/**
+ * The short names `Source::label()` uses in core, mirrored so the panel and
+ * `pb` call an install source the same thing. An unlisted value renders as it
+ * arrived rather than being hidden — a new source in core should look odd here,
+ * not vanish.
+ */
+const SOURCE_LABEL: Record<string, string> = {
+  homebrew: "brew",
+  npm: "npm",
+  bun: "bun",
+  pnpm: "pnpm",
+  github: "github",
+  self_managed: "self-managed",
+  system: "system",
+  unknown: "unknown",
+};
+
+export function sourceLabel(source: string): string {
+  return SOURCE_LABEL[source] ?? source;
 }
 
 /** A full vault row: `patchbay_core::KeyEntry` plus the panel's derived state. */

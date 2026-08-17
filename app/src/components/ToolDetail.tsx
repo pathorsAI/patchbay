@@ -6,12 +6,15 @@ import {
   isBlockingAdvisory,
   KEY_EXPIRY_LABEL,
   KEY_EXPIRY_LEVEL,
+  sourceLabel,
+  updateAvailable,
   type Advisory,
   type Note,
   type PermissionScope,
   type PermissionsReport,
   type Profile,
   type ToolStatus,
+  type VersionInfo,
 } from "../types";
 import { Copyable } from "./Copyable";
 import { ToolLogo } from "./ToolLogo";
@@ -151,6 +154,13 @@ export function ToolDetail({
           </section>
         )}
 
+        {status.version && (
+          <section className="section">
+            <span className="field-key">version</span>
+            <VersionRow version={status.version} />
+          </section>
+        )}
+
         {status.notes.length > 0 && (
           <section className="section">
             <span className="field-key">notes</span>
@@ -236,6 +246,43 @@ function AdvisoryList({ advisories }: Readonly<{ advisories: readonly Advisory[]
         </li>
       ))}
     </ul>
+  );
+}
+
+/**
+ * What is installed, and whether something newer exists.
+ *
+ * The board deliberately shows a version only when it is behind — 23 rows of
+ * version numbers drown the one that matters. A drawer holds one tool, so the
+ * installed version is context rather than noise and is always shown.
+ *
+ * `latest: null` is not "up to date": the update line only appears when both
+ * versions are known and differ, and `note` explains an absence in the same
+ * quiet register as the rest of the section. The update command is offered as
+ * a copyable rather than a button because upgrading is a mutation of the
+ * machine, not a read patchbay should make on its own.
+ */
+function VersionRow({ version }: Readonly<{ version: VersionInfo }>) {
+  const behind = updateAvailable(version);
+  return (
+    <div className="dversion">
+      <span className="dversion-line">
+        <span className="dversion-num">{version.installed ?? "not installed"}</span>
+        {behind && (
+          <>
+            <span className="dversion-arrow">→</span>
+            <span className="dversion-num is-latest">{version.latest}</span>
+          </>
+        )}
+        {/* An unknown source says nothing about where the tool came from, so
+            it earns no chip — the note below already explains the gap. */}
+        {version.source !== "unknown" && (
+          <span className="chip chip-scope">{sourceLabel(version.source)}</span>
+        )}
+      </span>
+      {version.note && <span className="muted small">{version.note}</span>}
+      {behind && version.update_command && <Copyable text={version.update_command} />}
+    </div>
   );
 }
 
