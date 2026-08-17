@@ -119,7 +119,7 @@ table →](docs/migration.md)**
 { "mcpServers": { "patchbay": { "command": "/usr/local/bin/patchbay-mcp" } } }
 ```
 
-Your agent gets `list_connections`, `switch_profile`, `verify`, `get_permissions`, `store_key`, `plan_setup`, and friends — "switch to the work gcloud account and deploy" becomes one sentence, and a key your AI creates mid-task gets registered instead of rotting in a chat log. Reading secret values back is **off by default** (`PATCHBAY_ALLOW_SECRET_READ=1` to opt in).
+Your agent gets `list_connections`, `switch_profile`, `verify`, `get_permissions`, `store_key`, `plan_setup`, and friends — "switch to the work gcloud account and deploy" becomes one sentence, and a key your AI creates mid-task gets registered instead of rotting in a chat log. Where permissions are granted per resource rather than per credential, `get_permissions` takes a `scope` and `list_permission_scopes` says what the choices are — a Google account has no roles of its own, only roles on a project, so patchbay reads the IAM policy of the one you name. Reading secret values back is **off by default** (`PATCHBAY_ALLOW_SECRET_READ=1` to opt in).
 
 ## Showcase
 

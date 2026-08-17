@@ -298,6 +298,19 @@ export type VerifyOutcome =
   | { result: "invalid"; tool: string; detail: string }
   | { result: "unsupported"; tool: string; reason: string; hint: string | null };
 
+/**
+ * One thing a tool's permissions can be read *against*. Some tools grant per
+ * resource rather than per credential — a Google account's IAM roles live on a
+ * project — so the question needs a scope before it has an answer.
+ */
+export interface PermissionScope {
+  /** What `permissionsIn` takes, e.g. a GCP project id. */
+  id: string;
+  label: string;
+  /** The scope the tool is already configured for; the picker opens on it. */
+  active: boolean;
+}
+
 export interface PermissionsReport {
   tool: string;
   supported: boolean;
@@ -305,11 +318,6 @@ export interface PermissionsReport {
   scopes: string[];
   notes: string[];
   hint: string | null;
+  /** Which scope this report is about. Absent for tools that have none. */
+  scope?: string;
 }
-
-/**
- * Tools whose `permissions()` can actually answer. Everything else returns
- * `supported: false`, so the panel omits the action rather than offering a
- * button that only ever says "not implemented".
- */
-export const PERMISSIONS_TOOLS = new Set(["gh", "wrangler"]);

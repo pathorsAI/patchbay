@@ -194,6 +194,7 @@ impl Probe for NeonProbe {
                     .to_string(),
             ],
             hint: Some("neon auth".to_string()),
+            scope: None,
         })
     }
 }

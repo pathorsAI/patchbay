@@ -1,10 +1,24 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getVersion } from "@tauri-apps/api/app";
-import { permissions as fetchPerms, statusAll, switchProfile, verifyProfile } from "./api";
+import {
+  permissions as fetchPerms,
+  permissionScopes,
+  permissionsIn,
+  statusAll,
+  switchProfile,
+  verifyProfile,
+} from "./api";
 import { clockTime, summarize, summaryLine } from "./expiry";
 import { apply, isFiltered, NO_FILTERS, type Filters } from "./filters";
 import { rowKey, switchMessage, type Panel, type SwitchNote, type View } from "./panel";
-import { categoryLabel, STATE_LABEL, type PermissionsReport, type ToolStatus, type VerifyOutcome } from "./types";
+import {
+  categoryLabel,
+  STATE_LABEL,
+  type PermissionScope,
+  type PermissionsReport,
+  type ToolStatus,
+  type VerifyOutcome,
+} from "./types";
 import { KeysView } from "./components/KeysView";
 import { McpView } from "./components/McpView";
 import { Sidebar } from "./components/Sidebar";
@@ -29,10 +43,13 @@ export default function App() {
   const [detail, setDetail] = useState<{ tool: string; permissions: boolean } | null>(null);
   const [verdicts, setVerdicts] = useState<Record<string, VerifyOutcome | null>>({});
   const [perms, setPerms] = useState<Record<string, PermissionsReport | null>>({});
+  const [permScopes, setPermScopes] = useState<Record<string, PermissionScope[] | null>>({});
   const [switching, setSwitching] = useState<string | null>(null);
   const [switchNotes, setSwitchNotes] = useState<Record<string, SwitchNote>>({});
 
   const searchRef = useRef<HTMLInputElement>(null);
+  /** Tools whose scope list has been asked for. See `loadPerms`. */
+  const scopesAsked = useRef<Set<string>>(new Set());
 
   const refresh = useCallback(async () => {
     setRefreshing(true);
@@ -100,9 +117,10 @@ export default function App() {
             setVerdicts((v) => ({ ...v, [key]: { result: "invalid", tool, detail: String(e) } })),
           );
       },
-      loadPerms(tool: string) {
+      loadPerms(tool: string, scope?: string) {
         setPerms((p) => ({ ...p, [tool]: null }));
-        fetchPerms(tool)
+        const read = scope === undefined ? fetchPerms(tool) : permissionsIn(tool, scope);
+        read
           .then((report) => setPerms((p) => ({ ...p, [tool]: report })))
           .catch((e) =>
             setPerms((p) => ({
@@ -114,9 +132,24 @@ export default function App() {
                 scopes: [],
                 notes: [String(e)],
                 hint: null,
+                scope,
               },
             })),
           );
+
+        // The scope list rides along with the first read, not with the render:
+        // it execs the tool's CLI too, and the click that asked for
+        // permissions is the consent for both. Once per tool — the guard is a
+        // ref rather than the state it fills, because a re-read arrives before
+        // the first answer does. A failure parks `[]`, which reads as "no
+        // picker" rather than retrying forever.
+        if (!scopesAsked.current.has(tool)) {
+          scopesAsked.current.add(tool);
+          setPermScopes((s) => ({ ...s, [tool]: null }));
+          permissionScopes(tool)
+            .then((list) => setPermScopes((s) => ({ ...s, [tool]: list })))
+            .catch(() => setPermScopes((s) => ({ ...s, [tool]: [] })));
+        }
       },
       switchTo(tool: string, profileId: string) {
         setSwitching(rowKey(tool, profileId));
@@ -140,7 +173,7 @@ export default function App() {
     [],
   );
 
-  const panel: Panel = { now, verdicts, perms, switching, switchNotes, ...actions };
+  const panel: Panel = { now, verdicts, perms, permScopes, switching, switchNotes, ...actions };
 
   const all = statuses ?? [];
   const shown = useMemo(() => apply(all, filters), [all, filters]);

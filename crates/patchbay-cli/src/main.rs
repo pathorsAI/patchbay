@@ -14,8 +14,8 @@ use anyhow::Result;
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use patchbay_core::{
-    Advisory, CheckOptions, KeyRegistry, McpClientRegistry, PermissionsReport, Registry,
-    SwitchOutcome, VerifyOutcome,
+    Advisory, CheckOptions, KeyRegistry, McpClientRegistry, PermissionScope, PermissionsReport,
+    Registry, SwitchOutcome, VerifyOutcome,
 };
 
 use render::Styles;
@@ -67,8 +67,22 @@ enum Command {
         json: bool,
     },
     /// Show what the active credential of a tool is allowed to do.
+    ///
+    /// Some tools grant per resource rather than per credential — a Google
+    /// account's IAM roles exist on a project, not on the account — so their
+    /// permissions are read against a scope. `--list-scopes` shows the ones
+    /// this login can see; `--scope` reads one of them. Tools that answer once
+    /// for the whole credential list no scopes and ignore the flag.
     Perms {
         tool: String,
+        /// Read permissions within this scope (e.g. a GCP project id) instead
+        /// of whatever the tool treats as the default.
+        #[arg(long, value_name = "ID", conflicts_with = "list_scopes")]
+        scope: Option<String>,
+        /// List the scopes this tool's permissions can be read against, and
+        /// stop.
+        #[arg(long)]
+        list_scopes: bool,
         #[arg(long)]
         json: bool,
     },
@@ -206,8 +220,22 @@ fn run() -> Result<i32> {
                 _ => 0,
             })
         }
-        Command::Perms { tool, json } => {
-            let report = registry.permissions(&tool)?;
+        Command::Perms {
+            tool,
+            scope,
+            list_scopes,
+            json,
+        } => {
+            if list_scopes {
+                let scopes = registry.permission_scopes(&tool)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&scopes)?);
+                } else {
+                    print_scopes(&tool, &scopes);
+                }
+                return Ok(0);
+            }
+            let report = registry.permissions_in(&tool, scope.as_deref())?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -384,6 +412,25 @@ fn print_verify(outcome: &VerifyOutcome) {
     }
 }
 
+/// The scopes a tool's permissions can be read against, with the one its
+/// current configuration points at marked — that is the id `pb perms` uses
+/// when none is given.
+fn print_scopes(tool: &str, scopes: &[PermissionScope]) {
+    if scopes.is_empty() {
+        println!("{tool}: permissions are not read per scope for this tool");
+        return;
+    }
+    println!("{tool}: {} scope(s)", scopes.len());
+    for scope in scopes {
+        let marker = if scope.active { "*" } else { " " };
+        if scope.label == scope.id {
+            println!("  {marker} {}", scope.id);
+        } else {
+            println!("  {marker} {}  {}", scope.id, scope.label);
+        }
+    }
+}
+
 fn print_perms(report: &PermissionsReport) {
     let PermissionsReport {
         tool,
@@ -392,12 +439,20 @@ fn print_perms(report: &PermissionsReport) {
         scopes,
         notes,
         hint,
+        scope,
     } = report;
+
+    // The scope is part of the answer, not decoration: "viewer" is a different
+    // fact about `proj-a` than about `proj-b`.
+    let where_ = match scope {
+        Some(scope) => format!(" in {scope}"),
+        None => String::new(),
+    };
 
     if *supported {
         match subject {
-            Some(subject) => println!("{tool}: {subject}"),
-            None => println!("{tool}:"),
+            Some(subject) => println!("{tool}: {subject}{where_}"),
+            None => println!("{tool}:{where_}"),
         }
         if scopes.is_empty() {
             println!("  (no scopes reported)");
@@ -406,7 +461,7 @@ fn print_perms(report: &PermissionsReport) {
             println!("{}", render::render_scopes(scopes));
         }
     } else {
-        println!("{tool}: permissions not available");
+        println!("{tool}: permissions not available{where_}");
     }
 
     if !notes.is_empty() {

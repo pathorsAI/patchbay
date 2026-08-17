@@ -11,7 +11,9 @@ use crate::keystore::SecurityCliKeystore;
 use crate::paths::Paths;
 use crate::probe::Probe;
 use crate::probes;
-use crate::types::{KeyRef, PermissionsReport, SwitchOutcome, ToolStatus, VerifyOutcome};
+use crate::types::{
+    KeyRef, PermissionScope, PermissionsReport, SwitchOutcome, ToolStatus, VerifyOutcome,
+};
 use crate::versions::{self, CheckOptions, CheckReport, VersionCache};
 
 pub struct Registry {
@@ -271,6 +273,26 @@ impl Registry {
 
     pub fn permissions(&self, tool: &str) -> anyhow::Result<PermissionsReport> {
         self.require(tool)?.permissions()
+    }
+
+    /// The scopes this tool's permissions can be read against. Empty for tools
+    /// whose credential carries one answer everywhere.
+    pub fn permission_scopes(&self, tool: &str) -> anyhow::Result<Vec<PermissionScope>> {
+        self.require(tool)?.permission_scopes()
+    }
+
+    /// Permissions within one scope. `None` reads whatever the tool treats as
+    /// the default — the same shape as [`Registry::verify_profile`].
+    pub fn permissions_in(
+        &self,
+        tool: &str,
+        scope_id: Option<&str>,
+    ) -> anyhow::Result<PermissionsReport> {
+        let probe = self.require(tool)?;
+        match scope_id {
+            Some(id) => probe.permissions_in(id),
+            None => probe.permissions(),
+        }
     }
 }
 

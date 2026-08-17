@@ -358,6 +358,24 @@ pub enum VerifyOutcome {
     },
 }
 
+/// One thing a tool's permissions can be read *against*.
+///
+/// Some tools have a single answer to "what may this credential do" — a gh
+/// token carries its scopes wherever it goes. Others do not: a Google account's
+/// IAM roles exist per project, so "what may I do" is only a question once a
+/// project is named. This is that name, resolved by the probe rather than typed
+/// by the human.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PermissionScope {
+    /// What [`crate::Probe::permissions_in`] takes, e.g. a GCP project id.
+    pub id: String,
+    /// How to show it — a display name where the tool has one, else the id.
+    pub label: String,
+    /// The scope the tool's current configuration already points at, so the
+    /// picker can open on the answer the user most likely wants.
+    pub active: bool,
+}
+
 /// What the active credential of a tool is allowed to do.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PermissionsReport {
@@ -372,6 +390,12 @@ pub struct PermissionsReport {
     pub notes: Vec<String>,
     /// How to change what is granted.
     pub hint: Option<String>,
+    /// Which [`PermissionScope`] this report is about, when the tool has any.
+    /// `None` means the tool answers once for the whole credential — the
+    /// field is omitted from JSON entirely in that case, so consumers written
+    /// against the unscoped shape keep parsing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
 }
 
 impl PermissionsReport {
@@ -383,6 +407,7 @@ impl PermissionsReport {
             scopes: Vec::new(),
             notes: vec![reason.to_string()],
             hint: hint.map(|h| h.to_string()),
+            scope: None,
         }
     }
 }

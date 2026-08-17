@@ -35,6 +35,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for one named server of one named client, because you opened its drawer —
   and a copy still reports which values travelled between files by name.
 
+- **gcloud permissions are read, not described.** `permissions` for gcloud used
+  to answer "IAM roles are per-project and per-resource; patchbay does not
+  resolve them yet" and hand back a `gcloud projects get-iam-policy` line to
+  paste — a bare command where an action would have worked, which is the one
+  thing CONTRIBUTING says the panel does not do. It now runs the read itself
+  and reports the account's roles on the project.
+
+  That needed a shape the report did not have, because IAM grants live on the
+  resource: a Google account has no roles of its own, only roles *on a
+  project*. So permissions became optionally scoped, following `verify_profile`
+  exactly. `Probe` gains `permission_scopes()` and `permissions_in(scope)`,
+  both defaulted, so the other 24 probes are untouched and gh and wrangler
+  behave as before; `PermissionsReport` gains `scope`, omitted from JSON when
+  there is none. The panel shows a searchable project picker (type to filter,
+  arrows and enter to choose, the configured project preselected) that appears
+  only once the backend says the tool has scopes — listing them execs gcloud,
+  so nothing runs until you press the button. `pb perms` gains `--scope` and
+  `--list-scopes`; the MCP `get_permissions` gains an optional `scope`, beside
+  a new `list_permission_scopes` tool.
+
+  Two things that stayed deliberate. The unscoped read resolves the active
+  configuration's `core/project` and reads *that*, the same move `verify` makes
+  with the active profile, rather than answering a question it could work out
+  for itself. And the copyable line survives in exactly one place — when there
+  is no gcloud on `PATH` to run, so patchbay genuinely cannot answer.
+
+- The frontend's hardcoded `PERMISSIONS_TOOLS` set is gone. Which tools can
+  report permissions is the backend's fact, answered by `supported`, not a list
+  in the UI that goes stale the moment a probe learns a new trick.
+
 ### Fixed
 
 - **The main pane no longer scrolls sideways.** 0.3.3 stopped the *window*
@@ -52,6 +82,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   10px of side padding around nothing; at 7px, and with the floor at 640px —
   the same as the vault's, and above the ~613px the headers themselves need —
   a typical matrix comes to 666px and fits the smallest window with room over.
+
 
 ## [0.3.3] - 2026-08-14
 

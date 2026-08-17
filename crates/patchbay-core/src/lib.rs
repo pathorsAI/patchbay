@@ -70,7 +70,7 @@ pub use paths::Paths;
 pub use probe::Probe;
 pub use registry::Registry;
 pub use types::{
-    ConnectionState, KeyRef, PermissionsReport, Profile, SwitchOutcome, ToolCategory, ToolStatus,
-    VerifyOutcome,
+    ConnectionState, KeyRef, PermissionScope, PermissionsReport, Profile, SwitchOutcome,
+    ToolCategory, ToolStatus, VerifyOutcome,
 };
 pub use versions::{CheckOptions, CheckReport, Source, VersionCache, VersionInfo};

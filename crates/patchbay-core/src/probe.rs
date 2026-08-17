@@ -1,6 +1,6 @@
 //! The per-tool adapter contract.
 
-use crate::types::{PermissionsReport, SwitchOutcome, ToolStatus, VerifyOutcome};
+use crate::types::{PermissionScope, PermissionsReport, SwitchOutcome, ToolStatus, VerifyOutcome};
 
 /// One developer CLI's auth state, as patchbay sees it.
 ///
@@ -9,9 +9,10 @@ use crate::types::{PermissionsReport, SwitchOutcome, ToolStatus, VerifyOutcome};
 /// * **tier 1** — [`Probe::status`]. Reads local state files only. No process
 ///   spawning, no network. Must stay in the low-milliseconds so the whole board
 ///   can be rendered on every prompt.
-/// * **tier 2** — [`Probe::verify`] and [`Probe::permissions`]. May execute the
-///   tool's own CLI, which may in turn hit the network. Seconds, not
-///   milliseconds. Only run when explicitly asked.
+/// * **tier 2** — [`Probe::verify`], [`Probe::permissions`] and the scoped
+///   variants beside them. May execute the tool's own CLI, which may in turn
+///   hit the network. Seconds, not milliseconds. Only run when explicitly
+///   asked.
 ///
 /// [`Probe::switch`] mutates state and may exec the tool's CLI.
 ///
@@ -52,6 +53,34 @@ pub trait Probe: Send + Sync {
 
     /// Tier 2: report what the active credential is allowed to do.
     fn permissions(&self) -> anyhow::Result<PermissionsReport>;
+
+    /// Tier 2: the scopes this tool's permissions can be read against.
+    ///
+    /// Empty — the default — means "one credential, one answer": ask
+    /// [`Probe::permissions`] and be done. A non-empty list means the question
+    /// is only well-formed once a scope is named, because the grants live on
+    /// the resource rather than on the credential (GCP IAM is the type case:
+    /// roles are per project, and the same account can be owner of one and a
+    /// stranger to the next).
+    ///
+    /// This is tier 2 like its neighbours — enumerating scopes may execute the
+    /// tool's CLI — so callers must treat it as a click, not a page load.
+    fn permission_scopes(&self) -> anyhow::Result<Vec<PermissionScope>> {
+        Ok(Vec::new())
+    }
+
+    /// Tier 2: report the credential's permissions within one scope.
+    ///
+    /// The default ignores `scope_id` and delegates to [`Probe::permissions`],
+    /// which is right for every tool that reports no scopes: there is nothing
+    /// to narrow.
+    ///
+    /// Implementors: resolve it yourself. Same rule as
+    /// [`Probe::verify_profile`] — if a CLI has to be invoked, patchbay
+    /// invokes it.
+    fn permissions_in(&self, _scope_id: &str) -> anyhow::Result<PermissionsReport> {
+        self.permissions()
+    }
 }
 
 /// Helper for probes with no switch path.

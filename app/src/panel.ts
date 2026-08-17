@@ -1,4 +1,10 @@
-import type { Meta, PermissionsReport, SwitchOutcome, VerifyOutcome } from "./types";
+import type {
+  Meta,
+  PermissionScope,
+  PermissionsReport,
+  SwitchOutcome,
+  VerifyOutcome,
+} from "./types";
 
 /**
  * What the main pane is showing. The board is the app; the other two are
@@ -34,11 +40,26 @@ export interface Panel {
    */
   verdicts: Record<string, VerifyOutcome | null>;
   perms: Record<string, PermissionsReport | null>;
+  /**
+   * Keyed by tool: the scopes its permissions can be read against, once
+   * somebody has asked. `null` = in flight, `undefined` = never asked, `[]` =
+   * asked and this tool has none (the ordinary case — most credentials carry
+   * the same permissions everywhere).
+   *
+   * Never populated on render: listing scopes execs the tool's CLI, so it
+   * waits for the same click that reads the permissions.
+   */
+  permScopes: Record<string, PermissionScope[] | null>;
   /** `rowKey` of the switch in flight. */
   switching: string | null;
   switchNotes: Record<string, SwitchNote>;
   verifyRow(tool: string, profileId: string): void;
-  loadPerms(tool: string): void;
+  /**
+   * Read permissions. With `scope`, reads that one and files the answer under
+   * the tool; without, reads the tool's default and asks — once — whether this
+   * tool has scopes at all, so the picker can appear beside the result.
+   */
+  loadPerms(tool: string, scope?: string): void;
   switchTo(tool: string, profileId: string): void;
   open(tool: string, opts?: { permissions?: boolean }): void;
 }

@@ -1,11 +1,11 @@
-import { useEffect } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { countdown, levelOf } from "../expiry";
 import { profileMatches } from "../filters";
 import { metaEntries, rowKey, verdictText, type Panel, type SwitchNote } from "../panel";
 import {
   KEY_EXPIRY_LABEL,
   KEY_EXPIRY_LEVEL,
-  PERMISSIONS_TOOLS,
+  type PermissionScope,
   type PermissionsReport,
   type Profile,
   type ToolStatus,
@@ -202,8 +202,13 @@ function SwitchNoteBlock({ note }: Readonly<{ note: SwitchNote }>) {
 
 /**
  * States what it knows, then offers the action that gets more. The button is
- * always here: even where patchbay has no scope reader, asking and reporting
- * the answer beats a sentence that just says no and gives you nothing to press.
+ * always here, for every tool: whether patchbay can answer is the backend's
+ * fact to report, not a list kept in the frontend that goes stale the moment a
+ * probe learns a new trick. A tool with no reader comes back `supported:
+ * false` and its notes say why — which is more than a hidden button ever did.
+ *
+ * Where a tool grants per resource rather than per credential, the read is
+ * only half the surface: the other half is choosing *what* to read against.
  */
 function PermissionsSection({
   tool,
@@ -211,11 +216,16 @@ function PermissionsSection({
   panel,
 }: Readonly<{ tool: string; report: PermissionsReport | null | undefined; panel: Panel }>) {
   const loading = report === null;
-  const hasScopeReader = PERMISSIONS_TOOLS.has(tool);
+  const scopes = panel.permScopes[tool];
+  const [picked, setPicked] = useState<string | null>(null);
 
-  // "re-read" only where something was read. A tool patchbay has no scope
-  // reader for answers "not supported", and offering to re-read that implies a
-  // second press could say something different.
+  // The scope in the box: what you chose, else the one this tool is already
+  // configured for, else the first. Never nothing while there is a list.
+  const chosen =
+    picked ?? scopes?.find((s) => s.active)?.id ?? (scopes?.length ? scopes[0].id : null);
+
+  // "re-read" only where something was read. A tool patchbay cannot answer for
+  // says so, and offering to re-read that implies a second press could differ.
   let readLabel: string;
   if (loading) readLabel = "reading…";
   else if (report?.supported) readLabel = "re-read scopes";
@@ -235,13 +245,32 @@ function PermissionsSection({
           {readLabel}
         </button>
         {report === undefined && (
-          <span className="muted small">
-            {hasScopeReader
-              ? `asks ${tool} what this credential carries`
-              : `no scope reader for ${tool} yet — most permissions live server-side, per resource`}
-          </span>
+          <span className="muted small">asks {tool} what this credential carries</span>
         )}
       </div>
+
+      {/* Only once the backend has said this tool has scopes — which it only
+          knows after the first read, because listing them execs the CLI too. */}
+      {scopes && scopes.length > 0 && chosen && (
+        <div className="perm-pick">
+          <span className="muted small">
+            granted per resource, not per credential — read another one
+          </span>
+          <div className="perm-pick-row">
+            <ScopePicker scopes={scopes} value={chosen} onChange={setPicked} tool={tool} />
+            <button
+              type="button"
+              className="action"
+              onClick={() => panel.loadPerms(tool, chosen)}
+              disabled={loading}
+            >
+              {loading ? <span className="spinner" /> : null}
+              read
+            </button>
+          </div>
+        </div>
+      )}
+
       {report && (
         <div className="perm-body">
           {report.subject && (
@@ -250,12 +279,169 @@ function PermissionsSection({
               <span className="kv-val">{report.subject}</span>
             </div>
           )}
+          {/* Which resource this is about is part of the answer: "viewer" is a
+              different fact about one project than about the next. */}
+          {report.scope && (
+            <div className="kv">
+              <span className="kv-key">scope</span>
+              <span className="kv-val">{report.scope}</span>
+            </div>
+          )}
           <Scopes report={report} />
           {report.notes.length > 0 && <NoteList tool={tool} notes={report.notes} />}
           {report.hint && <Copyable text={report.hint} />}
         </div>
       )}
     </section>
+  );
+}
+
+/**
+ * Type to filter, arrow to move, enter to take it — the app has no select and
+ * no combobox, and a native `<select>` is unusable at the length these lists
+ * reach (a working Google account sees dozens of projects). So: a text input
+ * that filters a listbox, wired to the ARIA combobox pattern by hand.
+ *
+ * Escape closes the list and stops there. The drawer listens for Escape on the
+ * window, and a keystroke that dismisses a dropdown must not also throw away
+ * the pane you opened it in.
+ */
+function ScopePicker({
+  scopes,
+  value,
+  onChange,
+  tool,
+}: Readonly<{
+  scopes: readonly PermissionScope[];
+  value: string;
+  onChange: (id: string) => void;
+  tool: string;
+}>) {
+  const [query, setQuery] = useState("");
+  const [open, setOpen] = useState(false);
+  const [cursor, setCursor] = useState(0);
+  const boxRef = useRef<HTMLDivElement>(null);
+  const listRef = useRef<HTMLUListElement>(null);
+  const listId = useId();
+
+  const matches = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return scopes;
+    return scopes.filter(
+      (s) => s.id.toLowerCase().includes(q) || s.label.toLowerCase().includes(q),
+    );
+  }, [scopes, query]);
+
+  // A filter that empties the list must not leave the cursor pointing past it.
+  const at = matches.length === 0 ? -1 : Math.min(cursor, matches.length - 1);
+
+  const close = () => {
+    setOpen(false);
+    setQuery("");
+  };
+
+  const take = (id: string) => {
+    onChange(id);
+    close();
+  };
+
+  // Clicking anywhere else is a dismissal, same as Escape.
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (!boxRef.current?.contains(e.target as Node)) close();
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [open]);
+
+  // Keyboard navigation is only navigation if the row you land on is visible.
+  useEffect(() => {
+    if (!open || at < 0) return;
+    listRef.current
+      ?.querySelector(`[data-idx="${at}"]`)
+      ?.scrollIntoView({ block: "nearest" });
+  }, [open, at]);
+
+  const onKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      if (!open) {
+        setOpen(true);
+        return;
+      }
+      const step = e.key === "ArrowDown" ? 1 : -1;
+      if (matches.length > 0) {
+        setCursor((c) => (Math.min(c, matches.length - 1) + step + matches.length) % matches.length);
+      }
+    } else if (e.key === "Enter") {
+      if (open && at >= 0) {
+        e.preventDefault();
+        take(matches[at].id);
+      }
+    } else if (e.key === "Escape") {
+      if (open) {
+        // The drawer's own Escape handler is on the window. Do not let it fire.
+        e.preventDefault();
+        e.stopPropagation();
+        close();
+      }
+    } else if (e.key === "Tab") {
+      close();
+    }
+  };
+
+  return (
+    <div className="combo" ref={boxRef}>
+      <input
+        type="text"
+        className="field-input combo-input"
+        role="combobox"
+        aria-expanded={open}
+        aria-controls={listId}
+        aria-autocomplete="list"
+        aria-activedescendant={open && at >= 0 ? `${listId}-${at}` : undefined}
+        aria-label={`scope to read ${tool} permissions in`}
+        value={open ? query : value}
+        placeholder={value}
+        onChange={(e) => {
+          setQuery(e.target.value);
+          setCursor(0);
+          setOpen(true);
+        }}
+        onFocus={() => setOpen(true)}
+        onKeyDown={onKeyDown}
+      />
+      {open && (
+        <ul className="combo-list" id={listId} ref={listRef} role="listbox">
+          {matches.length === 0 && <li className="combo-empty muted small">no match</li>}
+          {matches.map((s, i) => (
+            <li key={s.id}>
+              {/* An option you can click is a button; the role puts it back
+                  into the listbox for anyone reading it as one. */}
+              <button
+                type="button"
+                id={`${listId}-${i}`}
+                data-idx={i}
+                role="option"
+                aria-selected={s.id === value}
+                className={`combo-opt${i === at ? " is-on" : ""}`}
+                // mousedown, not click: blur would close the list first.
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  take(s.id);
+                }}
+                onMouseEnter={() => setCursor(i)}
+              >
+                <span className="combo-opt-id">{s.id}</span>
+                {s.label !== s.id && <span className="combo-opt-label">{s.label}</span>}
+                {s.active && <span className="active-tag">active</span>}
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
   );
 }
 

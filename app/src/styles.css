@@ -1200,6 +1200,93 @@ dialog.detail {
   gap: 10px;
 }
 
+/* Choosing what to read permissions against. Only appears for tools that
+   grant per resource, and only after the first read has told us they do. */
+
+.perm-pick {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.perm-pick-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* The app has no select and no combobox. This is one: a text input that
+   filters a listbox floating under it. Positioned rather than in the flow, so
+   opening it does not shove the report below out from under the cursor. */
+.combo {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+}
+
+.combo-input {
+  padding-block: 3px;
+}
+
+.combo-list {
+  position: absolute;
+  z-index: 2;
+  top: calc(100% + 3px);
+  left: 0;
+  right: 0;
+  max-height: 190px;
+  overflow-y: auto;
+  margin: 0;
+  padding: 3px;
+  list-style: none;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel-2);
+  box-shadow: 0 6px 18px rgb(0 0 0 / 28%);
+}
+
+.combo-opt {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  padding: 4px 6px;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--ink-2);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  text-align: left;
+  cursor: pointer;
+}
+
+/* One highlight, driven by the keyboard cursor — the pointer moves it too, so
+   hover and arrow keys can never disagree about which row Enter would take. */
+.combo-opt.is-on {
+  background: var(--neutral-wash);
+  color: var(--ink);
+}
+
+.combo-opt-id {
+  flex: none;
+  overflow-wrap: anywhere;
+}
+
+.combo-opt-label {
+  flex: 1;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 10.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.combo-empty {
+  padding: 4px 6px;
+}
+
 .perm-body .kv {
   display: flex;
   gap: 8px;

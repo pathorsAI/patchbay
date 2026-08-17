@@ -10,8 +10,9 @@ use patchbay_core::keys::NewKey;
 // module is public and they belong to the write layer this file wraps.
 use patchbay_core::mcp_clients::{CopyReport, WriteReport};
 use patchbay_core::{
-    KeyEntry, KeyExpiryState, KeyRegistry, McpClient, McpClientRegistry, PermissionsReport,
-    Registry, ServerSpec, SwitchOutcome, ToolStatus, TransportSpec, VerifyOutcome,
+    KeyEntry, KeyExpiryState, KeyRegistry, McpClient, McpClientRegistry, PermissionScope,
+    PermissionsReport, Registry, ServerSpec, SwitchOutcome, ToolStatus, TransportSpec,
+    VerifyOutcome,
 };
 
 /// Probe errors are surfaced to the panel as strings; the panel renders them,
@@ -74,6 +75,28 @@ async fn verify_profile(tool: String, profile: String) -> CmdResult<VerifyOutcom
 #[tauri::command]
 async fn permissions(tool: String) -> CmdResult<PermissionsReport> {
     blocking(move |registry| registry.permissions(&tool)).await
+}
+
+/// The scopes this tool's permissions can be read against — GCP projects, for
+/// gcloud. Empty means the credential carries one answer everywhere and the
+/// panel shows no picker.
+///
+/// Tier 2, like everything it sits beside: enumerating scopes executes the
+/// tool's CLI, so the panel only calls this from a click, never on open.
+#[tauri::command]
+async fn permission_scopes(tool: String) -> CmdResult<Vec<PermissionScope>> {
+    blocking(move |registry| registry.permission_scopes(&tool)).await
+}
+
+/// Permissions within one scope rather than the tool's default.
+///
+/// The same reason `verify_profile` exists: a single answer filed under a tool
+/// is worse than ambiguous when the grants live on the resource. "viewer" is a
+/// fact about one project, and rendering it as a fact about gcloud would be
+/// wrong on every other project the account can reach.
+#[tauri::command]
+async fn permissions_in(tool: String, scope: String) -> CmdResult<PermissionsReport> {
+    blocking(move |registry| registry.permissions_in(&tool, Some(&scope))).await
 }
 
 /// One vault entry as the panel needs it: the registry's own metadata plus the
@@ -378,6 +401,8 @@ pub fn run() {
             verify,
             verify_profile,
             permissions,
+            permission_scopes,
+            permissions_in,
             keys_list,
             key_add,
             key_remove,
