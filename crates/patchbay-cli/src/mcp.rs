@@ -167,7 +167,7 @@ pub fn run(command: Command, styles: &Styles) -> Result<i32> {
             let spec = spec.build()?;
             let report = registry.add_server(&client, &name, &spec, force)?;
             println!("registered {} with {}", report.name, report.label);
-            print_write(&report);
+            print_write(&report, styles);
             if !spec.env.is_empty() {
                 println!(
                     "  env set:  {} (values are now in that file in plain text)",
@@ -187,7 +187,7 @@ pub fn run(command: Command, styles: &Styles) -> Result<i32> {
             force,
         } => {
             let report = registry.copy_server(&name, &from, &to, force)?;
-            print_copy(&report);
+            print_copy(&report, styles);
             Ok(0)
         }
 
@@ -213,7 +213,7 @@ pub fn run(command: Command, styles: &Styles) -> Result<i32> {
 
             let report = registry.remove_server(&client, &name)?;
             println!("removed {} from {}", report.name, report.label);
-            print_write(&report);
+            print_write(&report, styles);
             println!("  the server itself still exists — this only unregisters it here");
             Ok(0)
         }
@@ -248,18 +248,18 @@ fn confirm(client: &McpClient, entry: &McpServerEntry) -> Result<bool> {
 // output
 // ---------------------------------------------------------------------------
 
-fn print_write(report: &WriteReport) {
+fn print_write(report: &WriteReport, styles: &Styles) {
     println!("  config:   {}", render::tilde(&report.config_path));
     match &report.backup_path {
         Some(path) => println!("  backup:   {}", render::tilde(path)),
         None => println!("  backup:   none — the file did not exist yet"),
     }
     for note in &report.notes {
-        println!("  note: {note}");
+        println!("{}", render::note_line("  ", note, styles));
     }
 }
 
-fn print_copy(report: &CopyReport) {
+fn print_copy(report: &CopyReport, styles: &Styles) {
     let targets: Vec<&str> = report.written.iter().map(|w| w.label.as_str()).collect();
     println!(
         "copied {} from {} to {}",
@@ -284,7 +284,7 @@ fn print_copy(report: &CopyReport) {
             println!("    backup: {}", render::tilde(path));
         }
         for note in &write.notes {
-            println!("    note: {note}");
+            println!("{}", render::note_line("    ", note, styles));
         }
     }
 }
@@ -410,7 +410,8 @@ pub fn render_board(clients: &[McpClient], styles: &Styles) -> String {
             }
         }
         for note in &client.notes {
-            out.push_str(&format!("  note: {note}\n"));
+            out.push_str(&render::note_line("  ", note, styles));
+            out.push('\n');
         }
     }
 

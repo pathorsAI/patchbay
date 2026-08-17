@@ -7,8 +7,9 @@
 //! team). The CLI resolves that directory through `xdg-app-paths`, so an
 //! explicit `XDG_CONFIG_HOME` moves it; `~/.now` is the pre-rename location.
 //!
-//! There is no expiry on disk — a Vercel CLI token is long-lived and revoked at
-//! the dashboard — so `expires_at` is `None` (unknown, not expired).
+//! A Vercel CLI token does not expire: it is long-lived and stops working only
+//! when it is revoked at the dashboard. That is [`Expiry::NoExpiry`], a fact
+//! about the credential rather than a gap in what patchbay can read.
 //!
 //! `token` is typed as [`serde::de::IgnoredAny`]: serde confirms the key exists
 //! and discards the value, so the token never leaves the parser's stack.
@@ -19,7 +20,7 @@ use serde::Deserialize;
 
 use crate::paths::Paths;
 use crate::probe::{unsupported_switch, unsupported_verify, Probe};
-use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
+use crate::types::{Expiry, PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
 use crate::util::read_text;
 
 pub struct VercelProbe {
@@ -74,7 +75,7 @@ impl Probe for VercelProbe {
         let installed = self.paths.has_binary("vercel") || dir.is_some();
         let mut status = ToolStatus::empty(Self::TOOL, installed);
         for note in self.paths.path_notes("vercel") {
-            status.note(note);
+            status.push_note(note);
         }
 
         let Some(dir) = dir else {
@@ -85,13 +86,13 @@ impl Probe for VercelProbe {
             Ok(Some(text)) => match serde_json::from_str(&text) {
                 Ok(auth) => Some(auth),
                 Err(e) => {
-                    status.note(format!("auth.json is not valid JSON ({e})"));
+                    status.problem(format!("auth.json is not valid JSON ({e})"));
                     None
                 }
             },
             Ok(None) => None,
             Err(e) => {
-                status.note(e);
+                status.problem(e);
                 None
             }
         };
@@ -100,13 +101,13 @@ impl Probe for VercelProbe {
             Ok(Some(text)) => match serde_json::from_str(&text) {
                 Ok(config) => Some(config),
                 Err(e) => {
-                    status.note(format!("config.json is not valid JSON ({e})"));
+                    status.problem(format!("config.json is not valid JSON ({e})"));
                     None
                 }
             },
             Ok(None) => None,
             Err(e) => {
-                status.note(e);
+                status.problem(e);
                 None
             }
         };
@@ -114,7 +115,7 @@ impl Probe for VercelProbe {
         let has_token = auth.as_ref().is_some_and(|a| a.token.is_some())
             || config.as_ref().is_some_and(|c| c.token.is_some());
         if !has_token {
-            status.note(format!(
+            status.info(format!(
                 "{} exists but holds no token; vercel is not logged in",
                 dir.display()
             ));
@@ -134,22 +135,17 @@ impl Probe for VercelProbe {
                     (None, Some(team)) => format!("team {team}"),
                     (None, None) => "vercel login".to_string(),
                 })
+                // Long-lived by design; revocation happens at the dashboard.
+                .expiry(Expiry::NoExpiry)
                 .with_meta("current_team", team.clone())
                 .with_meta("identity", identity)
                 .with_meta("source", dir.display().to_string()),
         );
         status.active = Some(Self::PROFILE_ID.to_string());
 
-        status.note(
-            "vercel stores one token with no expiry on disk; scope is decided by the team the \
-             token belongs to, so `expires_at` is unknown rather than absent"
-                .to_string(),
-        );
+        status.info("a vercel token's reach is decided by the team it belongs to");
         if team.is_none() {
-            status.note(
-                "no currentTeam is recorded, so commands run against your personal scope"
-                    .to_string(),
-            );
+            status.info("no currentTeam is recorded, so commands run against your personal scope");
         }
 
         Ok(status)
@@ -186,6 +182,7 @@ impl Probe for VercelProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::NoteKind;
     use std::fs;
     use std::path::Path;
 
@@ -221,7 +218,9 @@ mod tests {
         let profile = &status.profiles[0];
         assert_eq!(profile.label, "dev@example.com (team team_pathors)");
         assert_eq!(profile.meta["current_team"], "team_pathors");
-        assert!(profile.expires_at.is_none());
+        // Not "we could not find out" — the token genuinely has no deadline.
+        assert_eq!(profile.expiry, Expiry::NoExpiry);
+        assert!(profile.expires_at().is_none());
 
         let json = serde_json::to_string(&status).unwrap();
         assert!(!json.contains("FAKEFIXTUREVERCELTOKEN"), "{json}");
@@ -239,7 +238,10 @@ mod tests {
         );
         let status = VercelProbe::new(Paths::for_test(home)).status().unwrap();
         assert_eq!(status.profiles[0].label, "vercel login");
-        assert!(status.notes.iter().any(|n| n.contains("personal scope")));
+        assert!(status
+            .notes
+            .iter()
+            .any(|n| n.kind == NoteKind::Info && n.text.contains("personal scope")));
     }
 
     #[test]
@@ -272,7 +274,10 @@ mod tests {
             .unwrap();
         assert!(status.installed);
         assert!(status.profiles.is_empty());
-        assert!(status.notes.iter().any(|n| n.contains("not valid JSON")));
+        assert!(status
+            .notes
+            .iter()
+            .any(|n| n.kind == NoteKind::Problem && n.text.contains("not valid JSON")));
 
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), &format!("{DIR}/auth.json"), "{}");
@@ -280,7 +285,11 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.profiles.is_empty());
-        assert!(status.notes.iter().any(|n| n.contains("not logged in")));
+        // Not logged in is a state the board already shows; it is not a fault.
+        assert!(status
+            .notes
+            .iter()
+            .any(|n| n.kind == NoteKind::Info && n.text.contains("not logged in")));
     }
 
     #[test]

@@ -16,7 +16,8 @@
 //! refreshes the access token itself on the next command, so the timestamp
 //! describes an hour-long token nobody has to think about — reported as an
 //! expiry it puts a live login on the board as "expired 12d". Offline-scoped
-//! grants therefore carry no expiry, only a note.
+//! grants are therefore [`Expiry::Refreshable`], which carries that hourly
+//! clock without letting it count as a deadline.
 //!
 //! `NEON_API_KEY` in the environment overrides the file entirely, which is how
 //! CI runs the CLI — worth a note, because the file's expiry then describes a
@@ -26,7 +27,9 @@ use serde::Deserialize;
 
 use crate::paths::Paths;
 use crate::probe::{unsupported_switch, unsupported_verify, Probe};
-use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
+use crate::types::{
+    Expiry, Note, PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome,
+};
 use crate::util::{parse_epoch_millis, read_text};
 
 pub struct NeonProbe {
@@ -73,14 +76,13 @@ impl Probe for NeonProbe {
             self.paths.has_binary("neon") || self.paths.has_binary("neonctl") || path.is_file();
         let mut status = ToolStatus::empty(Self::TOOL, installed);
         for note in self.paths.path_notes("neon") {
-            status.note(note);
+            status.push_note(note);
         }
 
         if self.paths.env("NEON_API_KEY").is_some() {
-            status.note(
+            status.warn(
                 "NEON_API_KEY is set in the environment and overrides the stored login; the CLI \
-                 will use that key regardless of what is on disk"
-                    .to_string(),
+                 will use that key regardless of what is on disk",
             );
         }
 
@@ -88,7 +90,7 @@ impl Probe for NeonProbe {
             Ok(Some(text)) => text,
             Ok(None) => return Ok(status),
             Err(e) => {
-                status.note(e);
+                status.problem(e);
                 return Ok(status);
             }
         };
@@ -96,18 +98,29 @@ impl Probe for NeonProbe {
         let credentials: Credentials = match serde_json::from_str(&text) {
             Ok(credentials) => credentials,
             Err(e) => {
-                status.note(format!("credentials.json is not valid JSON ({e})"));
+                status.problem(format!("credentials.json is not valid JSON ({e})"));
                 return Ok(status);
             }
         };
 
         let expires_at = credentials.expires_at.and_then(parse_epoch_millis);
         if credentials.expires_at.is_some() && expires_at.is_none() {
-            status.note("expires_at is present but is not a usable timestamp".to_string());
+            status.problem("expires_at is present but is not a usable timestamp".to_string());
         }
 
         let scopes = Self::scopes(credentials.scope.as_deref());
         let refreshable = scopes.iter().any(|s| s.starts_with("offline"));
+
+        // Only a grant that cannot refresh itself has a deadline a human has to
+        // meet; see the module header. An offline-scoped grant keeps its hourly
+        // clock inside `Refreshable`, where nothing treats it as one.
+        let expiry = match (refreshable, expires_at) {
+            (true, access_token_expires) => Expiry::Refreshable {
+                access_token_expires,
+            },
+            (false, Some(at)) => Expiry::At(at),
+            (false, None) => Expiry::unknown("not recorded in credentials.json"),
+        };
 
         status.profiles.push(
             Profile::new(Self::PROFILE_ID)
@@ -115,9 +128,7 @@ impl Probe for NeonProbe {
                     Some(id) => format!("neon user {id}"),
                     None => "neon oauth login".to_string(),
                 })
-                // Only a grant that cannot refresh itself has an expiry worth
-                // showing; see the module header.
-                .expires_at(expires_at.filter(|_| !refreshable))
+                .expiry(expiry)
                 .with_meta("user_id", credentials.user_id.clone())
                 .with_meta("token_type", credentials.token_type.clone())
                 .with_meta("scopes", scopes)
@@ -125,19 +136,6 @@ impl Probe for NeonProbe {
                 .with_meta("source", path.display().to_string()),
         );
         status.active = Some(Self::PROFILE_ID.to_string());
-
-        status.note(
-            "the config directory is still `neonctl` even though the binary is now `neon`"
-                .to_string(),
-        );
-        if refreshable {
-            status.note(
-                "the grant is offline-scoped, so the CLI refreshes the access token itself; the \
-                 only timestamp in credentials.json dates that hourly token, not the login, and \
-                 nothing here says when the grant behind it stops working"
-                    .to_string(),
-            );
-        }
 
         Ok(status)
     }
@@ -188,11 +186,10 @@ impl Probe for NeonProbe {
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
             scopes,
-            notes: vec![
+            notes: vec![Note::info(
                 "scopes come from the local OAuth grant; membership of each Neon organisation \
-                 decides what those scopes can actually reach"
-                    .to_string(),
-            ],
+                 decides what those scopes can actually reach",
+            )],
             hint: Some("neon auth".to_string()),
             scope: None,
         })
@@ -202,6 +199,7 @@ impl Probe for NeonProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::NoteKind;
     use std::fs;
     use std::path::PathBuf;
 
@@ -241,11 +239,16 @@ mod tests {
         let status = NeonProbe::new(Paths::for_test(&home)).status().unwrap();
         assert_eq!(status.active.as_deref(), Some("default"));
         let profile = &status.profiles[0];
-        assert!(profile.expires_at.is_none());
+        assert!(profile.expires_at().is_none());
+        assert_eq!(
+            profile.expiry,
+            Expiry::Refreshable {
+                access_token_expires: parse_epoch_millis(1785611828464)
+            }
+        );
         assert_eq!(profile.meta["scopes"][0], "openid");
         assert_eq!(profile.meta["refreshable"], true);
         assert_eq!(profile.meta["token_type"], "bearer");
-        assert!(status.notes.iter().any(|n| n.contains("still `neonctl`")));
 
         let json = serde_json::to_string(&status).unwrap();
         for secret in [
@@ -264,15 +267,18 @@ mod tests {
         // expired tally.
         let (_dir, home) = fixture(&credentials(1609459200000));
         let status = NeonProbe::new(Paths::for_test(&home)).status().unwrap();
-        assert!(status.profiles[0].expires_at.is_none());
+        assert!(status.profiles[0].expires_at().is_none());
+        // The hour is still on the record, just not as a deadline.
+        assert_eq!(
+            status.profiles[0].expiry,
+            Expiry::Refreshable {
+                access_token_expires: parse_epoch_millis(1609459200000)
+            }
+        );
         assert_eq!(
             status.connection_state(),
             crate::types::ConnectionState::Connected
         );
-        assert!(status
-            .notes
-            .iter()
-            .any(|n| n.contains("refreshes the access token itself")));
     }
 
     #[test]
@@ -283,9 +289,10 @@ mod tests {
         let status = NeonProbe::new(Paths::for_test(&home)).status().unwrap();
         assert_eq!(status.profiles[0].meta["refreshable"], false);
         assert_eq!(
-            status.profiles[0].expires_at.unwrap().to_rfc3339(),
+            status.profiles[0].expires_at().unwrap().to_rfc3339(),
             "2026-08-01T19:17:08.464+00:00"
         );
+        assert!(matches!(status.profiles[0].expiry, Expiry::At(_)));
     }
 
     #[test]
@@ -293,7 +300,12 @@ mod tests {
         let (_dir, home) = fixture(&credentials(1785611828464));
         let paths = Paths::for_test(&home).with_env("NEON_API_KEY", "fake-fixture-key");
         let status = NeonProbe::new(paths).status().unwrap();
-        assert!(status.notes.iter().any(|n| n.contains("NEON_API_KEY")));
+        // An env var silently overriding the stored login is a surprise, not a
+        // breakage: warn.
+        assert!(status
+            .notes
+            .iter()
+            .any(|n| n.kind == NoteKind::Warn && n.text.contains("NEON_API_KEY")));
         let json = serde_json::to_string(&status).unwrap();
         assert!(!json.contains("fake-fixture-key"), "{json}");
     }
@@ -312,7 +324,22 @@ mod tests {
         let status = NeonProbe::new(Paths::for_test(&home)).status().unwrap();
         assert!(status.installed);
         assert!(status.profiles.is_empty());
-        assert!(status.notes.iter().any(|n| n.contains("not valid JSON")));
+        assert!(status
+            .notes
+            .iter()
+            .any(|n| n.kind == NoteKind::Problem && n.text.contains("not valid JSON")));
+    }
+
+    #[test]
+    fn test_an_unusable_expires_at_is_a_problem() {
+        // Far outside the range a millisecond timestamp can represent.
+        let (_dir, home) = fixture(
+            r#"{ "access_token": "fake", "scope": "openid", "expires_at": 9223372036854775807 }"#,
+        );
+        let status = NeonProbe::new(Paths::for_test(&home)).status().unwrap();
+        assert!(status.notes.iter().any(|n| n.kind == NoteKind::Problem
+            && n.text
+                .contains("expires_at is present but is not a usable timestamp")));
     }
 
     #[test]
@@ -320,7 +347,11 @@ mod tests {
         let (_dir, home) = fixture(r#"{ "access_token": "fake", "scope": "openid" }"#);
         let status = NeonProbe::new(Paths::for_test(&home)).status().unwrap();
         assert_eq!(status.profiles.len(), 1);
-        assert!(status.profiles[0].expires_at.is_none());
+        assert!(status.profiles[0].expires_at().is_none());
+        assert_eq!(
+            status.profiles[0].expiry,
+            Expiry::unknown("not recorded in credentials.json")
+        );
         assert_eq!(status.profiles[0].meta["refreshable"], false);
     }
 }

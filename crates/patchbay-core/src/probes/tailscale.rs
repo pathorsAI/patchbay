@@ -22,7 +22,7 @@ use serde::Deserialize;
 
 use crate::paths::Paths;
 use crate::probe::{unknown_profile, unsupported_switch, unsupported_verify, Probe};
-use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
+use crate::types::{Expiry, PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
 use crate::util::parse_timestamp;
 
 pub struct TailscaleProbe {
@@ -123,7 +123,7 @@ impl Probe for TailscaleProbe {
             || state_file.is_file();
         let mut status = ToolStatus::empty(Self::TOOL, installed);
         for note in self.paths.path_notes("tailscale") {
-            status.note(note);
+            status.push_note(note);
         }
 
         if !installed {
@@ -134,6 +134,10 @@ impl Probe for TailscaleProbe {
             status.profiles.push(
                 Profile::new(id.as_str())
                     .label(format!("tailscale profile {id}"))
+                    // The node key does expire, and `tailscale status --json`
+                    // dates it — but that is tier 2. Tier 1 only knows the
+                    // profile directory exists.
+                    .expiry(Expiry::unknown("in the tailscale daemon's own state store"))
                     .with_meta("source", "macOS group container")
                     .with_meta("detail", "run `pb verify tailscale` for the tailnet name"),
             );
@@ -143,20 +147,20 @@ impl Probe for TailscaleProbe {
         // so a single directory is the active one. With several, patchbay will
         // not guess.
         match stored.len() {
-            0 => status.note(
+            0 => status.info(
                 "tailscale keeps its login inside the daemon's own state store, which patchbay \
-                 does not parse; run `pb verify tailscale` to see the tailnet and key expiry"
-                    .to_string(),
+                 does not parse; run `pb verify tailscale` to see the tailnet and key expiry",
             ),
             1 => {
                 status.active = Some(stored[0].clone());
-                status.note(
-                    "the profile id comes from the app's group container; the tailnet name, \
-                     online state and node key expiry need `pb verify tailscale`"
-                        .to_string(),
+                // The expiry half of this now rides on `Expiry`; what is left
+                // is provenance and the two facts verify alone can supply.
+                status.info(
+                    "the profile id comes from the app's group container; the tailnet name and \
+                     online state need `pb verify tailscale`",
                 );
             }
-            n => status.note(format!(
+            n => status.info(format!(
                 "{n} stored profiles, and which one is loaded is not readable from disk; run \
                  `tailscale switch --list`"
             )),
@@ -293,6 +297,7 @@ impl Probe for TailscaleProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::NoteKind;
     use std::fs;
     use std::path::PathBuf;
 
@@ -317,8 +322,18 @@ mod tests {
         assert!(status.installed);
         assert_eq!(status.active.as_deref(), Some("f4fe"));
         assert_eq!(status.profiles.len(), 1);
-        assert!(status.profiles[0].expires_at.is_none());
-        assert!(status.notes.iter().any(|n| n.contains("pb verify")));
+        // The node key really does expire; tier 1 just cannot see when.
+        assert_eq!(status.profiles[0].expires_at(), None);
+        assert_eq!(
+            status.profiles[0].expiry,
+            Expiry::unknown("in the tailscale daemon's own state store")
+        );
+        let provenance = status
+            .notes
+            .iter()
+            .find(|n| n.text.contains("pb verify"))
+            .expect("verify is still pointed at");
+        assert_eq!(provenance.kind, NoteKind::Info);
     }
 
     #[test]
@@ -330,7 +345,10 @@ mod tests {
         let ids: Vec<_> = status.profiles.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(ids, vec!["bdc8", "f4fe"]);
         assert!(status.active.is_none());
-        assert!(status.notes.iter().any(|n| n.contains("2 stored profiles")));
+        assert!(status
+            .notes
+            .iter()
+            .any(|n| n.text.contains("2 stored profiles")));
     }
 
     #[test]
@@ -353,7 +371,14 @@ mod tests {
             .unwrap();
         assert!(status.installed);
         assert!(status.profiles.is_empty());
-        assert!(status.notes.iter().any(|n| n.contains("does not parse")));
+        // patchbay declining to parse a private store is not a fault.
+        let opaque = status
+            .notes
+            .iter()
+            .find(|n| n.text.contains("does not parse"))
+            .expect("the unparsed store is explained");
+        assert_eq!(opaque.kind, NoteKind::Info);
+        assert_eq!(status.alarming_notes().count(), 0);
     }
 
     #[test]

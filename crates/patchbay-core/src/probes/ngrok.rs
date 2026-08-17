@@ -33,8 +33,8 @@ use serde::Deserialize;
 
 use crate::keys_verify::{HttpClient, UreqClient};
 use crate::paths::Paths;
-use crate::probe::{unsupported_switch, unsupported_verify, Probe};
-use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
+use crate::probe::{exec_disabled_verify, unsupported_switch, Probe};
+use crate::types::{Expiry, PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
 use crate::util::read_text;
 
 /// The ngrok API. Used only when an `api_key` is configured — an `authtoken`
@@ -142,13 +142,15 @@ impl Probe for NgrokProbe {
         let installed = self.paths.has_binary("ngrok") || path.is_some();
         let mut status = ToolStatus::empty(Self::TOOL, installed);
         for note in self.paths.path_notes("ngrok") {
-            status.note(note);
+            status.push_note(note);
         }
 
         let config = match parsed {
             Ok(config) => config,
+            // Either the file will not parse or it will not be read; both mean
+            // patchbay is reporting on an ngrok it cannot see.
             Err(e) => {
-                status.note(e);
+                status.problem(e);
                 return Ok(status);
             }
         };
@@ -159,7 +161,7 @@ impl Probe for NgrokProbe {
         let authtoken = config.authtoken().is_some();
         let api_key = config.api_key().is_some();
         if !authtoken && !api_key {
-            status.note(format!(
+            status.info(format!(
                 "{} has no authtoken; run `ngrok config add-authtoken <token>`",
                 path.display()
             ));
@@ -177,6 +179,9 @@ impl Probe for NgrokProbe {
         status.profiles.push(
             Profile::new(Self::AGENT)
                 .label(label)
+                // An authtoken runs until it is revoked at ngrok; there is no
+                // schedule, and `pb verify ngrok` is the liveness answer.
+                .expiry(Expiry::NoExpiry)
                 .with_meta("authtoken", authtoken)
                 .with_meta("api_key", api_key)
                 .with_meta("config_version", config.version.clone())
@@ -190,24 +195,10 @@ impl Probe for NgrokProbe {
         if authtoken {
             status.active = Some(Self::AGENT.to_string());
         } else {
-            status.note(
+            status.warn(
                 "an api_key is set but no authtoken: the ngrok API is reachable, but \
                  `ngrok http …` will refuse to start a tunnel",
             );
-        }
-
-        status.note(
-            "ngrok authtokens do not expire on a schedule; patchbay cannot tell a live one \
-             from a revoked one without `pb verify ngrok`",
-        );
-        if !tunnels.is_empty() {
-            status.note(format!(
-                "{} named tunnel{} defined ({}) — forwarding rules on this one account, not \
-                 separate logins",
-                tunnels.len(),
-                if tunnels.len() == 1 { "" } else { "s" },
-                tunnels.join(", ")
-            ));
         }
         Ok(status)
     }
@@ -222,12 +213,9 @@ impl Probe for NgrokProbe {
     }
 
     fn verify(&self) -> anyhow::Result<VerifyOutcome> {
+        // patchbay's own switch, not a fact about the user's ngrok login.
         if !self.paths.may_exec() {
-            return Ok(unsupported_verify(
-                Self::TOOL,
-                "verification is disabled in this context",
-                Some("ngrok config check"),
-            ));
+            return Ok(exec_disabled_verify(Self::TOOL, Some("ngrok config check")));
         }
         let (path, parsed) = self.load();
         if path.is_none() {
@@ -343,6 +331,7 @@ fn check_api_key(api_key: &str, http: &dyn HttpClient) -> ApiKeyCheck {
 mod tests {
     use super::*;
     use crate::keys_verify::{HttpResponse, StubHttp};
+    use crate::types::NoteKind;
     use std::fs;
     use std::path::PathBuf;
 
@@ -375,6 +364,9 @@ mod tests {
         assert_eq!(status.profiles[0].meta["api_key"], false);
         assert_eq!(status.profiles[0].meta["config_version"], "3");
         assert_eq!(status.profiles[0].meta["tunnels"], 0);
+        // Revoked, never expired — and the type says so instead of a note.
+        assert_eq!(status.profiles[0].expiry, Expiry::NoExpiry);
+        assert!(!status.notes.iter().any(|n| n.text.contains("expire")));
 
         // The token is a presence flag and nothing else — no value, and no
         // last4 either.
@@ -401,19 +393,18 @@ mod tests {
         );
         let status = NgrokProbe::new(Paths::for_test(&home)).status().unwrap();
 
-        // Two tunnels, still one login.
+        // Two tunnels, still one login — and that is said by the shape of the
+        // status, not by a note counting them at the reader.
         assert_eq!(status.profiles.len(), 1);
+        assert_eq!(status.profiles[0].id, "agent");
         assert_eq!(status.profiles[0].meta["tunnels"], 2);
         assert_eq!(
             status.profiles[0].meta["tunnel_names"],
             serde_json::json!(["api", "web"])
         );
         assert!(
-            status
-                .notes
-                .iter()
-                .any(|n| n.contains("not separate logins")),
-            "{:?}",
+            !status.notes.iter().any(|n| n.text.contains("tunnel")),
+            "the panel renders the tunnel list; a note would say it twice: {:?}",
             status.notes
         );
     }
@@ -427,11 +418,12 @@ mod tests {
         assert_eq!(status.profiles[0].label, "ngrok api key only");
         // An API key cannot start a tunnel, so nothing is active.
         assert_eq!(status.active, None);
-        assert!(
-            status.notes.iter().any(|n| n.contains("refuse to start")),
-            "{:?}",
-            status.notes
-        );
+        let surprise = status
+            .notes
+            .iter()
+            .find(|n| n.text.contains("refuse to start"))
+            .unwrap_or_else(|| panic!("{:?}", status.notes));
+        assert_eq!(surprise.kind, NoteKind::Warn);
         assert!(!serde_json::to_string(&status)
             .unwrap()
             .contains("ak_secret_value"));
@@ -474,7 +466,7 @@ mod tests {
         let paths = Paths::for_test(dir.path()).with_env("NGROK_CONFIG", custom.to_str().unwrap());
         let status = NgrokProbe::new(paths).status().unwrap();
         assert_eq!(status.active.as_deref(), Some("agent"));
-        assert!(status.notes.iter().any(|n| n.contains("NGROK_CONFIG")));
+        assert!(status.notes.iter().any(|n| n.text.contains("NGROK_CONFIG")));
     }
 
     #[test]
@@ -490,11 +482,12 @@ mod tests {
         let status = NgrokProbe::new(Paths::for_test(&home)).status().unwrap();
         assert!(status.installed);
         assert!(status.profiles.is_empty());
-        assert!(
-            status.notes.iter().any(|n| n.contains("not valid YAML")),
-            "{:?}",
-            status.notes
-        );
+        let malformed = status
+            .notes
+            .iter()
+            .find(|n| n.text.contains("not valid YAML"))
+            .unwrap_or_else(|| panic!("{:?}", status.notes));
+        assert_eq!(malformed.kind, NoteKind::Problem);
     }
 
     #[test]
@@ -503,11 +496,13 @@ mod tests {
         let status = NgrokProbe::new(Paths::for_test(&home)).status().unwrap();
         assert!(status.profiles.is_empty());
         assert_eq!(status.active, None);
-        assert!(
-            status.notes.iter().any(|n| n.contains("add-authtoken")),
-            "{:?}",
-            status.notes
-        );
+        // Nothing is broken; the tool simply has not been set up.
+        let unset = status
+            .notes
+            .iter()
+            .find(|n| n.text.contains("add-authtoken"))
+            .unwrap_or_else(|| panic!("{:?}", status.notes));
+        assert_eq!(unset.kind, NoteKind::Info);
     }
 
     #[test]
@@ -527,12 +522,16 @@ mod tests {
     #[test]
     fn test_verify_never_runs_in_a_test_context() {
         // `Paths::for_test` disables exec, which is what keeps this suite off
-        // both the ngrok binary and the network.
+        // both the ngrok binary and the network. That is patchbay's own
+        // switch, so it is ExecDisabled — never a caveat about ngrok.
         let (_dir, home) = fixture(REAL_V3);
-        assert!(matches!(
-            NgrokProbe::new(Paths::for_test(&home)).verify().unwrap(),
-            VerifyOutcome::Unsupported { .. }
-        ));
+        match NgrokProbe::new(Paths::for_test(&home)).verify().unwrap() {
+            VerifyOutcome::ExecDisabled { tool, hint } => {
+                assert_eq!(tool, "ngrok");
+                assert_eq!(hint.as_deref(), Some("ngrok config check"));
+            }
+            other => panic!("expected ExecDisabled, got {other:?}"),
+        }
     }
 
     // --- the API key check, through the shared HTTP seam --------------------

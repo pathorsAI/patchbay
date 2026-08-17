@@ -2,13 +2,84 @@
 
 export type Meta = Record<string, unknown>;
 
+/**
+ * How loudly to say a note. Mirrors `patchbay_core::NoteKind`.
+ *
+ * Before this existed the panel drew every note behind the same amber warning
+ * triangle, so "docker has no active registry, which is normal for docker" and
+ * "docker's credential store is unreadable" looked identical and the whole
+ * board read as a list of complaints.
+ */
+export type NoteKind = "info" | "warn" | "problem";
+
+export interface Note {
+  kind: NoteKind;
+  text: string;
+}
+
+/** Notes worth a badge on the collapsed card — everything but `info`. */
+export const isAlarming = (n: Note): boolean => n.kind !== "info";
+
+/**
+ * When — and whether — a login stops working. Mirrors `patchbay_core::Expiry`.
+ *
+ * `expires_at: null` used to mean three unrelated things at once: never
+ * expires, expires but patchbay cannot see when, and expires but the CLI
+ * renews it silently. They are different answers and the panel showed one
+ * label for all of them.
+ */
+export type Expiry =
+  | { state: "at"; at: string }
+  | { state: "no_expiry" }
+  | { state: "unknown"; reason?: string }
+  /** The CLI renews this. `access_token_expires` is the short-lived token's
+   *  own clock — never a deadline anyone has to meet. */
+  | { state: "refreshable"; access_token_expires?: string | null };
+
 export interface Profile {
   id: string;
   label: string;
-  /** RFC 3339, or null when the tool does not expose an expiry. */
+  /**
+   * Derived from `expiry` by core: RFC 3339 for a real deadline, null for all
+   * three of the states that are not one. Kept for back-compat; prefer
+   * `expiry`, which can tell them apart.
+   */
   expires_at: string | null;
+  expiry: Expiry;
   meta: Meta;
 }
+
+/**
+ * Whether "which one is active?" is even a question for this tool. Mirrors
+ * `patchbay_core::ActiveConcept`.
+ *
+ * rclone names its remote on every command, docker holds several registry
+ * logins at once — for those an empty active slot is the correct answer, not a
+ * missing one, and it must not read as "not connected".
+ */
+export type ActiveConcept = { kind: "selects" } | { kind: "not_applicable"; reason: string };
+
+/** Mirrors `patchbay_core::AdvisoryKind` — an internally tagged enum. */
+export type AdvisoryKind =
+  | { kind: "renamed"; [k: string]: unknown }
+  | { kind: "removed"; [k: string]: unknown }
+  | { kind: "unmaintained"; [k: string]: unknown }
+  | { kind: "info" };
+
+/** A curated notice about a tool: a rename, a removal, an end-of-life. */
+export interface Advisory {
+  tool: string;
+  kind: AdvisoryKind;
+  message: string;
+  url: string | null;
+}
+
+/**
+ * Mirrors `Advisory::is_blocking` — something removed or abandoned is worth
+ * alarming about; a rename you can keep ignoring is not.
+ */
+export const isBlockingAdvisory = (a: Advisory): boolean =>
+  a.kind.kind === "removed" || a.kind.kind === "unmaintained";
 
 /** The categories this build of the panel knows by name. */
 export type KnownCategory =
@@ -152,8 +223,18 @@ export interface ToolStatus {
   category: ToolCategory;
   profiles: Profile[];
   active: string | null;
-  notes: string[];
+  /** Whether an empty `active` is normal for this tool. */
+  active_concept: ActiveConcept;
+  notes: Note[];
   registered_keys: KeyRef[];
+  /**
+   * Curated notices — renames, removals, end-of-life. Core has always
+   * serialized these and the panel silently dropped them by not declaring the
+   * field, so a tool that had been *removed* looked the same as one that had
+   * not. Static data, so they are here whether or not the version cache is
+   * warm.
+   */
+  advisories: Advisory[];
   connection_state: ConnectionState;
 }
 
@@ -221,7 +302,7 @@ export interface McpClient {
   config_path: string;
   present: boolean;
   servers: McpServerEntry[];
-  notes: string[];
+  notes: Note[];
 }
 
 /** The three transports, as a spec that is about to be written. */
@@ -262,7 +343,7 @@ export interface McpWriteReport {
   backup_path: string | null;
   created_file: boolean;
   /** Format caveats and the restart hint. Show all of them. */
-  notes: string[];
+  notes: Note[];
 }
 
 /** Mirrors `patchbay_core::mcp_clients::CopyReport`. */
@@ -290,13 +371,19 @@ export const isWritableScope = (e: McpServerEntry): boolean =>
 export type SwitchOutcome =
   | { result: "switched"; tool: string; profile_id: string; detail: string; notes: string[] }
   | { result: "unsupported"; tool: string; reason: string; hint: string | null }
+  /** patchbay itself is running with command execution switched off. A fact
+   *  about patchbay's configuration, not about the user's login — so the panel
+   *  disables the button and explains in a tooltip rather than filing a note. */
+  | { result: "exec_disabled"; tool: string; hint: string | null }
   | { result: "unknown_profile"; tool: string; profile_id: string; available: string[] }
   | { result: "failed"; tool: string; profile_id: string; detail: string };
 
 export type VerifyOutcome =
   | { result: "valid"; tool: string; detail: string }
   | { result: "invalid"; tool: string; detail: string }
-  | { result: "unsupported"; tool: string; reason: string; hint: string | null };
+  | { result: "unsupported"; tool: string; reason: string; hint: string | null }
+  /** See `SwitchOutcome`'s variant of the same name. */
+  | { result: "exec_disabled"; tool: string; hint: string | null };
 
 /**
  * One thing a tool's permissions can be read *against*. Some tools grant per
@@ -316,7 +403,7 @@ export interface PermissionsReport {
   supported: boolean;
   subject: string | null;
   scopes: string[];
-  notes: string[];
+  notes: Note[];
   hint: string | null;
   /** Which scope this report is about. Absent for tools that have none. */
   scope?: string;

@@ -5,19 +5,25 @@
 //! and plenty of others use — `~/.kube/config` as a *directory* of per-cluster
 //! yaml files, which is scanned non-recursively and merged the same way.
 //!
-//! Contexts have no expiry of their own: a context points at a user, and that
-//! user is often an `exec` credential plugin (`gke-gcloud-auth-plugin`, `aws
-//! eks get-token`) that mints short-lived tokens on demand. That indirection is
-//! recorded in `meta.auth` because it is exactly what breaks when you switch
-//! the *other* tool's profile.
+//! Contexts have no credential of their own: a context points at a user, and
+//! that user is often an `exec` credential plugin (`gke-gcloud-auth-plugin`,
+//! `aws eks get-token`) that mints short-lived tokens on demand. That
+//! indirection is recorded in `meta.auth` because it is exactly what breaks
+//! when you switch the *other* tool's profile.
+//!
+//! It also decides the expiry, which is [`Expiry::Unknown`] in every case and
+//! for a different reason each time — an exec plugin's deadline belongs to
+//! whichever cloud CLI it shells out to, an embedded client certificate has one
+//! this probe does not parse. Never [`Expiry::NoExpiry`]: nothing here is
+//! eternal by design, patchbay simply does not hold the clock.
 
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
 use crate::paths::Paths;
-use crate::probe::{unknown_profile, unsupported_switch, unsupported_verify, Probe};
-use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
+use crate::probe::{exec_disabled_switch, unknown_profile, unsupported_verify, Probe};
+use crate::types::{Expiry, PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
 use crate::util::read_text;
 
 pub struct KubectlProbe {
@@ -129,7 +135,7 @@ impl Probe for KubectlProbe {
         let installed = self.paths.has_binary("kubectl") || candidates.iter().any(|p| p.exists());
         let mut status = ToolStatus::empty(Self::TOOL, installed);
         for note in self.paths.path_notes("kubeconfig") {
-            status.note(note);
+            status.push_note(note);
         }
 
         // A real trap seen in the wild: ~/.kube/config exists but is a
@@ -150,7 +156,7 @@ impl Probe for KubectlProbe {
                         });
                         sources.extend(files.into_iter().map(|f| (f, Some(index))));
                     }
-                    Err(e) => status.note(format!(
+                    Err(e) => status.problem(format!(
                         "{} is a directory that could not be listed ({e})",
                         path.display()
                     )),
@@ -170,14 +176,14 @@ impl Probe for KubectlProbe {
                 Ok(Some(text)) => text,
                 Ok(None) => continue,
                 Err(e) => {
-                    status.note(e);
+                    status.problem(e);
                     continue;
                 }
             };
             let config: KubeConfig = match serde_yaml_ng::from_str(&text) {
                 Ok(config) => config,
                 Err(e) => {
-                    status.note(format!("{} is not valid YAML ({e})", path.display()));
+                    status.problem(format!("{} is not valid YAML ({e})", path.display()));
                     continue;
                 }
             };
@@ -209,26 +215,41 @@ impl Probe for KubectlProbe {
                 let user_body = user
                     .as_ref()
                     .and_then(|name| config.users.iter().find(|u| &u.name == name));
-                let auth = match user_body.map(|u| &u.user) {
+                // How the context authenticates decides where its expiry lives,
+                // so the two are read off the same user entry.
+                let (auth, expiry) = match user_body.map(|u| &u.user) {
                     Some(UserBody {
                         exec: Some(exec), ..
-                    }) => format!(
-                        "exec plugin ({})",
-                        exec.command.as_deref().unwrap_or("unnamed")
+                    }) => (
+                        format!(
+                            "exec plugin ({})",
+                            exec.command.as_deref().unwrap_or("unnamed")
+                        ),
+                        Expiry::unknown("with the cloud CLI the exec plugin calls"),
                     ),
                     Some(UserBody {
                         auth_provider: Some(provider),
                         ..
-                    }) => format!(
-                        "auth-provider ({})",
-                        provider.name.as_deref().unwrap_or("unnamed")
+                    }) => (
+                        format!(
+                            "auth-provider ({})",
+                            provider.name.as_deref().unwrap_or("unnamed")
+                        ),
+                        Expiry::unknown("in the auth provider's own token cache"),
                     ),
-                    Some(_) => "static credential in kubeconfig".to_string(),
-                    None => "unknown".to_string(),
+                    Some(_) => (
+                        "static credential in kubeconfig".to_string(),
+                        Expiry::unknown("in the credential embedded in the kubeconfig"),
+                    ),
+                    None => (
+                        "unknown".to_string(),
+                        Expiry::unknown("no user entry for this context"),
+                    ),
                 };
 
                 status.profiles.push(
                     Profile::new(&named.name)
+                        .expiry(expiry)
                         .with_meta("cluster", named.context.cluster.clone())
                         .with_meta("user", user)
                         .with_meta("namespace", named.context.namespace.clone())
@@ -241,7 +262,7 @@ impl Probe for KubectlProbe {
         for scan in &scans {
             match scan.with_contexts.len() {
                 // Nothing usable in there: the old failure mode, unchanged.
-                0 => status.note(format!(
+                0 => status.problem(format!(
                     "{} is a directory, not a kubeconfig file, and no *.yaml/*.yml file inside it defines any context; kubectl will fail until KUBECONFIG points at a real config",
                     scan.dir.display()
                 )),
@@ -256,9 +277,8 @@ impl Probe for KubectlProbe {
                 // single active context to report.
                 _ => {
                     active = None;
-                    status.note(
-                        "multiple kubeconfig files; no single current context (set KUBECONFIG to choose)"
-                            .to_string(),
+                    status.warn(
+                        "multiple kubeconfig files; no single current context (set KUBECONFIG to choose)",
                     );
                 }
             }
@@ -269,7 +289,7 @@ impl Probe for KubectlProbe {
                     .iter()
                     .map(|p| p.display().to_string())
                     .collect();
-                status.note(format!(
+                status.problem(format!(
                     "{} is a directory of kubeconfigs, not a kubeconfig file; patchbay merged them, but kubectl in your shell will not until you set: export KUBECONFIG={}",
                     scan.dir.display(),
                     list.join(":")
@@ -281,14 +301,17 @@ impl Probe for KubectlProbe {
 
         if let Some(active) = &status.active {
             if !status.profiles.iter().any(|p| &p.id == active) {
-                status.note(format!(
+                status.problem(format!(
                     "current-context is `{active}` but no context with that name is defined"
                 ));
             }
         }
 
         // Exec plugins are why "I switched gcloud accounts and kubectl broke".
-        let exec_contexts: Vec<&str> = status
+        // Which contexts they are is already in `meta.auth`, so the list of
+        // names is dropped; the consequence is not derivable from anything on
+        // the profile, so it stays — once, in one clause.
+        let exec_contexts = status
             .profiles
             .iter()
             .filter(|p| {
@@ -297,13 +320,10 @@ impl Probe for KubectlProbe {
                     .and_then(|v| v.as_str())
                     .is_some_and(|a| a.starts_with("exec plugin"))
             })
-            .map(|p| p.id.as_str())
-            .collect();
-        if !exec_contexts.is_empty() {
-            status.note(format!(
-                "{} context(s) mint tokens through an exec credential plugin, so they inherit whichever cloud account is active: {}",
-                exec_contexts.len(),
-                exec_contexts.join(", ")
+            .count();
+        if exec_contexts > 0 {
+            status.warn(format!(
+                "{exec_contexts} context(s) mint tokens through an exec credential plugin, so they follow whichever cloud account is active"
             ));
         }
 
@@ -316,9 +336,8 @@ impl Probe for KubectlProbe {
             return Ok(unknown_profile(Self::TOOL, profile_id, &status));
         }
         if !self.paths.may_exec() {
-            return Ok(unsupported_switch(
+            return Ok(exec_disabled_switch(
                 Self::TOOL,
-                "command execution is disabled for this probe",
                 Some(&format!("kubectl config use-context {profile_id}")),
             ));
         }
@@ -379,8 +398,19 @@ impl Probe for KubectlProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::NoteKind;
     use std::fs;
     use std::path::PathBuf;
+
+    /// The kind recorded for the one note containing `needle`.
+    fn kind_of(status: &ToolStatus, needle: &str) -> NoteKind {
+        status
+            .notes
+            .iter()
+            .find(|n| n.text.contains(needle))
+            .unwrap_or_else(|| panic!("no note containing {needle:?}: {:?}", status.notes))
+            .kind
+    }
 
     const CONFIG: &str = r#"
 apiVersion: v1
@@ -434,10 +464,28 @@ users:
             status.profiles[1].meta["auth"],
             "static credential in kubeconfig"
         );
-        assert!(status
+        // No context dates its own credential, and none of them is eternal
+        // either: each says where the clock it cannot see actually lives.
+        assert_eq!(
+            status.profiles[0].expiry,
+            Expiry::unknown("with the cloud CLI the exec plugin calls")
+        );
+        assert_eq!(
+            status.profiles[1].expiry,
+            Expiry::unknown("in the credential embedded in the kubeconfig")
+        );
+        assert!(status.profiles.iter().all(|p| p.expires_at().is_none()));
+
+        // "…and switching gcloud moves them" is not on any profile, so it is
+        // still said out loud — as a warning, without re-listing the contexts.
+        let inherit = status
             .notes
             .iter()
-            .any(|n| n.contains("exec credential plugin")));
+            .find(|n| n.text.contains("exec credential plugin"))
+            .expect("expected the exec-plugin caveat");
+        assert_eq!(inherit.kind, NoteKind::Warn);
+        assert!(inherit.text.contains('1'), "{}", inherit.text);
+        assert!(!inherit.text.contains("prod"), "{}", inherit.text);
 
         // Embedded client key data must never be carried along.
         let json = serde_json::to_string(&status).unwrap();
@@ -478,7 +526,12 @@ users:
             .unwrap();
         assert!(status.installed);
         assert!(status.profiles.is_empty());
-        assert!(status.notes.iter().any(|n| n.contains("is a directory")));
+        assert!(status
+            .notes
+            .iter()
+            .any(|n| n.text.contains("is a directory")));
+        // kubectl itself cannot read this at all, so it is not a caveat.
+        assert_eq!(kind_of(&status, "is a directory"), NoteKind::Problem);
     }
 
     /// The layout on a real machine: `~/.kube/config` is a directory of
@@ -531,7 +584,7 @@ users:
 
         // Two files carry contexts, each with its own current-context.
         assert!(status.active.is_none());
-        assert!(status.notes.iter().any(|n| n
+        assert!(status.notes.iter().any(|n| n.text
             == "multiple kubeconfig files; no single current context (set KUBECONFIG to choose)"));
 
         // The junk yaml is named and skipped; the non-yaml cache file is not
@@ -539,7 +592,8 @@ users:
         assert!(status
             .notes
             .iter()
-            .any(|n| n.contains("scratch.yaml") && n.contains("not valid YAML")));
+            .any(|n| n.text.contains("scratch.yaml") && n.text.contains("not valid YAML")));
+        assert_eq!(kind_of(&status, "scratch.yaml"), NoteKind::Problem);
         let json = serde_json::to_string(&status).unwrap();
         assert!(!json.contains("ya29.SECRET"), "{json}");
         assert!(!json.contains("gke_gcloud_auth_plugin_cache"), "{json}");
@@ -548,9 +602,9 @@ users:
         let hint = status
             .notes
             .iter()
-            .find(|n| n.contains("export KUBECONFIG="))
+            .find(|n| n.text.contains("export KUBECONFIG="))
             .expect("expected a KUBECONFIG hint");
-        assert!(hint.contains(&format!(
+        assert!(hint.text.contains(&format!(
             "export KUBECONFIG={}:{}",
             config.join("llm-cluster.yaml").display(),
             config.join("pathors-tw.yaml").display()
@@ -578,7 +632,7 @@ users:
         assert!(!status
             .notes
             .iter()
-            .any(|n| n.contains("no single current context")));
+            .any(|n| n.text.contains("no single current context")));
     }
 
     #[test]
@@ -586,7 +640,10 @@ users:
         let (_dir, home) = fixture(".kube/config", CONFIG);
         let status = KubectlProbe::new(Paths::for_test(&home)).status().unwrap();
         assert_eq!(status.active.as_deref(), Some("prod"));
-        assert!(!status.notes.iter().any(|n| n.contains("is a directory")));
+        assert!(!status
+            .notes
+            .iter()
+            .any(|n| n.text.contains("is a directory")));
     }
 
     #[test]
@@ -604,13 +661,37 @@ users:
     fn test_malformed_yaml_and_dangling_current_context() {
         let (_dir, home) = fixture(".kube/config", "\tnot: [valid yaml");
         let status = KubectlProbe::new(Paths::for_test(&home)).status().unwrap();
-        assert!(status.notes.iter().any(|n| n.contains("not valid YAML")));
+        assert!(status
+            .notes
+            .iter()
+            .any(|n| n.text.contains("not valid YAML")));
+        assert_eq!(kind_of(&status, "not valid YAML"), NoteKind::Problem);
 
         let (_dir, home) = fixture(".kube/config", "current-context: ghost\ncontexts: []\n");
         let status = KubectlProbe::new(Paths::for_test(&home)).status().unwrap();
         assert!(status
             .notes
             .iter()
-            .any(|n| n.contains("no context with that name")));
+            .any(|n| n.text.contains("no context with that name")));
+        // A dangling current-context is a broken kubeconfig, not a caveat.
+        assert_eq!(
+            kind_of(&status, "no context with that name"),
+            NoteKind::Problem
+        );
+    }
+
+    #[test]
+    fn test_execution_being_switched_off_is_not_a_reason_kubectl_cannot_switch() {
+        let (_dir, home) = fixture(".kube/config", CONFIG);
+        match KubectlProbe::new(Paths::for_test(&home))
+            .switch("local")
+            .unwrap()
+        {
+            SwitchOutcome::ExecDisabled { tool, hint } => {
+                assert_eq!(tool, "kubectl");
+                assert_eq!(hint.as_deref(), Some("kubectl config use-context local"));
+            }
+            other => panic!("expected ExecDisabled, got {other:?}"),
+        }
     }
 }

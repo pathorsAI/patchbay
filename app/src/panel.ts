@@ -18,6 +18,12 @@ export interface SwitchNote {
   text: string;
   hint?: string;
   bad: boolean;
+  /**
+   * patchbay itself is running with command execution switched off. Not a
+   * fault of the tool or the login — so the button goes grey with a tooltip
+   * and nothing is filed as a caveat about the user's credentials.
+   */
+  execDisabled?: boolean;
 }
 
 /**
@@ -70,6 +76,13 @@ export function switchMessage(outcome: SwitchOutcome): SwitchNote {
       return { text: [outcome.detail, ...outcome.notes].join(" — "), bad: false };
     case "unsupported":
       return { text: outcome.reason, hint: outcome.hint ?? undefined, bad: false };
+    case "exec_disabled":
+      return {
+        text: "patchbay is running with command execution switched off, so it did not try",
+        hint: outcome.hint ?? undefined,
+        bad: false,
+        execDisabled: true,
+      };
     case "unknown_profile":
       return { text: `no such profile: ${outcome.profile_id}`, bad: true };
     case "failed":
@@ -78,7 +91,14 @@ export function switchMessage(outcome: SwitchOutcome): SwitchNote {
 }
 
 export function verdictText(v: VerifyOutcome): string {
-  return v.result === "unsupported" ? v.reason : v.detail;
+  switch (v.result) {
+    case "unsupported":
+      return v.reason;
+    case "exec_disabled":
+      return "command execution is switched off in this patchbay";
+    default:
+      return v.detail;
+  }
 }
 
 /** Meta keys worth surfacing on the face of a card, most identifying first. */

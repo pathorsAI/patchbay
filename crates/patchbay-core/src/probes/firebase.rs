@@ -16,17 +16,21 @@
 //!
 //! `tokens.expires_at` dates an hour-long OAuth access token, not the login:
 //! where a `refresh_token` sits beside it, firebase-tools mints a new one
-//! silently on the next command. So that expiry is reported only for a grant
-//! that has no refresh token — for every ordinary login it is `None`, because
-//! what ends the session is the refresh token being revoked and nothing here
-//! records when that happens. The alternative is a board that says "expired
-//! 235d" about an account you used this morning.
+//! silently on the next command. Every ordinary login is therefore
+//! [`Expiry::Refreshable`], which carries that hourly clock without letting it
+//! count as a deadline — what ends the session is the refresh token being
+//! revoked, and nothing here records when that happens. Only a grant with no
+//! refresh token gets [`Expiry::At`], because then the hour really is the whole
+//! login. The alternative is a board that says "expired 235d" about an account
+//! you used this morning.
 
 use serde::Deserialize;
 
 use crate::paths::Paths;
 use crate::probe::{unsupported_switch, unsupported_verify, Probe};
-use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
+use crate::types::{
+    Expiry, Note, PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome,
+};
 use crate::util::{parse_epoch_millis, read_text};
 
 pub struct FirebaseProbe {
@@ -90,15 +94,18 @@ impl FirebaseProbe {
     fn profile(email: &str, tokens: Option<&Tokens>) -> Profile {
         // The hour is only the truth for a grant that cannot refresh itself.
         let refreshable = tokens.is_some_and(Tokens::refreshable);
-        let expires_at = (!refreshable)
-            .then(|| {
-                tokens
-                    .and_then(|t| t.expires_at)
-                    .and_then(parse_epoch_millis)
-            })
-            .flatten();
+        let access_token_expires = tokens
+            .and_then(|t| t.expires_at)
+            .and_then(parse_epoch_millis);
+        let expiry = match (refreshable, access_token_expires) {
+            (true, access_token_expires) => Expiry::Refreshable {
+                access_token_expires,
+            },
+            (false, Some(at)) => Expiry::At(at),
+            (false, None) => Expiry::unknown("not recorded in the firebase-tools configstore"),
+        };
         Profile::new(email)
-            .expires_at(expires_at)
+            .expiry(expiry)
             .with_meta(
                 "scopes",
                 tokens.map(|t| t.scopes.clone()).unwrap_or_default(),
@@ -118,14 +125,14 @@ impl Probe for FirebaseProbe {
         let installed = self.paths.has_binary("firebase") || path.is_file();
         let mut status = ToolStatus::empty(Self::TOOL, installed);
         for note in self.paths.path_notes("firebase") {
-            status.note(note);
+            status.push_note(note);
         }
 
         let text = match read_text(&path) {
             Ok(Some(text)) => text,
             Ok(None) => return Ok(status),
             Err(e) => {
-                status.note(e);
+                status.problem(e);
                 return Ok(status);
             }
         };
@@ -133,7 +140,7 @@ impl Probe for FirebaseProbe {
         let store: Store = match serde_json::from_str(&text) {
             Ok(store) => store,
             Err(e) => {
-                status.note(format!("firebase-tools.json is not valid JSON ({e})"));
+                status.problem(format!("firebase-tools.json is not valid JSON ({e})"));
                 return Ok(status);
             }
         };
@@ -158,34 +165,24 @@ impl Probe for FirebaseProbe {
 
         if status.profiles.is_empty() {
             if !store.active_projects.is_empty() {
-                status.note(
-                    "firebase-tools has project aliases on this machine but no logged-in account"
-                        .to_string(),
+                status.info(
+                    "firebase-tools has project aliases on this machine but no logged-in account",
                 );
             }
             return Ok(status);
         }
 
-        if status.profiles.iter().any(|p| p.expires_at.is_none()) {
-            status.note(
-                "firebase-tools records no expiry for a login: the token it dates is an hour-long \
-                 access token it refreshes silently, and revocation of the refresh token behind it \
-                 is decided by Google, not written here"
-                    .to_string(),
-            );
-        }
         if !store.active_projects.is_empty() {
-            status.note(format!(
+            status.info(format!(
                 "the active Firebase project is per-directory ({} recorded); the profile above is \
                  the account, not the project",
                 store.active_projects.len()
             ));
         }
         if !store.additional_accounts.is_empty() {
-            status.note(
+            status.info(
                 "extra accounts from `firebase login:add` are selected per command with \
-                 `--account`, not globally"
-                    .to_string(),
+                 `--account`, not globally",
             );
         }
 
@@ -238,11 +235,10 @@ impl Probe for FirebaseProbe {
             supported: true,
             subject: Some(profile.id.clone()),
             scopes,
-            notes: vec![
+            notes: vec![Note::info(
                 "these are the OAuth scopes of the local grant; what you may actually do is \
-                 decided by the account's IAM roles on each Firebase project"
-                    .to_string(),
-            ],
+                 decided by the account's IAM roles on each Firebase project",
+            )],
             hint: Some("firebase login --reauth".to_string()),
             scope: None,
         })
@@ -252,6 +248,7 @@ impl Probe for FirebaseProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::NoteKind;
     use std::fs;
     use std::path::PathBuf;
 
@@ -288,8 +285,16 @@ mod tests {
         assert_eq!(status.active.as_deref(), Some("dev@example.com"));
         assert_eq!(status.profiles[0].meta["primary"], true);
         assert_eq!(status.profiles[0].meta["scopes"][0], "email");
-        assert!(status.notes.iter().any(|n| n.contains("per-directory")));
-        assert!(status.notes.iter().any(|n| n.contains("--account")));
+        assert!(status
+            .notes
+            .iter()
+            .any(|n| n.kind == NoteKind::Info && n.text.contains("per-directory")));
+        assert!(status
+            .notes
+            .iter()
+            .any(|n| n.kind == NoteKind::Info && n.text.contains("--account")));
+        // Nothing here is worth alarming anyone about.
+        assert_eq!(status.alarming_notes().count(), 0);
     }
 
     #[test]
@@ -299,7 +304,13 @@ mod tests {
         // 235d" and counted it among the tool's dead logins.
         let (_dir, home) = fixture(STORE);
         let status = FirebaseProbe::new(Paths::for_test(&home)).status().unwrap();
-        assert!(status.profiles.iter().all(|p| p.expires_at.is_none()));
+        assert!(status.profiles.iter().all(|p| p.expires_at().is_none()));
+        // The state carries the hour it really has; nothing reads it as a
+        // deadline.
+        assert!(status.profiles.iter().all(|p| p.expiry
+            == Expiry::Refreshable {
+                access_token_expires: parse_epoch_millis(1766355597325)
+            }));
         assert!(status
             .profiles
             .iter()
@@ -308,7 +319,6 @@ mod tests {
             status.connection_state(),
             crate::types::ConnectionState::Connected
         );
-        assert!(status.notes.iter().any(|n| n.contains("records no expiry")));
     }
 
     #[test]
@@ -321,8 +331,19 @@ mod tests {
         assert_eq!(status.profiles[0].meta["refreshable"], false);
         // epoch milliseconds, not seconds.
         assert_eq!(
-            status.profiles[0].expires_at.unwrap().to_rfc3339(),
+            status.profiles[0].expires_at().unwrap().to_rfc3339(),
             "2025-12-21T22:19:57.325+00:00"
+        );
+        assert!(matches!(status.profiles[0].expiry, Expiry::At(_)));
+    }
+
+    #[test]
+    fn test_an_account_with_no_tokens_at_all_has_an_unknown_expiry() {
+        let (_dir, home) = fixture(r#"{ "user": { "email": "dev@example.com" } }"#);
+        let status = FirebaseProbe::new(Paths::for_test(&home)).status().unwrap();
+        assert_eq!(
+            status.profiles[0].expiry,
+            Expiry::unknown("not recorded in the firebase-tools configstore")
         );
     }
 
@@ -350,7 +371,7 @@ mod tests {
         assert!(status
             .notes
             .iter()
-            .any(|n| n.contains("no logged-in account")));
+            .any(|n| n.kind == NoteKind::Info && n.text.contains("no logged-in account")));
     }
 
     #[test]
@@ -365,7 +386,10 @@ mod tests {
         let (_dir, home) = fixture("{ \"user\": ");
         let status = FirebaseProbe::new(Paths::for_test(&home)).status().unwrap();
         assert!(status.installed);
-        assert!(status.notes.iter().any(|n| n.contains("not valid JSON")));
+        assert!(status
+            .notes
+            .iter()
+            .any(|n| n.kind == NoteKind::Problem && n.text.contains("not valid JSON")));
     }
 
     #[test]

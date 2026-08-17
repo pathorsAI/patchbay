@@ -9,8 +9,10 @@
 //! `expiration_time` dates the *access* token. Where a `refresh_token` sits
 //! beside it, wrangler renews that silently on the next command, so the
 //! timestamp is not when the login stops working — reported as the profile's
-//! expiry it put a live grant on the board as "expired 154d". It is kept only
-//! for a grant with no refresh token, where the deadline really is the login's.
+//! expiry it put a live grant on the board as "expired 154d". That grant is
+//! [`Expiry::Refreshable`], carrying the timestamp as the access token's own
+//! clock and nothing more. Only a grant with no refresh token gets
+//! [`Expiry::At`], because there the deadline really is the login's.
 //!
 //! `oauth_token` and `refresh_token` are typed as [`serde::de::IgnoredAny`]:
 //! serde confirms the keys exist and throws the values away, so no Cloudflare
@@ -20,7 +22,9 @@ use serde::Deserialize;
 
 use crate::paths::Paths;
 use crate::probe::{unsupported_switch, unsupported_verify, Probe};
-use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
+use crate::types::{
+    Expiry, Note, PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome,
+};
 use crate::util::{parse_timestamp, read_text};
 
 pub struct WranglerProbe {
@@ -62,14 +66,14 @@ impl Probe for WranglerProbe {
         let installed = self.paths.has_binary("wrangler") || !present.is_empty();
         let mut status = ToolStatus::empty(Self::TOOL, installed);
         for note in self.paths.path_notes("wrangler") {
-            status.note(note);
+            status.push_note(note);
         }
 
         let Some(path) = present.first().copied() else {
             return Ok(status);
         };
         if present.len() > 1 {
-            status.note(format!(
+            status.info(format!(
                 "two wrangler configs exist; reading {} and ignoring {}",
                 path.display(),
                 present[1].display()
@@ -80,7 +84,7 @@ impl Probe for WranglerProbe {
             Ok(Some(text)) => text,
             Ok(None) => return Ok(status),
             Err(e) => {
-                status.note(e);
+                status.problem(e);
                 return Ok(status);
             }
         };
@@ -88,13 +92,13 @@ impl Probe for WranglerProbe {
         let config: WranglerConfig = match toml::from_str(&text) {
             Ok(config) => config,
             Err(e) => {
-                status.note(format!("{} is not valid TOML ({e})", path.display()));
+                status.problem(format!("{} is not valid TOML ({e})", path.display()));
                 return Ok(status);
             }
         };
 
         if config.oauth_token.is_none() && config.api_token.is_none() {
-            status.note(format!(
+            status.info(format!(
                 "{} exists but holds no token; wrangler is not logged in",
                 path.display()
             ));
@@ -103,9 +107,21 @@ impl Probe for WranglerProbe {
 
         let expires_at = config.expiration_time.as_deref().and_then(parse_timestamp);
         if config.expiration_time.is_some() && expires_at.is_none() {
-            status.note("expiration_time is present but could not be parsed".to_string());
+            status.problem("expiration_time is present but could not be parsed".to_string());
         }
         let refreshable = config.refresh_token.is_some();
+
+        // Only a grant wrangler cannot renew for you has a deadline a human has
+        // to meet; see the module header. With nothing to renew it and no
+        // timestamp either — an API token, normally — the deadline is the
+        // dashboard's business and is not on this machine at all.
+        let expiry = match (refreshable, expires_at) {
+            (true, access_token_expires) => Expiry::Refreshable {
+                access_token_expires,
+            },
+            (false, Some(at)) => Expiry::At(at),
+            (false, None) => Expiry::unknown("in the Cloudflare dashboard"),
+        };
 
         status.profiles.push(
             Profile::new(Self::PROFILE_ID)
@@ -114,9 +130,7 @@ impl Probe for WranglerProbe {
                 } else {
                     "cloudflare oauth login"
                 })
-                // Only a grant wrangler cannot renew for you has an expiry
-                // worth showing; see the module header.
-                .expires_at(expires_at.filter(|_| !refreshable))
+                .expiry(expiry)
                 .with_meta(
                     "auth_type",
                     if config.api_token.is_some() {
@@ -130,12 +144,6 @@ impl Probe for WranglerProbe {
                 .with_meta("source", path.display().to_string()),
         );
         status.active = Some(Self::PROFILE_ID.to_string());
-
-        if refreshable {
-            status.note(
-                "a refresh token is present, so wrangler renews the access token itself on the next command; the only timestamp in the config dates that access token, not the login, and nothing here says when the grant behind it stops working".to_string(),
-            );
-        }
 
         Ok(status)
     }
@@ -187,9 +195,9 @@ impl Probe for WranglerProbe {
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
             scopes,
-            notes: vec![
-                "scopes are read from the local OAuth grant; account-level API token permissions are not visible here".to_string(),
-            ],
+            notes: vec![Note::info(
+                "scopes are read from the local OAuth grant; account-level API token permissions are not visible here",
+            )],
             hint: Some("re-run `wrangler login` to request a different scope set".to_string()),
             scope: None,
         })
@@ -199,6 +207,7 @@ impl Probe for WranglerProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::NoteKind;
     use std::fs;
     use std::path::Path;
 
@@ -261,13 +270,13 @@ mod tests {
 
         let status = WranglerProbe::new(Paths::for_test(&home)).status().unwrap();
         assert_eq!(
-            status.profiles[0].expires_at.unwrap().to_rfc3339(),
+            status.profiles[0].expires_at().unwrap().to_rfc3339(),
             "2030-01-01T00:00:00+00:00"
         );
         assert!(status
             .notes
             .iter()
-            .any(|n| n.contains("two wrangler configs")));
+            .any(|n| n.kind == NoteKind::Info && n.text.contains("two wrangler configs")));
     }
 
     #[test]
@@ -292,15 +301,19 @@ mod tests {
         let home = dir.path().to_path_buf();
         write(&home, NEW_PATH, &config("2020-01-01T00:00:00Z"));
         let status = WranglerProbe::new(Paths::for_test(&home)).status().unwrap();
-        assert!(status.profiles[0].expires_at.is_none());
+        // The state says it outright now, and the stale hour rides along in it
+        // rather than being reported as the login's deadline.
+        assert_eq!(
+            status.profiles[0].expiry,
+            Expiry::Refreshable {
+                access_token_expires: parse_timestamp("2020-01-01T00:00:00Z")
+            }
+        );
+        assert!(status.profiles[0].expires_at().is_none());
         assert_eq!(
             status.connection_state(),
             crate::types::ConnectionState::Connected
         );
-        assert!(status
-            .notes
-            .iter()
-            .any(|n| n.contains("renews the access token itself")));
     }
 
     #[test]
@@ -315,9 +328,25 @@ mod tests {
         let status = WranglerProbe::new(Paths::for_test(&home)).status().unwrap();
         assert_eq!(status.profiles[0].meta["refreshable"], false);
         assert_eq!(
-            status.profiles[0].expires_at.unwrap().to_rfc3339(),
+            status.profiles[0].expires_at().unwrap().to_rfc3339(),
             "2030-03-13T10:24:29.685+00:00"
         );
+        assert!(matches!(status.profiles[0].expiry, Expiry::At(_)));
+    }
+
+    #[test]
+    fn test_an_api_token_has_no_deadline_this_machine_can_see() {
+        // No refresh token and no expiration_time: whatever expiry the token
+        // has was set in the dashboard and is not written here.
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        write(&home, NEW_PATH, "api_token = \"fake-fixture-api\"\n");
+        let status = WranglerProbe::new(Paths::for_test(&home)).status().unwrap();
+        assert_eq!(
+            status.profiles[0].expiry,
+            Expiry::unknown("in the Cloudflare dashboard")
+        );
+        assert!(status.profiles[0].expires_at().is_none());
     }
 
     #[test]
@@ -334,7 +363,28 @@ mod tests {
         let status = WranglerProbe::new(Paths::for_test(&home)).status().unwrap();
         assert!(status.installed);
         assert!(status.profiles.is_empty());
-        assert!(status.notes.iter().any(|n| n.contains("not valid TOML")));
+        assert!(status
+            .notes
+            .iter()
+            .any(|n| n.kind == NoteKind::Problem && n.text.contains("not valid TOML")));
+    }
+
+    #[test]
+    fn test_an_unparseable_expiration_time_is_a_problem() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        write(&home, NEW_PATH, &config("the thirteenth of never"));
+        let status = WranglerProbe::new(Paths::for_test(&home)).status().unwrap();
+        assert!(status.notes.iter().any(|n| n.kind == NoteKind::Problem
+            && n.text
+                .contains("expiration_time is present but could not be parsed")));
+        // Still refreshable, just with no access-token clock to report.
+        assert_eq!(
+            status.profiles[0].expiry,
+            Expiry::Refreshable {
+                access_token_expires: None
+            }
+        );
     }
 
     #[test]
@@ -344,7 +394,10 @@ mod tests {
         write(&home, NEW_PATH, "scopes = []\n");
         let status = WranglerProbe::new(Paths::for_test(&home)).status().unwrap();
         assert!(status.profiles.is_empty());
-        assert!(status.notes.iter().any(|n| n.contains("not logged in")));
+        assert!(status
+            .notes
+            .iter()
+            .any(|n| n.text.contains("not logged in")));
     }
 
     #[test]

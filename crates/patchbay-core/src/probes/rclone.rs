@@ -7,11 +7,15 @@
 //! friends.
 //!
 //! rclone has no "active remote": every command names its remote explicitly.
-//! `active` is therefore always `None` and switching is unsupported by design.
+//! `active` is therefore always `None` — recorded as
+//! [`crate::types::ActiveConcept::NotApplicable`] so the panel reads it as the
+//! answer rather than a gap — and switching is unsupported by design.
 
 use crate::paths::Paths;
 use crate::probe::{unsupported_switch, unsupported_verify, Probe};
-use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
+use crate::types::{
+    ActiveConcept, Expiry, PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome,
+};
 use crate::util::{parse_timestamp, read_text, Ini};
 
 pub struct RcloneProbe {
@@ -53,7 +57,8 @@ impl RcloneProbe {
     /// on the next command and writes the new one back to `rclone.conf`. For a
     /// remote with a refresh token that hourly `expiry` is not the login's, and
     /// showing it as one marks working remotes expired for as long as you
-    /// happen not to have used them.
+    /// happen not to have used them — which is exactly what
+    /// [`crate::types::Expiry::Refreshable`] exists to keep apart.
     fn token_state(raw: &str) -> Option<TokenState> {
         let json: serde_json::Value = serde_json::from_str(raw).ok()?;
         Some(TokenState {
@@ -132,45 +137,63 @@ impl Probe for RcloneProbe {
         let installed = self.paths.has_binary("rclone") || path.is_file();
         let mut status = ToolStatus::empty(Self::TOOL, installed);
         for note in self.paths.path_notes("rclone") {
-            status.note(note);
+            status.push_note(note);
         }
 
         let text = match read_text(&path) {
             Ok(Some(text)) => text,
             Ok(None) => return Ok(status),
             Err(e) => {
-                status.note(e);
+                status.problem(e);
                 return Ok(status);
             }
         };
 
         let ini = Ini::parse(&text);
         if ini.sections.is_empty() && !text.trim().is_empty() {
-            status.note("rclone.conf has no readable remote sections".to_string());
+            status.problem("rclone.conf has no readable remote sections");
         }
 
         let mut unparsed_tokens = Vec::new();
-        let mut refreshable_remotes = 0usize;
         for section in &ini.sections {
             let mut profile = Profile::new(&section.name);
+            // A remote with no token block is a static credential — an S3 key
+            // pair, an sftp password — and those do not expire on their own.
+            let mut expiry = Expiry::NoExpiry;
 
             if let Some(raw) = section.get("token") {
                 match Self::token_state(raw) {
                     Some(state) => {
-                        profile = profile
-                            .expires_at(state.expiry.filter(|_| !state.refreshable))
-                            .with_meta("refreshable", state.refreshable);
-                        refreshable_remotes += usize::from(state.refreshable);
+                        expiry = if state.refreshable {
+                            // rclone renews this itself on the next command and
+                            // writes the new one back; the blob's `expiry`
+                            // dates that access token, never the login.
+                            Expiry::Refreshable {
+                                access_token_expires: state.expiry,
+                            }
+                        } else {
+                            match state.expiry {
+                                Some(at) => Expiry::At(at),
+                                None => Expiry::unknown("nowhere in the stored token"),
+                            }
+                        };
+                        profile = profile.with_meta("refreshable", state.refreshable);
                     }
-                    None => unparsed_tokens.push(section.name.clone()),
+                    None => {
+                        expiry = Expiry::unknown("in a token blob patchbay could not parse");
+                        unparsed_tokens.push(section.name.clone());
+                    }
                 }
                 profile = profile.with_meta("auth", "oauth token");
             } else if section.get("service_account_file").is_some() {
                 profile = profile.with_meta("auth", "service account file");
             } else if section.get("type").map(|t| t == "alias") == Some(true) {
+                // Whatever the target remote's credential does, this one does.
+                expiry = Expiry::unknown("wherever the target remote keeps it");
                 profile = profile.with_meta("auth", "inherits from the target remote");
             }
 
+            profile = profile.expiry(expiry);
             for key in SAFE_KEYS {
                 if let Some(value) = section.get(key).filter(|v| !v.is_empty()) {
                     profile = profile.with_meta(key, value);
@@ -180,21 +203,14 @@ impl Probe for RcloneProbe {
         }
 
         if !unparsed_tokens.is_empty() {
-            status.note(format!(
+            status.problem(format!(
                 "could not read an expiry from the stored token of: {}",
                 unparsed_tokens.join(", ")
             ));
         }
-        if refreshable_remotes > 0 {
-            status.note(format!(
-                "{refreshable_remotes} remote(s) carry a refresh token, so rclone renews the access token itself and rewrites rclone.conf; the `expiry` in those blobs dates that access token, not the login, and is not reported as one"
-            ));
-        }
         if !status.profiles.is_empty() {
-            status.note(
-                "rclone has no active remote; every command names its remote explicitly"
-                    .to_string(),
-            );
+            status.active_concept =
+                ActiveConcept::not_applicable("every rclone command names its own remote");
         }
 
         Ok(status)
@@ -232,13 +248,19 @@ impl Probe for RcloneProbe {
         let mut any_invalid = false;
         for profile in &status.profiles {
             let outcome = self.verify_profile(&profile.id)?;
-            let (mark, detail) = match &outcome {
+            let (mark, detail): (&str, &str) = match &outcome {
                 VerifyOutcome::Valid { detail, .. } => ("ok", detail),
                 VerifyOutcome::Invalid { detail, .. } => {
                     any_invalid = true;
                     ("FAILED", detail)
                 }
                 VerifyOutcome::Unsupported { reason, .. } => ("skipped", reason),
+                // Unreachable: the exec switch is checked above, before any
+                // remote is looked at. Spelled out so the compiler keeps that
+                // invariant rather than a comment doing it.
+                VerifyOutcome::ExecDisabled { .. } => {
+                    ("skipped", "command execution is switched off")
+                }
             };
             lines.push(format!("{}: {mark} — {detail}", profile.id));
         }
@@ -354,6 +376,7 @@ impl Probe for RcloneProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::NoteKind;
     use std::fs;
     use std::path::PathBuf;
 
@@ -394,8 +417,9 @@ remote = work:Legal
         );
         let status = RcloneProbe::new(Paths::for_test(&home)).status().unwrap();
         assert_eq!(status.profiles[0].meta["refreshable"], false);
+        assert!(matches!(status.profiles[0].expiry, Expiry::At(_)));
         assert_eq!(
-            status.profiles[0].expires_at.unwrap().to_rfc3339(),
+            status.profiles[0].expires_at().unwrap().to_rfc3339(),
             "2030-05-01T04:00:00.123456789+00:00"
         );
     }
@@ -407,6 +431,10 @@ remote = work:Legal
         let ids: Vec<_> = status.profiles.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(ids, vec!["work", "archive", "legal"]);
         assert!(status.active.is_none());
+        assert_eq!(
+            status.active_concept,
+            ActiveConcept::not_applicable("every rclone command names its own remote")
+        );
 
         let work = &status.profiles[0];
         assert_eq!(work.meta["type"], "drive");
@@ -415,18 +443,32 @@ remote = work:Legal
         // Empty values are not carried through as noise.
         assert!(work.meta.get("team_drive").is_none());
         // A refresh token beside the expiry: rclone renews it and rewrites the
-        // config, so that timestamp is the access token's, not the login's.
+        // config, so that timestamp is the access token's, not the login's. The
+        // paragraph that used to explain this is now the state itself.
         assert_eq!(work.meta["refreshable"], true);
-        assert!(work.expires_at.is_none());
-        assert!(status
+        assert!(matches!(
+            work.expiry,
+            Expiry::Refreshable {
+                access_token_expires: Some(_)
+            }
+        ));
+        assert!(work.expires_at().is_none());
+        assert!(!status
             .notes
             .iter()
-            .any(|n| n.contains("renews the access token itself")));
+            .any(|n| n.text.contains("renews the access token itself")));
+
+        // A static S3 key pair has no clock at all.
+        assert_eq!(status.profiles[1].expiry, Expiry::NoExpiry);
 
         let legal = &status.profiles[2];
         assert_eq!(legal.meta["remote"], "work:Legal");
         assert_eq!(legal.meta["auth"], "inherits from the target remote");
-        assert!(legal.expires_at.is_none());
+        assert_eq!(
+            legal.expiry,
+            Expiry::unknown("wherever the target remote keeps it")
+        );
+        assert!(legal.expires_at().is_none());
     }
 
     #[test]
@@ -450,11 +492,15 @@ remote = work:Legal
         let (_dir, home) = fixture("[broken]\ntype = drive\ntoken = not-json-at-all\n");
         let status = RcloneProbe::new(Paths::for_test(&home)).status().unwrap();
         assert_eq!(status.profiles.len(), 1);
-        assert!(status.profiles[0].expires_at.is_none());
+        assert_eq!(
+            status.profiles[0].expiry,
+            Expiry::unknown("in a token blob patchbay could not parse")
+        );
+        assert!(status.profiles[0].expires_at().is_none());
         assert!(status
             .notes
             .iter()
-            .any(|n| n.contains("could not read an expiry")));
+            .any(|n| n.kind == NoteKind::Problem && n.text.contains("could not read an expiry")));
     }
 
     #[test]
@@ -470,10 +516,13 @@ remote = work:Legal
         let (_dir, home) = fixture("garbage with no sections\n");
         let status = RcloneProbe::new(Paths::for_test(&home)).status().unwrap();
         assert!(status.profiles.is_empty());
-        assert!(status
-            .notes
-            .iter()
-            .any(|n| n.contains("no readable remote sections")));
+        assert!(
+            status
+                .notes
+                .iter()
+                .any(|n| n.kind == NoteKind::Problem
+                    && n.text.contains("no readable remote sections"))
+        );
     }
 
     // --- verification, through the scripted exec seam ----------------------

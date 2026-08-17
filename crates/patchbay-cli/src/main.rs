@@ -332,10 +332,14 @@ fn styles() -> Styles {
     Styles::detect()
 }
 
-/// `Unsupported` is information, not failure — it still exits 0.
+/// `Unsupported` is information, not failure — it still exits 0. So is
+/// `ExecDisabled`: nothing was attempted, and that is this patchbay's own
+/// configuration rather than anything wrong with the user's login.
 fn switch_exit_code(outcome: &SwitchOutcome) -> i32 {
     match outcome {
-        SwitchOutcome::Switched { .. } | SwitchOutcome::Unsupported { .. } => 0,
+        SwitchOutcome::Switched { .. }
+        | SwitchOutcome::Unsupported { .. }
+        | SwitchOutcome::ExecDisabled { .. } => 0,
         SwitchOutcome::UnknownProfile { .. } | SwitchOutcome::Failed { .. } => 1,
     }
 }
@@ -362,6 +366,14 @@ fn print_switch(outcome: &SwitchOutcome) {
         SwitchOutcome::Unsupported { tool, reason, hint } => {
             println!("{tool}: cannot switch automatically");
             println!("  {reason}");
+            if let Some(hint) = hint {
+                println!("  run: {hint}");
+            }
+        }
+        // One line: this says nothing about the tool, only about how this
+        // patchbay was started. The hint goes on the usual hint line.
+        SwitchOutcome::ExecDisabled { tool, hint } => {
+            println!("{tool}: command execution is disabled in this context");
             if let Some(hint) = hint {
                 println!("  run: {hint}");
             }
@@ -405,6 +417,12 @@ fn print_verify(outcome: &VerifyOutcome) {
         VerifyOutcome::Unsupported { tool, reason, hint } => {
             println!("{tool}: cannot verify");
             println!("  {reason}");
+            if let Some(hint) = hint {
+                println!("  run: {hint}");
+            }
+        }
+        VerifyOutcome::ExecDisabled { tool, hint } => {
+            println!("{tool}: command execution is disabled in this context");
             if let Some(hint) = hint {
                 println!("  run: {hint}");
             }
@@ -465,7 +483,7 @@ fn print_perms(report: &PermissionsReport) {
     }
 
     if !notes.is_empty() {
-        println!("{}", render::indent_lines(notes));
+        println!("{}", render::indent_notes(notes, &styles()));
     }
     // Labelled so it cannot be mistaken for another note.
     if let Some(hint) = hint {

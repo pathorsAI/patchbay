@@ -131,7 +131,7 @@ impl Registry {
             .map(|p| {
                 let mut status = p.status().unwrap_or_else(|e| {
                     let mut status = ToolStatus::empty(p.tool(), false);
-                    status.note(format!("probe failed: {e}"));
+                    status.problem(format!("probe failed: {e}"));
                     status
                 });
                 linked.attach(&mut status);
@@ -148,7 +148,9 @@ impl Registry {
         // complaint about that tool.
         if let Some(first) = all.first_mut() {
             for warning in self.paths.config_warnings() {
-                first.note(warning.clone());
+                // patchbay's own config is broken; overrides the user asked
+                // for are silently not in force.
+                first.problem(warning.clone());
             }
         }
         all
@@ -311,11 +313,11 @@ impl LinkedKeys {
             // What the link does not mean. The probe cannot say this: it never
             // sees the vault.
             if let Some(note) = crate::keys::key_link_note(&status.tool, refs.len()) {
-                status.note(note);
+                status.push_note(note);
             }
         }
         if let Some(note) = &self.note {
-            status.note(note.clone());
+            status.problem(note.clone());
         }
     }
 }
@@ -427,13 +429,17 @@ mod tests {
         let note = wrangler
             .notes
             .iter()
-            .find(|n| n.contains("different credential"))
+            .find(|n| n.text.contains("different credential"))
             .unwrap_or_else(|| panic!("no caveat on the wrangler row: {:?}", wrangler.notes));
-        assert!(note.contains("wrangler logout"), "{note}");
-        assert!(note.contains("pb key verify"), "{note}");
+        // A second credential with wider reach than the one on the row is a
+        // real risk, not a footnote.
+        assert_eq!(note.kind, crate::types::NoteKind::Warn);
+        assert!(note.text.contains("wrangler logout"), "{note:?}");
+        assert!(note.text.contains("pb key verify"), "{note:?}");
         assert!(
-            note.starts_with("1 standalone Cloudflare API token is"),
-            "{note}"
+            note.text
+                .starts_with("1 standalone Cloudflare API token is"),
+            "{note:?}"
         );
 
         // Singular and plural both read correctly.
@@ -445,14 +451,17 @@ mod tests {
             wrangler
                 .notes
                 .iter()
-                .any(|n| n.starts_with("2 standalone Cloudflare API tokens are")),
+                .any(|n| n.text.starts_with("2 standalone Cloudflare API tokens are")),
             "{:?}",
             wrangler.notes
         );
 
         // A tool with no registered keys gains no note.
         let gh = board.iter().find(|s| s.tool == "gh").unwrap();
-        assert!(!gh.notes.iter().any(|n| n.contains("different credential")));
+        assert!(!gh
+            .notes
+            .iter()
+            .any(|n| n.text.contains("different credential")));
     }
 
     #[test]
@@ -480,7 +489,10 @@ mod tests {
         let registry = Registry::all(Paths::for_test(dir.path()));
         for status in registry.status_all() {
             assert!(status.registered_keys.is_empty(), "{}", status.tool);
-            assert!(status.notes.iter().all(|n| !n.contains("registered keys")));
+            assert!(status
+                .notes
+                .iter()
+                .all(|n| !n.text.contains("registered keys")));
         }
     }
 
@@ -501,7 +513,8 @@ mod tests {
                 status
                     .notes
                     .iter()
-                    .any(|n| n.contains("registered keys unavailable")),
+                    .any(|n| n.kind == crate::types::NoteKind::Problem
+                        && n.text.contains("registered keys unavailable")),
                 "{} lost the explanation",
                 status.tool
             );
@@ -547,11 +560,12 @@ mod tests {
         assert!(all[0]
             .notes
             .iter()
-            .any(|n| n.contains("patchbay config: unknown key `not_a_tool`")));
+            .any(|n| n.kind == crate::types::NoteKind::Problem
+                && n.text.contains("patchbay config: unknown key `not_a_tool`")));
         // Once, not once per tool.
         let carriers = all
             .iter()
-            .filter(|s| s.notes.iter().any(|n| n.contains("unknown key")))
+            .filter(|s| s.notes.iter().any(|n| n.text.contains("unknown key")))
             .count();
         assert_eq!(carriers, 1);
     }

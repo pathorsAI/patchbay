@@ -11,25 +11,31 @@
 //!
 //! Profiles are configurations.
 //!
-//! **Expiry is deliberately unknown.** `access_tokens.db` is right there and it
-//! has a `token_expiry` column, so it looks like the answer — it is not. That
+//! **Expiry is [`Expiry::Refreshable`].** `access_tokens.db` is right there and
+//! it has a `token_expiry` column, so it looks like the answer — it is not. That
 //! column dates a one-hour OAuth access token that gcloud refreshes silently on
 //! the next call, so reading it as the profile's expiry marks a perfectly good
 //! login "expired 3d" the moment you stop using it, and a login you made *this
 //! second* is already inside the board's 24h attention window. What actually
 //! ends a gcloud session is the refresh token being revoked or an org
-//! reauthentication policy firing, and neither is written to this machine.
-//! So `expires_at` stays `None` — unknown, as it genuinely is — and
-//! [`Probe::verify_profile`] is what answers "does this still work?".
+//! reauthentication policy firing, and neither is written to this machine. So a
+//! gcloud login has no deadline a human has to meet — which is precisely what
+//! `Refreshable` states — and [`Probe::verify_profile`] is what answers "does
+//! this still work?".
+//!
+//! `access_token_expires` stays `None`: this probe never opens
+//! `access_tokens.db`, and that hourly clock is a debugging aid, never a login
+//! expiry.
 
 use std::path::Path;
 
 use rusqlite::{Connection, OpenFlags};
 
 use crate::paths::Paths;
-use crate::probe::{unknown_profile, unsupported_switch, unsupported_verify, Probe};
+use crate::probe::{exec_disabled_switch, unknown_profile, unsupported_verify, Probe};
 use crate::types::{
-    PermissionScope, PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome,
+    Expiry, Note, PermissionScope, PermissionsReport, Profile, SwitchOutcome, ToolStatus,
+    VerifyOutcome,
 };
 use crate::util::{read_text, CmdOutput, Ini};
 
@@ -65,7 +71,7 @@ impl GcloudProbe {
 
     /// Accounts with stored credentials. Only `account_id` is ever read — the
     /// `value` blob holds the actual refresh token and is never touched.
-    fn credentialed_accounts(dir: &Path, notes: &mut Vec<String>) -> Vec<String> {
+    fn credentialed_accounts(dir: &Path, notes: &mut Vec<Note>) -> Vec<String> {
         let path = dir.join("credentials.db");
         if !path.is_file() {
             return Vec::new();
@@ -73,7 +79,9 @@ impl GcloudProbe {
         match read_key_column(&path, "credentials", "account_id") {
             Ok(rows) => rows,
             Err(e) => {
-                notes.push(format!("could not read credentials.db ({e})"));
+                notes.push(Note::problem(format!(
+                    "could not read credentials.db ({e})"
+                )));
                 Vec::new()
             }
         }
@@ -127,7 +135,7 @@ impl GcloudProbe {
         Ok((meta("account"), meta("project")))
     }
 
-    fn read_adc(&self, notes: &mut Vec<String>) -> Option<Adc> {
+    fn read_adc(&self, notes: &mut Vec<Note>) -> Option<Adc> {
         let path = self
             .paths
             .gcloud_dir()
@@ -154,10 +162,9 @@ impl GcloudProbe {
                         .map(str::to_string),
                 }),
                 Err(_) => {
-                    notes.push(
-                        "application_default_credentials.json exists but is not valid JSON"
-                            .to_string(),
-                    );
+                    notes.push(Note::problem(
+                        "application_default_credentials.json exists but is not valid JSON",
+                    ));
                     Some(Adc {
                         account: None,
                         quota_project: None,
@@ -166,7 +173,7 @@ impl GcloudProbe {
             },
             Ok(None) => None,
             Err(e) => {
-                notes.push(e);
+                notes.push(Note::problem(e));
                 Some(Adc {
                     account: None,
                     quota_project: None,
@@ -186,7 +193,7 @@ impl Probe for GcloudProbe {
         let installed = self.paths.has_binary("gcloud") || dir.is_dir();
         let mut status = ToolStatus::empty(Self::TOOL, installed);
         for note in self.paths.path_notes("gcloud") {
-            status.note(note);
+            status.push_note(note);
         }
 
         let active = match read_text(&dir.join("active_config")) {
@@ -196,7 +203,7 @@ impl Probe for GcloudProbe {
             }
             Ok(None) => None,
             Err(e) => {
-                status.note(e);
+                status.problem(e);
                 None
             }
         };
@@ -221,7 +228,7 @@ impl Probe for GcloudProbe {
                     Ok(Some(text)) => text,
                     Ok(None) => continue,
                     Err(e) => {
-                        status.note(e);
+                        status.problem(e);
                         continue;
                     }
                 };
@@ -233,10 +240,13 @@ impl Probe for GcloudProbe {
                     used_accounts.push(account.clone());
                 }
 
-                // No `.expires_at(...)`: see the module header. gcloud writes no
-                // date this machine can read that means "the login stopped
-                // working".
+                // `Refreshable` with no access-token clock: see the module
+                // header. gcloud writes no date this machine can read that
+                // means "the login stopped working".
                 let profile = Profile::new(name)
+                    .expiry(Expiry::Refreshable {
+                        access_token_expires: None,
+                    })
                     .with_meta("account", account.clone())
                     .with_meta("project", core.and_then(|s| s.get("project")))
                     .with_meta("region", compute.and_then(|s| s.get("region")))
@@ -251,18 +261,9 @@ impl Probe for GcloudProbe {
             }
         }
 
-        // Say why every row reads "no expiry" — otherwise the honest answer
-        // looks like a probe that forgot to fill the field in.
-        if !status.profiles.is_empty() {
-            status.note(
-                "gcloud records no expiry for a login: the token cache in access_tokens.db holds a one-hour access token that refreshes silently, and revocation or an org reauthentication policy is decided server-side — verify a profile to find out whether it still works"
-                    .to_string(),
-            );
-        }
-
         if let Some(active) = &active {
             if !status.profiles.iter().any(|p| &p.id == active) {
-                status.note(format!(
+                status.problem(format!(
                     "active_config names `{active}` but there is no configurations/config_{active}"
                 ));
             }
@@ -276,7 +277,7 @@ impl Probe for GcloudProbe {
                         .get("account")
                         .and_then(|v| v.as_str())
                         .unwrap_or("?");
-                    status.note(format!(
+                    status.problem(format!(
                         "active configuration `{active}` uses account {account}, which has no stored credentials (run `gcloud auth login {account}`)"
                     ));
                 }
@@ -291,7 +292,7 @@ impl Probe for GcloudProbe {
             .filter(|a| !used_accounts.contains(a))
             .collect();
         if !unused.is_empty() {
-            status.note(format!(
+            status.info(format!(
                 "credentialed accounts not used by any configuration: {}",
                 unused
                     .iter()
@@ -315,7 +316,7 @@ impl Probe for GcloudProbe {
             note.push_str(
                 "; ADC is separate from the active configuration and does NOT follow `gcloud config configurations activate` — client libraries and Terraform keep using it until you run `gcloud auth application-default login`",
             );
-            status.note(note);
+            status.warn(note);
 
             if let (Some(adc_account), Some(active)) = (&adc.account, &status.active) {
                 let config_account = status
@@ -326,7 +327,7 @@ impl Probe for GcloudProbe {
                     .and_then(|v| v.as_str());
                 if let Some(config_account) = config_account {
                     if config_account != adc_account {
-                        status.note(format!(
+                        status.warn(format!(
                             "ADC mismatch: configuration `{active}` uses {config_account} but ADC is {adc_account}"
                         ));
                     }
@@ -343,9 +344,8 @@ impl Probe for GcloudProbe {
             return Ok(unknown_profile(Self::TOOL, profile_id, &status));
         }
         if !self.paths.may_exec() {
-            return Ok(unsupported_switch(
+            return Ok(exec_disabled_switch(
                 Self::TOOL,
-                "command execution is disabled for this probe",
                 Some(&format!(
                     "gcloud config configurations activate {profile_id}"
                 )),
@@ -370,7 +370,7 @@ impl Probe for GcloudProbe {
         ];
         if let Ok(after) = self.status() {
             notes.extend(
-                after.notes.into_iter().filter(|n| {
+                after.notes.into_iter().map(|n| n.text).filter(|n| {
                     n.starts_with("ADC mismatch") || n.contains("no stored credentials")
                 }),
             );
@@ -612,9 +612,9 @@ impl Probe for GcloudProbe {
                 supported: false,
                 subject: Some(account),
                 scopes: Vec::new(),
-                notes: vec![format!(
+                notes: vec![Note::problem(format!(
                     "could not read the IAM policy of {scope_id} — {detail}"
-                )],
+                ))],
                 hint: None,
                 scope: Some(scope_id.to_string()),
             });
@@ -632,9 +632,9 @@ impl Probe for GcloudProbe {
                     supported: false,
                     subject: Some(account),
                     scopes: Vec::new(),
-                    notes: vec![format!(
+                    notes: vec![Note::problem(format!(
                         "gcloud returned something that is not the IAM policy JSON patchbay expects ({e})"
-                    )],
+                    ))],
                     hint: None,
                     scope: Some(scope_id.to_string()),
                 });
@@ -643,12 +643,14 @@ impl Probe for GcloudProbe {
         roles.sort();
         roles.dedup();
 
-        let mut notes =
-            vec!["project-level bindings only; org/folder inheritance not shown".to_string()];
+        // Both of these describe how IAM reads, not something to act on.
+        let mut notes = vec![Note::info(
+            "project-level bindings only; org/folder inheritance not shown",
+        )];
         if roles.is_empty() {
-            notes.push(format!(
+            notes.push(Note::info(format!(
                 "{account} holds no role granted directly on {scope_id} — it may still reach it through a role inherited from the organisation or folder, or through a group"
-            ));
+            )));
         }
         Ok(PermissionsReport {
             tool: Self::TOOL.to_string(),
@@ -825,8 +827,29 @@ fn read_key_column(path: &Path, table: &str, key_column: &str) -> rusqlite::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::NoteKind;
     use std::fs;
     use std::path::PathBuf;
+
+    /// Every note's text on one blob, for `contains` assertions.
+    fn note_text(status: &ToolStatus) -> String {
+        status
+            .notes
+            .iter()
+            .map(|n| n.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The kind recorded for the one note containing `needle`.
+    fn kind_of(status: &ToolStatus, needle: &str) -> NoteKind {
+        status
+            .notes
+            .iter()
+            .find(|n| n.text.contains(needle))
+            .unwrap_or_else(|| panic!("no note containing {needle:?}: {:?}", status.notes))
+            .kind
+    }
 
     /// Builds a fake `~/.config/gcloud`. All credential material in fixtures is
     /// invented — no real token ever appears in this repository.
@@ -943,16 +966,21 @@ mod tests {
 
         let status = fx.probe().status().unwrap();
         let work = status.profiles.iter().find(|p| p.id == "work").unwrap();
-        assert!(work.expires_at.is_none());
+        // The state itself says "silently renewed", and carries no hourly clock
+        // because this probe never opens access_tokens.db.
+        assert_eq!(
+            work.expiry,
+            Expiry::Refreshable {
+                access_token_expires: None
+            }
+        );
+        assert!(work.expires_at().is_none());
         assert_eq!(
             status.connection_state(),
             crate::types::ConnectionState::Connected
         );
-        assert!(
-            status.notes.iter().any(|n| n.contains("records no expiry")),
-            "{:?}",
-            status.notes
-        );
+        // …and it says so as a type, not as a paragraph of prose in `notes`.
+        assert!(!note_text(&status).contains("expiry"), "{:?}", status.notes);
     }
 
     #[test]
@@ -967,11 +995,15 @@ mod tests {
         .unwrap();
 
         let status = fx.probe().status().unwrap();
-        let notes = status.notes.join("\n");
+        let notes = note_text(&status);
         assert!(notes.contains("ADC"), "{notes}");
         assert!(notes.contains("proj-q"), "{notes}");
         assert!(notes.contains("does NOT follow"), "{notes}");
         assert!(notes.contains("ADC mismatch"), "{notes}");
+        // A second credential quietly ignoring the switch is a surprise, not a
+        // breakage: amber, never red.
+        assert_eq!(kind_of(&status, "does NOT follow"), NoteKind::Warn);
+        assert_eq!(kind_of(&status, "ADC mismatch"), NoteKind::Warn);
         // Never leak the credential itself.
         assert!(!notes.contains("fake-fixture-value"), "{notes}");
     }
@@ -990,7 +1022,7 @@ mod tests {
         .unwrap();
 
         let status = fx.probe().status().unwrap();
-        let notes = status.notes.join("\n");
+        let notes = note_text(&status);
         assert!(notes.contains("(ADC) exist;"), "{notes}");
         assert!(!notes.contains("ADC mismatch"), "{notes}");
         assert!(!notes.contains("exist for "), "{notes}");
@@ -1017,9 +1049,16 @@ mod tests {
 
         let status = fx.probe().status().unwrap();
         assert_eq!(status.active.as_deref(), Some("ghost"));
-        let notes = status.notes.join("\n");
+        let notes = note_text(&status);
         assert!(notes.contains("no configurations/config_ghost"), "{notes}");
         assert!(notes.contains("credentials.db"), "{notes}");
+        // A dangling active_config and an unreadable credential store are both
+        // things that are already broken.
+        assert_eq!(
+            kind_of(&status, "no configurations/config_ghost"),
+            NoteKind::Problem
+        );
+        assert_eq!(kind_of(&status, "credentials.db"), NoteKind::Problem);
         // The unparseable config still shows up, just with no metadata.
         let broken = status.profiles.iter().find(|p| p.id == "broken").unwrap();
         assert!(broken.meta.get("account").is_none());
@@ -1052,9 +1091,16 @@ mod tests {
             .credentials_db(&["someone@example.com"]);
 
         let status = fx.probe().status().unwrap();
-        let notes = status.notes.join("\n");
+        let notes = note_text(&status);
         assert!(notes.contains("no stored credentials"), "{notes}");
         assert!(notes.contains("not used by any configuration"), "{notes}");
+        // The active account being uncredentialed breaks every call; the spare
+        // credential nobody points at is a fact about the machine, not a fault.
+        assert_eq!(kind_of(&status, "no stored credentials"), NoteKind::Problem);
+        assert_eq!(
+            kind_of(&status, "not used by any configuration"),
+            NoteKind::Info
+        );
     }
 
     /// A fixture with two configurations and one of them active — the shape the
@@ -1292,7 +1338,7 @@ mod tests {
         // The panel operates the tool; it does not hand out a line to paste.
         assert_eq!(report.hint, None);
         assert!(
-            report.notes.iter().any(|n| n.contains("org/folder")),
+            report.notes.iter().any(|n| n.text.contains("org/folder")),
             "{:?}",
             report.notes
         );
@@ -1364,7 +1410,10 @@ mod tests {
         assert!(report.supported);
         assert!(report.scopes.is_empty());
         assert!(
-            report.notes.iter().any(|n| n.contains("no role granted")),
+            report
+                .notes
+                .iter()
+                .any(|n| n.text.contains("no role granted")),
             "{:?}",
             report.notes
         );
@@ -1385,7 +1434,12 @@ mod tests {
         assert!(!report.supported);
         assert_eq!(report.scope.as_deref(), Some("proj-b"));
         assert!(report.scopes.is_empty());
-        let notes = report.notes.join("\n");
+        let notes = report
+            .notes
+            .iter()
+            .map(|n| n.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(notes.contains("proj-b"), "{notes}");
         assert!(notes.contains("does not have permission"), "{notes}");
         // gcloud's own `ERROR: (command)` prefix only repeats what we ran.
@@ -1406,7 +1460,12 @@ mod tests {
         ));
 
         let report = probe_with(&fx, exec).permissions_in("proj-b").unwrap();
-        let notes = report.notes.join("\n");
+        let notes = report
+            .notes
+            .iter()
+            .map(|n| n.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert_eq!(notes.lines().count(), 1, "{notes}");
         assert!(notes.contains("proj-b"), "{notes}");
         assert!(notes.contains("gcloud auth login b@example.com"), "{notes}");
@@ -1440,7 +1499,10 @@ mod tests {
         let report = probe_with(&fx, exec.clone()).permissions().unwrap();
         assert!(!report.supported);
         assert!(
-            report.notes.iter().any(|n| n.contains("pick a project")),
+            report
+                .notes
+                .iter()
+                .any(|n| n.text.contains("pick a project")),
             "{:?}",
             report.notes
         );
@@ -1458,6 +1520,24 @@ mod tests {
                 assert_eq!(available, vec!["work".to_string()]);
             }
             other => panic!("expected UnknownProfile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_execution_being_switched_off_is_not_a_reason_gcloud_cannot_switch() {
+        // patchbay's own configuration, so it is its own outcome — never an
+        // `Unsupported` reason string blamed on the tool.
+        let fx = Fixture::new();
+        fx.config("work", "[core]\naccount = b@example.com\n");
+        match fx.probe().switch("work").unwrap() {
+            SwitchOutcome::ExecDisabled { tool, hint } => {
+                assert_eq!(tool, "gcloud");
+                assert_eq!(
+                    hint.as_deref(),
+                    Some("gcloud config configurations activate work")
+                );
+            }
+            other => panic!("expected ExecDisabled, got {other:?}"),
         }
     }
 }

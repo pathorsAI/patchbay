@@ -30,7 +30,14 @@ use serde::Deserialize;
 
 use crate::paths::Paths;
 use crate::probe::{unsupported_switch, Probe};
-use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
+use crate::types::{
+    ActiveConcept, Expiry, PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome,
+};
+
+/// Where an `op` session's deadline lives — which is to say, not on disk. The
+/// CLI holds a 30-minute idle timer in the session itself, so patchbay can
+/// only report that there is one, never when it lands.
+const SESSION_EXPIRY: &str = "in a 30-minute idle session, never written to disk";
 use crate::util::read_text;
 
 pub struct OpProbe {
@@ -77,7 +84,7 @@ impl Probe for OpProbe {
         let installed = self.paths.has_binary("op") || path.is_some();
         let mut status = ToolStatus::empty(Self::TOOL, installed);
         for note in self.paths.path_notes("op") {
-            status.note(note);
+            status.push_note(note);
         }
 
         if !installed {
@@ -85,10 +92,9 @@ impl Probe for OpProbe {
         }
 
         let Some(path) = path else {
-            status.note(
+            status.info(
                 "no op config file in any of the documented locations; with the desktop app \
-                 integration that is normal — the account list then lives in the 1Password app"
-                    .to_string(),
+                 integration that is normal — the account list then lives in the 1Password app",
             );
             return Ok(status);
         };
@@ -97,7 +103,7 @@ impl Probe for OpProbe {
             Ok(Some(text)) => text,
             Ok(None) => return Ok(status),
             Err(e) => {
-                status.note(e);
+                status.problem(e);
                 return Ok(status);
             }
         };
@@ -105,7 +111,7 @@ impl Probe for OpProbe {
         let config: Config = match serde_json::from_str(&text) {
             Ok(config) => config,
             Err(e) => {
-                status.note(format!("{} is not valid JSON ({e})", path.display()));
+                status.problem(format!("{} is not valid JSON ({e})", path.display()));
                 return Ok(status);
             }
         };
@@ -125,6 +131,7 @@ impl Probe for OpProbe {
                         (None, Some(url)) => url.clone(),
                         (None, None) => id.clone(),
                     })
+                    .expiry(Expiry::unknown(SESSION_EXPIRY))
                     .with_meta("email", account.email.clone())
                     .with_meta("url", account.url.clone())
                     .with_meta("account_uuid", account.account_uuid.clone()),
@@ -132,7 +139,7 @@ impl Probe for OpProbe {
         }
 
         if status.profiles.is_empty() {
-            status.note(format!(
+            status.info(format!(
                 "{} lists no accounts; with biometric unlock the roster comes from the desktop \
                  app instead, so this is not proof that op is signed out",
                 path.display()
@@ -140,21 +147,17 @@ impl Probe for OpProbe {
             return Ok(status);
         }
 
-        // `latest_signin` is the closest thing to an active account.
+        // `latest_signin` is the closest thing to an active account — and it is
+        // only the last one used, not a selection, which is what the
+        // not-applicable concept below says.
         if let Some(latest) = config.latest_signin {
             if status.profiles.iter().any(|p| p.id == latest) {
                 status.active = Some(latest);
             }
         }
-        status.note(
-            "`latest_signin` records the last account signed in to, not a permanent selection; \
-             every command can override it with --account"
-                .to_string(),
-        );
-        status.note(
-            "op sessions expire after 30 minutes of inactivity and that deadline is not written \
-             to disk, so expiry is unknown here; use `pb verify op`"
-                .to_string(),
+        status.active_concept = ActiveConcept::not_applicable(
+            "`latest_signin` is the last account used, and any command can name another with \
+             --account",
         );
 
         Ok(status)
@@ -207,6 +210,7 @@ impl Probe for OpProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::NoteKind;
     use std::fs;
     use std::path::Path;
 
@@ -239,8 +243,16 @@ mod tests {
             status.profiles[0].label,
             "dev@example.com @ https://my.1password.com"
         );
-        assert!(status.profiles[0].expires_at.is_none());
-        assert!(status.notes.iter().any(|n| n.contains("30 minutes")));
+        // The 30-minute idle window is the expiry state now, not a paragraph.
+        assert_eq!(status.profiles[0].expiry, Expiry::unknown(SESSION_EXPIRY));
+        assert!(status.profiles[0].expires_at().is_none());
+        assert!(!status.notes.iter().any(|n| n.text.contains("30 minutes")));
+        // Likewise the "not a permanent selection" note.
+        assert!(status.active_concept.is_not_applicable());
+        assert!(!status
+            .notes
+            .iter()
+            .any(|n| n.text.contains("latest_signin")));
 
         // The undocumented device id is not something patchbay passes on.
         let json = serde_json::to_string(&status).unwrap();
@@ -272,10 +284,9 @@ mod tests {
         let status = OpProbe::new(Paths::for_test(dir.path())).status().unwrap();
         assert!(status.installed);
         assert!(status.profiles.is_empty());
-        assert!(status
-            .notes
-            .iter()
-            .any(|n| n.contains("not proof that op is signed out")));
+        assert!(status.notes.iter().any(
+            |n| n.kind == NoteKind::Info && n.text.contains("not proof that op is signed out")
+        ));
     }
 
     #[test]
@@ -290,7 +301,10 @@ mod tests {
         write(dir.path(), ".config/op/config", "{ \"accounts\": ");
         let status = OpProbe::new(Paths::for_test(dir.path())).status().unwrap();
         assert!(status.installed);
-        assert!(status.notes.iter().any(|n| n.contains("not valid JSON")));
+        assert!(status
+            .notes
+            .iter()
+            .any(|n| n.kind == NoteKind::Problem && n.text.contains("not valid JSON")));
     }
 
     #[test]
@@ -303,6 +317,9 @@ mod tests {
             Paths::for_test(dir.path()).with_env("OP_CONFIG_DIR", elsewhere.to_str().unwrap());
         let status = OpProbe::new(paths).status().unwrap();
         assert_eq!(status.profiles.len(), 2);
-        assert!(status.notes.iter().any(|n| n.contains("$OP_CONFIG_DIR=")));
+        assert!(status
+            .notes
+            .iter()
+            .any(|n| n.text.contains("$OP_CONFIG_DIR=")));
     }
 }

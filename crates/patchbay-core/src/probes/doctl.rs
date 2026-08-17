@@ -30,7 +30,7 @@ use serde::Deserialize;
 
 use crate::paths::Paths;
 use crate::probe::{unknown_profile, unsupported_switch, unsupported_verify, Probe};
-use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
+use crate::types::{Expiry, PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
 use crate::util::read_text;
 
 pub struct DoctlProbe {
@@ -73,14 +73,14 @@ impl Probe for DoctlProbe {
         let installed = self.paths.has_binary("doctl") || path.is_file();
         let mut status = ToolStatus::empty(Self::TOOL, installed);
         for note in self.paths.path_notes("doctl") {
-            status.note(note);
+            status.push_note(note);
         }
 
         let text = match read_text(&path) {
             Ok(Some(text)) => text,
             Ok(None) => return Ok(status),
             Err(e) => {
-                status.note(e);
+                status.problem(e);
                 return Ok(status);
             }
         };
@@ -88,7 +88,7 @@ impl Probe for DoctlProbe {
         let config: Config = match serde_yaml_ng::from_str(&text) {
             Ok(config) => config,
             Err(e) => {
-                status.note(format!("doctl config.yaml is not valid YAML ({e})"));
+                status.problem(format!("doctl config.yaml is not valid YAML ({e})"));
                 return Ok(status);
             }
         };
@@ -99,6 +99,9 @@ impl Probe for DoctlProbe {
             status.profiles.push(
                 Profile::new(Self::DEFAULT_CONTEXT)
                     .label("default context")
+                    // DigitalOcean personal access tokens are dateless: they
+                    // live until someone revokes them.
+                    .expiry(Expiry::NoExpiry)
                     .with_meta("token_storage", "config.yaml (top-level access-token)")
                     .with_meta("api_url", config.api_url.clone().filter(|u| !u.is_empty())),
             );
@@ -109,6 +112,7 @@ impl Probe for DoctlProbe {
             }
             status.profiles.push(
                 Profile::new(name.as_str())
+                    .expiry(Expiry::NoExpiry)
                     .with_meta("token_storage", "config.yaml (auth-contexts)")
                     .with_meta("api_url", config.api_url.clone().filter(|u| !u.is_empty())),
             );
@@ -116,7 +120,7 @@ impl Probe for DoctlProbe {
 
         if status.profiles.is_empty() {
             if !text.trim().is_empty() {
-                status.note("doctl config.yaml holds no access token".to_string());
+                status.info("doctl config.yaml holds no access token");
             }
             return Ok(status);
         }
@@ -127,31 +131,27 @@ impl Probe for DoctlProbe {
             .map(|c| c.to_lowercase())
             .unwrap_or_else(|| Self::DEFAULT_CONTEXT.to_string());
         if let Some(context) = self.paths.env("DIGITALOCEAN_CONTEXT") {
-            status.note(format!(
+            status.warn(format!(
                 "DIGITALOCEAN_CONTEXT={context} is set and overrides the context recorded in the \
                  file"
             ));
         }
         if self.paths.env("DIGITALOCEAN_ACCESS_TOKEN").is_some() {
-            status.note(
+            status.warn(
                 "DIGITALOCEAN_ACCESS_TOKEN is set in the environment and takes precedence over \
-                 every stored context"
-                    .to_string(),
+                 every stored context",
             );
         }
         if status.profiles.iter().any(|p| p.id == active) {
             status.active = Some(active);
         } else {
-            status.note(format!(
+            // A pointer at a context that is not here: doctl will fail.
+            status.problem(format!(
                 "the recorded context `{active}` has no token in this file"
             ));
         }
 
-        status.note(
-            "doctl keeps its tokens in plain text in config.yaml and records no expiry; a token \
-             may still have been revoked at DigitalOcean"
-                .to_string(),
-        );
+        status.warn("doctl keeps its tokens in plain text in config.yaml");
 
         Ok(status)
     }
@@ -191,6 +191,7 @@ impl Probe for DoctlProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::NoteKind;
     use std::fs;
     use std::path::PathBuf;
 
@@ -221,7 +222,10 @@ mod tests {
         // `default` is not in the map, and would be missed by a naive probe.
         assert_eq!(ids, vec!["default", "cerana", "pathors-team"]);
         assert_eq!(status.active.as_deref(), Some("pathors-team"));
-        assert!(status.profiles.iter().all(|p| p.expires_at.is_none()));
+        // Dateless by design, which is a different claim from "we don't know".
+        assert!(status.profiles.iter().all(|p| p.expiry == Expiry::NoExpiry));
+        // The expiry explanation now lives in the type, not in a note.
+        assert!(!status.notes.iter().any(|n| n.text.contains("no expiry")));
 
         let json = serde_json::to_string(&status).unwrap();
         for secret in [
@@ -248,14 +252,14 @@ mod tests {
             .with_env("DIGITALOCEAN_CONTEXT", "other")
             .with_env("DIGITALOCEAN_ACCESS_TOKEN", "dop_v1_fakefixtureenv");
         let status = DoctlProbe::new(paths).status().unwrap();
-        assert!(status
-            .notes
-            .iter()
-            .any(|n| n.contains("DIGITALOCEAN_CONTEXT=other")));
-        assert!(status
-            .notes
-            .iter()
-            .any(|n| n.contains("DIGITALOCEAN_ACCESS_TOKEN")));
+        for text in ["DIGITALOCEAN_CONTEXT=other", "DIGITALOCEAN_ACCESS_TOKEN"] {
+            let note = status
+                .notes
+                .iter()
+                .find(|n| n.text.contains(text))
+                .unwrap_or_else(|| panic!("no note about {text}"));
+            assert_eq!(note.kind, NoteKind::Warn, "{text}");
+        }
         let json = serde_json::to_string(&status).unwrap();
         assert!(!json.contains("dop_v1_fakefixtureenv"), "{json}");
     }
@@ -265,10 +269,13 @@ mod tests {
         let (_dir, home) = fixture("context: ghost\naccess-token: dop_v1_fakefixture\n");
         let status = DoctlProbe::new(Paths::for_test(&home)).status().unwrap();
         assert!(status.active.is_none());
-        assert!(status
+        // A dangling context pointer is broken configuration.
+        let dangling = status
             .notes
             .iter()
-            .any(|n| n.contains("`ghost` has no token")));
+            .find(|n| n.text.contains("`ghost` has no token"))
+            .expect("the dangling context is reported");
+        assert_eq!(dangling.kind, NoteKind::Problem);
     }
 
     #[test]
@@ -282,12 +289,22 @@ mod tests {
 
         let (_dir, home) = fixture("context: [unclosed\n");
         let status = DoctlProbe::new(Paths::for_test(&home)).status().unwrap();
-        assert!(status.notes.iter().any(|n| n.contains("not valid YAML")));
+        let malformed = status
+            .notes
+            .iter()
+            .find(|n| n.text.contains("not valid YAML"))
+            .expect("the parse failure is reported");
+        assert_eq!(malformed.kind, NoteKind::Problem);
 
         let (_dir, home) = fixture("output: text\n");
         let status = DoctlProbe::new(Paths::for_test(&home)).status().unwrap();
         assert!(status.profiles.is_empty());
-        assert!(status.notes.iter().any(|n| n.contains("no access token")));
+        let tokenless = status
+            .notes
+            .iter()
+            .find(|n| n.text.contains("no access token"))
+            .expect("the tokenless file is explained");
+        assert_eq!(tokenless.kind, NoteKind::Info);
     }
 
     #[test]

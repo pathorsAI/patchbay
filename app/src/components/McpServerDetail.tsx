@@ -9,6 +9,7 @@ import {
   type McpTransportKind,
   type McpWriteReport,
 } from "../types";
+import { NoteGlyph } from "./ToolDetail";
 
 /**
  * The drawer that writes MCP config: one server, one client's copy of it at a
@@ -623,8 +624,11 @@ function ProjectScopeNote({ entries }: Readonly<{ entries: McpServerEntry[] }>) 
   const keys = [...entries.flatMap((e) => e.env_keys), ...entries.flatMap((e) => e.header_keys)];
   return (
     <div className="field">
-      <div className="banner">
-        <span className="glyph">△</span>
+      {/* Nothing failed here: patchbay is declining to write someone else's
+          project config, which is the correct behaviour. This used to be the
+          red error banner, which made a deliberate boundary look like a
+          breakage. */}
+      <div className="notice">
         <span>
           this copy lives in a project scope ({scopes.join(", ")}), not the user scope. patchbay
           only writes the user scope — a project's servers are that project's business. Edit it with{" "}
@@ -961,8 +965,8 @@ function WriteBlock({ report }: Readonly<{ report: McpWriteReport }>) {
         )}
       </span>
       {report.notes.map((n) => (
-        <span className="write-note" key={n}>
-          <span className="glyph">△</span> {n}
+        <span className={`write-note note-${n.kind}`} key={n.text}>
+          <NoteGlyph kind={n.kind} /> {n.text}
         </span>
       ))}
     </div>

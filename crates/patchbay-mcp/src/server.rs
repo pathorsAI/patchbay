@@ -54,11 +54,26 @@ summarising them away.
 
 4. An 'unsupported' result is a normal answer, not a failure to retry. It means patchbay \
 deliberately will not do that automatically, and `hint` names the command the human should \
-run. Surface the hint; do not retry, and do not run the hint yourself.
+run. Surface the hint; do not retry, and do not run the hint yourself. 'exec_disabled' is a \
+different answer with the same shape: nothing was attempted because command execution is \
+switched off in THIS patchbay. That is a fact about how the server was started, never a fault \
+in the user's login — do not report it as one, and do not retry.
 
-5. `expires_at: null` means the expiry is UNKNOWN — commonly the token lives in the OS \
-keychain where patchbay cannot read it without running the tool. It does not mean expired. \
-Use `verify` if you need certainty. The same rule governs versions: a null `latest` means \
+5. Read a profile's `expiry.state` rather than guessing from `expires_at`. Four states, and \
+only one of them is a deadline:
+   - `at` — a real deadline; `expiry.at` (and the derived `expires_at`) carries the timestamp.
+   - `no_expiry` — this credential does not expire by design. A static AWS access key, an \
+ngrok authtoken. Nothing to warn about, ever.
+   - `unknown` — there IS an expiry, but it lives somewhere patchbay will not read (an OS \
+keychain, a vendor's binary cache). `expiry.reason` says where. Unknown is NOT expired; call \
+`verify` if you need certainty.
+   - `refreshable` — the CLI renews this silently, so there is no deadline a human has to act \
+on. `expiry.access_token_expires`, when present, is the short-lived access token's own clock; \
+it is useful for debugging and is NOT a login expiry. A stale one is not a problem to report.
+
+   `expires_at` is kept for older consumers and is non-null only in the `at` state, so the \
+other three all read as null. Never treat that null as expired, and never treat it as unknown \
+without checking `expiry.state` first. The same rule governs versions: a null `latest` means \
 patchbay could not find out, never that the tool is current.
 
 5a. When a tool behaves in a way its documentation does not explain — a missing flag, a command \
@@ -295,25 +310,32 @@ the active profile is machine-global state that the user or another process may 
 since you last looked.
 
 Returns a JSON array of ToolStatus objects: { tool, installed, category, profiles: [{ id, label, \
-expires_at, meta }], active, notes, connection_state }.
+expiry, expires_at, meta }], active, active_concept, notes, connection_state }.
 
 - `category` groups the board's 23 tools: cloud (gcloud, aws, az, firebase, neon, supabase, \
 flyctl, doctl), code (gh, npm), secrets (infisical, op), cluster (kubectl), edge (wrangler, \
 vercel), storage (rclone), containers (docker), network (tailscale, ssh), payments (stripe), \
 ai (ollama, huggingface, claude), other. Filter on it when the user's request is about a class \
 of tool ('am I logged into my cloud accounts?') rather than a named one.
-- Some tools have no *active* profile by design — docker, rclone, ssh and npm all use every \
-credential concurrently and pick one per command — so `active: null` there is normal, not a \
-problem to fix.
+- `active_concept` answers whether 'which one is active?' is even a question for this tool. \
+`{ kind: 'selects' }` means it picks one at a time, so a null `active` means nothing is logged \
+in. `{ kind: 'not_applicable', reason }` means the tool has no such notion — docker, rclone, ssh \
+and npm all use every credential concurrently and pick one per command — so a null `active` \
+there is the correct answer, not a problem to fix. Check this field before telling a user that \
+nothing is selected; `reason` is the one-phrase explanation to pass on.
 - `connection_state` is patchbay's own verdict, derived from the fields below: `connected` \
 (an active profile, nothing expiring within 24h), `attention` (active, but the credential is \
 expired or expires within 24h — this is the one to surface), `disconnected` (installed, nothing \
 active), `not_installed`. Prefer it over re-deriving the state from expiries yourself.
 - `active` is the id you would pass to switch_profile. It may be null when nothing is logged in, \
 or when the tool has no notion of an active profile.
-- `expires_at: null` means UNKNOWN, not expired — usually the token lives in the OS keychain \
-where patchbay cannot read the expiry without running the tool. Never report a null expiry as an \
-expired credential; call `verify` if you need certainty.
+- `expiry` is the honest answer about when a profile stops working: \
+`{ state: 'at', at }` (a real deadline), `{ state: 'no_expiry' }` (never expires, by design), \
+`{ state: 'unknown', reason }` (there is one, but it lives where patchbay will not read — the \
+`reason` says where), or `{ state: 'refreshable', access_token_expires? }` (the CLI renews it \
+silently; the access-token clock is not a login deadline and a stale one is not news). \
+`expires_at` is derived from it for older consumers and is non-null only in the `at` state — \
+so read `expiry.state`, and never report a null `expires_at` as an expired credential.
 - `registered_keys` lists standalone vault keys filed against this tool — a Cloudflare API \
 token used for direct API calls shows up on the `wrangler` row even though no CLI tracks it. \
 Each carries { id, label, last4, expires_at, expiry_state }; anything `expired` or \
@@ -327,9 +349,14 @@ end-of-life — independent of the version cache, so it is populated even when `
 Each is { tool, kind: { type: renamed | removed | unmaintained | info, … }, message, url }. \
 `removed` and `unmaintained` are the ones worth raising unprompted: they explain failures the user \
 has not hit yet. Pass the `url` along; every advisory is sourced.
-- `notes` carries the real caveats (malformed config, mismatched Application Default \
-Credentials, missing directory). Read them; they explain surprises.
-- A probe that fails degrades to `installed: false` plus an explanatory note, so one broken tool \
+- `notes` carries the caveats, each as { kind, text }. `kind` is `problem` (something on this \
+machine is broken or will fail: a config that will not parse, a profile reference pointing at \
+nothing), `warn` (a real risk, nothing broken yet: a secret in plain text, an environment \
+variable overriding the stored login) or `info` (how the tool works, what was counted, where a \
+file came from). Surface `problem` and `warn` unprompted; an `info` note is background, not a \
+complaint, and relaying a board's worth of them as issues is the failure this field exists to \
+prevent.
+- A probe that fails degrades to `installed: false` plus a `problem` note, so one broken tool \
 never blanks the board.
 - Credential material is never returned, only metadata about it.")]
     async fn list_connections(&self) -> Result<CallToolResult, ErrorData> {
@@ -346,12 +373,14 @@ same caveats as list_connections, narrowed to a single tool.
 Use this before any operation whose result depends on the active account, project or context, \
 instead of assuming the login is still what it was earlier.
 
-Returns one ToolStatus: { tool, installed, category, profiles: [{ id, label, expires_at, meta }], \
-active, notes, registered_keys, connection_state }. `registered_keys` is the vault's standalone \
-keys for this tool (id, label, last4, expires_at, expiry_state). `connection_state` is the quickest read: `connected`, \
-`attention` (expired or expiring within 24h), `disconnected`, `not_installed`. Remember that \
-`expires_at: null` means the expiry is unknown (token held in the OS keychain), which is not the \
-same as expired — use `verify` if the difference matters.
+Returns one ToolStatus: { tool, installed, category, profiles: [{ id, label, expiry, expires_at, \
+meta }], active, active_concept, notes, registered_keys, connection_state }. `registered_keys` is \
+the vault's standalone keys for this tool (id, label, last4, expires_at, expiry_state). \
+`connection_state` is the quickest read: `connected`, `attention` (expired or expiring within \
+24h), `disconnected`, `not_installed`. Remember that a profile's `expiry.state` is the precise \
+answer — `no_expiry`, `unknown` and `refreshable` are three different things and all three leave \
+the derived `expires_at` null, so none of them means expired. Use `verify` if the difference \
+matters. Notes are { kind, text }: act on `problem` and `warn`, treat `info` as background.
 
 An unrecognised `tool` comes back as an error whose message lists every valid tool key; retry \
 with one of those.")]
@@ -388,6 +417,9 @@ people deploy to the wrong project.
 - 'unsupported' — a normal answer, not a failure. This tool has no switch patchbay can perform \
 safely and non-interactively. `hint` is a command for the HUMAN to run: surface it and stop. Do \
 not retry, and do not run the hint yourself.
+- 'exec_disabled' — nothing was attempted, because command execution is switched off in this \
+patchbay. This describes how the server was started, not the tool and not the user's login: say \
+so plainly, offer `hint` if there is one, and do not retry.
 - 'unknown_profile' — no such profile. `available` lists the ids that do exist, so you can retry \
 with a correct one.
 - 'failed' — the switch was attempted and the tool refused. `detail` says why.")]
@@ -408,10 +440,11 @@ that tool's own CLI — which normally makes a network round trip. Seconds, not 
 
 Do NOT call this routinely, and do not use it as a warm-up before other work. Call it only when \
 either (a) the user explicitly asks whether a login is still good, or (b) tier 1 \
-(list_connections / get_status) showed something ambiguous you need to resolve — an `expires_at` \
-in the past, an `expires_at` of null you actually need pinned down, or notes suggesting the \
-config is inconsistent — AND the answer changes what you do next. If tier 1 already answered the \
-question, stop there.
+(list_connections / get_status) showed something ambiguous you need to resolve — a deadline in \
+the past, an `expiry.state` of `unknown` you actually need pinned down, or a `problem` note \
+suggesting the config is inconsistent — AND the answer changes what you do next. If tier 1 \
+already answered the question, stop there. An `expiry.state` of `no_expiry` or `refreshable` is \
+not ambiguous and is not a reason to call this.
 
 Pass `profile_id` to check ONE profile — an rclone remote, an ssh host alias, a kubectl \
 context, a cloudflared origin certificate. For those tools the profile is the meaningful unit, \
@@ -426,7 +459,10 @@ Returns a VerifyOutcome, discriminated by the `result` field:
 re-authenticate; say so plainly.
 - 'unsupported' — patchbay has no verification path for this tool yet. A normal answer, not an \
 error: `hint` may name a command for the human to run. Surface it and stop; retrying will not \
-change anything.")]
+change anything.
+- 'exec_disabled' — nothing was checked, because command execution is switched off in this \
+patchbay. A fact about the server's own configuration, not about the credential: do not report \
+it as a failed or missing login, and do not retry.")]
     async fn verify(
         &self,
         Parameters(VerifyParams { tool, profile_id }): Parameters<VerifyParams>,
@@ -455,7 +491,8 @@ says nothing about another: re-read with the right scope rather than generalisin
 credential carries one answer everywhere list no scopes and ignore the field.
 
 Returns a PermissionsReport: { tool, supported, subject, scopes, notes, hint, scope }. `scope` is \
-present only when the report is about one — always name it when relaying the result.
+present only when the report is about one — always name it when relaying the result. `notes` are \
+{ kind, text } as everywhere else: `problem` and `warn` are worth raising, `info` is background.
 
 `supported: false` is a normal answer, not a failure: it means patchbay cannot enumerate \
 permissions for this tool yet, or the login was refused the policy of that one resource (which is \

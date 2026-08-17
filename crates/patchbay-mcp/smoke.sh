@@ -128,9 +128,25 @@ need(lc and "result" in lc, "no list_connections result")
 need(not lc["result"].get("isError"), "list_connections returned isError")
 board = json.loads(lc["result"]["content"][0]["text"])
 need(isinstance(board, list), "list_connections did not return a JSON array")
-need(all({"tool", "installed", "profiles", "active", "notes", "registered_keys"} <= set(s)
-         for s in board),
+need(all({"tool", "installed", "profiles", "active", "active_concept", "notes",
+          "registered_keys"} <= set(s) for s in board),
      "ToolStatus shape mismatch")
+# Notes carry a severity, and expiry carries its own state: both are what stop
+# a consumer having to parse English to learn whether anything is wrong.
+for s in board:
+    need(s["active_concept"].get("kind") in {"selects", "not_applicable"},
+         f"{s['tool']}: bad active_concept {s['active_concept']!r}")
+    for n in s["notes"]:
+        need(isinstance(n, dict) and n.get("kind") in {"info", "warn", "problem"}
+             and isinstance(n.get("text"), str),
+             f"{s['tool']}: note is not a kinded {{kind, text}}: {n!r}")
+    for p in s["profiles"]:
+        state = p.get("expiry", {}).get("state")
+        need(state in {"at", "no_expiry", "unknown", "refreshable"},
+             f"{s['tool']}/{p['id']}: bad expiry state {state!r}")
+        # `expires_at` is derived, so only a real deadline may produce one.
+        need((p.get("expires_at") is not None) == (state == "at"),
+             f"{s['tool']}/{p['id']}: expires_at disagrees with expiry.state {state!r}")
 
 # 4. unknown tool -> tool error whose message names the valid tools
 bad = msgs.get(4)
@@ -172,6 +188,10 @@ need(isinstance(clients, list), "list_mcp_clients did not return a JSON array")
 for c in clients:
     need({"client", "label", "config_path", "present", "servers", "notes"} <= set(c),
          f"client shape mismatch: {sorted(c)}")
+    for n in c["notes"]:
+        need(isinstance(n, dict) and n.get("kind") in {"info", "warn", "problem"}
+             and isinstance(n.get("text"), str),
+             f"{c['client']}: note is not a kinded {{kind, text}}: {n!r}")
     for srv in c["servers"]:
         need({"name", "transport", "env_keys"} <= set(srv),
              f"server shape mismatch: {sorted(srv)}")

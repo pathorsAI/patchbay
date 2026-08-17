@@ -84,9 +84,17 @@ patchbay works out **how each tool was installed** and asks the right place. Eve
 Results are cached at `~/.config/patchbay/versions.json` for 24 hours. **`pb status` only ever reads that cache** — it never executes a binary and never touches the network, so the board stays in the tens of milliseconds whether the cache is warm or cold. A warm cache adds an update marker to the board:
 
 ```
-gh           github.com/YJack0000          2         —      ↑ 2.95.0 → 2.97.0 · token expiry unknown…
-neon         default                       1         —      ⚠ advisory · ↑ 2.38.2 → 3.1.1
+gh           github.com/YJack0000          2   expiry unknown   ↑ 2.95.0 → 2.97.0
+neon         default                       1   auto-renewed     ⚠ advisory · ↑ 2.38.2 → 3.1.1
+kubectl      —                             5   —                ✖ ~/.kube/config is a directory of…
 ```
+
+The EXPIRES column says which of four things it means — a countdown, `no expiry`,
+`expiry unknown`, or `auto-renewed` for a token the CLI silently renews — rather
+than showing one em dash for all four. Notes carry a severity too: `✖` is
+something broken, `⚠` is a risk worth knowing, and the explanations of how a
+tool works get no marker at all, because a glyph on every line is a glyph that
+means nothing.
 
 **Advisories** (`⚠`) are curated deprecation notices — renames, removals, end-of-life dates — and they show up whether or not the version cache is warm, because they are static data. Each one is gated so it only appears where it applies (the AWS CLI v1 end-of-support notice never shows on v2), carries a source URL, and `pb check-updates` exits non-zero when something is genuinely removed or unmaintained. Nothing goes in the table without vendor documentation behind it.
 ## Moving to a new machine

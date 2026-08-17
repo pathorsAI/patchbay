@@ -13,7 +13,7 @@
 //!   Code installs disagree.
 //!
 //! The OAuth token itself is **not** in this file — on macOS it lives in the
-//! Keychain — so `expires_at` is unknown rather than absent, exactly like `gh`.
+//! Keychain — so the expiry is `Unknown`, not absent, exactly like `gh`.
 //! `CLAUDE_CONFIG_DIR` moves the directory that holds the file.
 
 use std::collections::BTreeMap;
@@ -22,7 +22,9 @@ use serde::Deserialize;
 
 use crate::paths::Paths;
 use crate::probe::{unsupported_switch, unsupported_verify, Probe};
-use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
+use crate::types::{
+    Expiry, Note, PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome,
+};
 use crate::util::read_text;
 
 pub struct ClaudeProbe {
@@ -75,14 +77,14 @@ impl Probe for ClaudeProbe {
         let installed = self.paths.has_binary("claude") || path.is_file();
         let mut status = ToolStatus::empty(Self::TOOL, installed);
         for note in self.paths.path_notes("claude") {
-            status.note(note);
+            status.push_note(note);
         }
 
         let text = match read_text(&path) {
             Ok(Some(text)) => text,
             Ok(None) => return Ok(status),
             Err(e) => {
-                status.note(e);
+                status.problem(e);
                 return Ok(status);
             }
         };
@@ -90,16 +92,15 @@ impl Probe for ClaudeProbe {
         let state: State = match serde_json::from_str(&text) {
             Ok(state) => state,
             Err(e) => {
-                status.note(format!("{} is not valid JSON ({e})", path.display()));
+                status.problem(format!("{} is not valid JSON ({e})", path.display()));
                 return Ok(status);
             }
         };
 
         let Some(account) = state.oauth_account else {
-            status.note(
+            status.info(
                 "no oauthAccount in .claude.json; Claude Code has state here but no signed-in \
-                 account (an API-key setup looks like this too)"
-                    .to_string(),
+                 account (an API-key setup looks like this too)",
             );
             return Ok(status);
         };
@@ -111,7 +112,7 @@ impl Probe for ClaudeProbe {
         status.profiles.push(
             Profile::new(&id)
                 // The token is in the Keychain, so no expiry is knowable here.
-                .expires_at(None)
+                .expiry(Expiry::unknown("in the OS keychain"))
                 .with_meta("organization", account.organization_name.clone())
                 .with_meta("organization_uuid", account.organization_uuid.clone())
                 .with_meta("billing_type", account.billing_type.clone())
@@ -121,20 +122,8 @@ impl Probe for ClaudeProbe {
         );
         status.active = Some(id);
 
-        status.note(
-            "token expiry is unknown because Claude Code keeps its OAuth credentials in the OS \
-             keychain, not in .claude.json"
-                .to_string(),
-        );
         if state.has_completed_onboarding == Some(false) {
-            status.note("onboarding has not been completed on this machine".to_string());
-        }
-        if !state.mcp_servers.is_empty() {
-            status.note(format!(
-                "{} user-scoped MCP server(s) configured; project-scoped servers live in each \
-                 project's own .mcp.json",
-                state.mcp_servers.len()
-            ));
+            status.info("onboarding has not been completed on this machine");
         }
 
         Ok(status)
@@ -174,11 +163,10 @@ impl Probe for ClaudeProbe {
             subject: Some(profile.id.clone()),
             // Claude Code's grant carries no scope list of its own.
             scopes: Vec::new(),
-            notes: vec![
+            notes: vec![Note::info(
                 "what this login may do follows the plan and the organisation's settings, \
-                 neither of which is recorded locally"
-                    .to_string(),
-            ],
+                 neither of which is recorded locally",
+            )],
             hint: Some("claude /status".to_string()),
             scope: None,
         })
@@ -188,6 +176,7 @@ impl Probe for ClaudeProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::NoteKind;
     use std::fs;
     use std::path::PathBuf;
 
@@ -225,9 +214,13 @@ mod tests {
         assert_eq!(profile.meta["billing_type"], "stripe_subscription");
         assert_eq!(profile.meta["mcp_servers"], 2);
         assert_eq!(profile.meta["projects"], 2);
-        // Keychain-backed, like gh.
-        assert!(profile.expires_at.is_none());
-        assert!(status.notes.iter().any(|n| n.contains("keychain")));
+        // Keychain-backed, like gh — and the reason travels in the type now,
+        // so nothing about it is left to a note.
+        assert_eq!(profile.expires_at(), None);
+        assert_eq!(profile.expiry, Expiry::unknown("in the OS keychain"));
+        assert!(!status.notes.iter().any(|n| n.text.contains("keychain")));
+        // The panel has a whole MCP view; a count here only says it twice.
+        assert!(!status.notes.iter().any(|n| n.text.contains("MCP")));
 
         // Project paths are counted, never listed.
         let json = serde_json::to_string(&status).unwrap();
@@ -241,7 +234,13 @@ mod tests {
         let status = ClaudeProbe::new(Paths::for_test(&home)).status().unwrap();
         assert!(status.installed);
         assert!(status.profiles.is_empty());
-        assert!(status.notes.iter().any(|n| n.contains("no oauthAccount")));
+        // An API-key setup looks exactly like this, so it must not alarm.
+        let unsigned = status
+            .notes
+            .iter()
+            .find(|n| n.text.contains("no oauthAccount"))
+            .expect("the accountless state is explained");
+        assert_eq!(unsigned.kind, NoteKind::Info);
     }
 
     #[test]
@@ -257,7 +256,12 @@ mod tests {
         let (_dir, home) = fixture("{ \"oauthAccount\": ");
         let status = ClaudeProbe::new(Paths::for_test(&home)).status().unwrap();
         assert!(status.installed);
-        assert!(status.notes.iter().any(|n| n.contains("not valid JSON")));
+        let malformed = status
+            .notes
+            .iter()
+            .find(|n| n.text.contains("not valid JSON"))
+            .expect("the parse failure is reported");
+        assert_eq!(malformed.kind, NoteKind::Problem);
     }
 
     #[test]
@@ -273,7 +277,7 @@ mod tests {
         assert!(status
             .notes
             .iter()
-            .any(|n| n.contains("$CLAUDE_CONFIG_DIR=")));
+            .any(|n| n.text.contains("$CLAUDE_CONFIG_DIR=")));
     }
 
     #[test]

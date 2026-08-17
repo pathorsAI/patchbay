@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { mcpList } from "../api";
 import type { McpClient, McpServerEntry } from "../types";
 import { McpServerDetail } from "./McpServerDetail";
+import { NoteGlyph } from "./ToolDetail";
 
 /** What one client has to say about one server name. */
 type Cell = "user" | "project" | "none";
@@ -184,10 +185,10 @@ export function McpView() {
         <ul className="notes notes-full">
           {clients.flatMap((c) =>
             c.notes.map((n, i) => (
-              <li key={`${c.client}-${i}`}>
-                <span className="glyph">△</span>
+              <li className={`note-${n.kind}`} key={`${c.client}-${i}`}>
+                <NoteGlyph kind={n.kind} />
                 <span>
-                  {c.label}: {n}
+                  {c.label}: {n.text}
                 </span>
               </li>
             )),

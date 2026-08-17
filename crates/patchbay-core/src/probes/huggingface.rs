@@ -22,7 +22,7 @@
 
 use crate::paths::Paths;
 use crate::probe::{unsupported_switch, unsupported_verify, Probe};
-use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
+use crate::types::{Expiry, PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
 use crate::util::{read_text, Ini};
 
 pub struct HuggingfaceProbe {
@@ -52,7 +52,7 @@ impl Probe for HuggingfaceProbe {
             self.paths.has_binary("hf") || self.paths.has_binary("huggingface-cli") || dir.is_dir();
         let mut status = ToolStatus::empty(Self::TOOL, installed);
         for note in self.paths.path_notes("huggingface") {
-            status.note(note);
+            status.push_note(note);
         }
 
         if !installed {
@@ -68,7 +68,7 @@ impl Probe for HuggingfaceProbe {
             Ok(Some(text)) => Ini::parse(&text),
             Ok(None) => Ini::default(),
             Err(e) => {
-                status.note(e);
+                status.problem(e);
                 Ini::default()
             }
         };
@@ -78,12 +78,21 @@ impl Probe for HuggingfaceProbe {
                 .get("expires_at")
                 .and_then(|raw| raw.trim().parse::<i64>().ok())
                 .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0));
+            // `expires_at` is only ever written for a browser login. A plain
+            // access token has no deadline at all; an OAuth section missing
+            // the field has one patchbay cannot see.
+            let oauth = section.get("refresh_token").is_some();
+            let expiry = match (expires_at, oauth) {
+                (Some(at), _) => Expiry::At(at),
+                (None, true) => Expiry::unknown("not recorded in stored_tokens"),
+                (None, false) => Expiry::NoExpiry,
+            };
             status.profiles.push(
                 Profile::new(&section.name)
-                    .expires_at(expires_at)
+                    .expiry(expiry)
                     .with_meta(
                         "auth",
-                        if section.get("refresh_token").is_some() {
+                        if oauth {
                             "oauth (browser login)"
                         } else {
                             "access token"
@@ -97,6 +106,8 @@ impl Probe for HuggingfaceProbe {
             status.profiles.push(
                 Profile::new(Self::DEFAULT_PROFILE)
                     .label("hugging face token")
+                    // A bare `token` file is always a plain access token.
+                    .expiry(Expiry::NoExpiry)
                     .with_meta("auth", "access token")
                     .with_meta("source", token.display().to_string()),
             );
@@ -106,10 +117,9 @@ impl Probe for HuggingfaceProbe {
         if self.paths.env("HF_TOKEN").is_some()
             || self.paths.env("HUGGING_FACE_HUB_TOKEN").is_some()
         {
-            status.note(
+            status.warn(
                 "an HF token is set in the environment and takes precedence over both files — a \
-                 missing token file does not mean you are logged out"
-                    .to_string(),
+                 missing token file does not mean you are logged out",
             );
         }
 
@@ -119,24 +129,20 @@ impl Probe for HuggingfaceProbe {
 
         if !named.sections.is_empty() {
             // Deliberately not guessed: see the module docs.
-            status.note(format!(
+            status.info(format!(
                 "{} named token(s); which one is active cannot be told from disk without reading \
                  token values, which patchbay will not do — `hf auth list` marks it with a *",
                 named.sections.len()
             ));
             if !has_active_token {
-                status.note(
+                // Tokens are stored, none is selected: every hf call goes out
+                // unauthenticated until one is.
+                status.problem(
                     "there are named tokens but no active token file, so the CLI is not \
-                     authenticated until you run `hf auth switch`"
-                        .to_string(),
+                     authenticated until you run `hf auth switch`",
                 );
             }
         }
-        status.note(
-            "an access token has no expiry unless it came from a browser login; `expires_at` is \
-             only written for OAuth sections"
-                .to_string(),
-        );
 
         Ok(status)
     }
@@ -172,6 +178,7 @@ impl Probe for HuggingfaceProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::NoteKind;
     use std::fs;
     use std::path::Path;
 
@@ -193,7 +200,11 @@ mod tests {
         assert!(status.installed);
         assert_eq!(status.active.as_deref(), Some("default"));
         assert_eq!(status.profiles.len(), 1);
-        assert!(status.profiles[0].expires_at.is_none());
+        // A plain access token has no deadline at all — a different claim from
+        // "there is one and we cannot see it".
+        assert_eq!(status.profiles[0].expiry, Expiry::NoExpiry);
+        // The type carries that now, so no note repeats it.
+        assert!(!status.notes.iter().any(|n| n.text.contains("expiry")));
 
         let json = serde_json::to_string(&status).unwrap();
         assert!(!json.contains("hf_fakefixturetokenvalue"), "{json}");
@@ -216,18 +227,21 @@ mod tests {
             .unwrap();
         let ids: Vec<_> = status.profiles.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(ids, vec!["work", "oauth-dev"]);
-        assert!(status.profiles[0].expires_at.is_none());
+        // A named access token never expires; the dated OAuth one does.
+        assert_eq!(status.profiles[0].expiry, Expiry::NoExpiry);
         assert_eq!(
-            status.profiles[1].expires_at.unwrap().to_rfc3339(),
+            status.profiles[1].expires_at().unwrap().to_rfc3339(),
             "2026-07-25T17:20:00+00:00"
         );
         assert_eq!(status.profiles[1].meta["auth"], "oauth (browser login)");
         // Not guessed.
         assert!(status.active.is_none());
-        assert!(status
+        let unknowable = status
             .notes
             .iter()
-            .any(|n| n.contains("cannot be told from disk")));
+            .find(|n| n.text.contains("cannot be told from disk"))
+            .expect("the unknowable active token is explained");
+        assert_eq!(unknowable.kind, NoteKind::Info);
 
         let json = serde_json::to_string(&status).unwrap();
         for secret in [
@@ -241,6 +255,28 @@ mod tests {
     }
 
     #[test]
+    fn test_an_undated_oauth_login_is_unknown_rather_than_endless() {
+        // A browser login *does* expire; a section that lost its expires_at is
+        // the one case where huggingface owes an Unknown, not a NoExpiry.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = hf_dir(tmp.path());
+        fs::write(dir.join("token"), "hf_fixture").unwrap();
+        fs::write(
+            dir.join("stored_tokens"),
+            "[oauth-dev]\nhf_token = hf_fixture\nrefresh_token = fake-fixture-refresh\n",
+        )
+        .unwrap();
+        let status = HuggingfaceProbe::new(Paths::for_test(tmp.path()))
+            .status()
+            .unwrap();
+        assert_eq!(
+            status.profiles[0].expiry,
+            Expiry::unknown("not recorded in stored_tokens")
+        );
+        assert_eq!(status.profiles[0].expires_at(), None);
+    }
+
+    #[test]
     fn test_named_tokens_without_an_active_file_are_called_out() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = hf_dir(tmp.path());
@@ -249,7 +285,13 @@ mod tests {
             .status()
             .unwrap();
         assert_eq!(status.profiles.len(), 1);
-        assert!(status.notes.iter().any(|n| n.contains("not authenticated")));
+        // Tokens on disk, none selected: hf calls go out unauthenticated.
+        let stranded = status
+            .notes
+            .iter()
+            .find(|n| n.text.contains("not authenticated"))
+            .expect("the stranded state is reported");
+        assert_eq!(stranded.kind, NoteKind::Problem);
     }
 
     #[test]
@@ -263,11 +305,13 @@ mod tests {
             .with_env("HF_TOKEN", "hf_fakefixtureenv");
         let status = HuggingfaceProbe::new(paths).status().unwrap();
         assert_eq!(status.profiles.len(), 1);
-        assert!(status.notes.iter().any(|n| n.contains("$HF_HOME=")));
-        assert!(status
+        assert!(status.notes.iter().any(|n| n.text.contains("$HF_HOME=")));
+        let env = status
             .notes
             .iter()
-            .any(|n| n.contains("set in the environment")));
+            .find(|n| n.text.contains("set in the environment"))
+            .expect("the env token is called out");
+        assert_eq!(env.kind, NoteKind::Warn);
         let json = serde_json::to_string(&status).unwrap();
         assert!(!json.contains("hf_fakefixtureenv"), "{json}");
     }

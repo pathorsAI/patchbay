@@ -1,7 +1,8 @@
 //! `infisical` — logged-in users in `~/.infisical/infisical-config.json`.
 //!
 //! The JWT itself lives in the configured vault backend (keychain or an
-//! encrypted file), not in this config, so `expires_at` is unknown. The config
+//! encrypted file), not in this config, so every profile's expiry is
+//! [`crate::types::Expiry::Unknown`] naming that backend. The config
 //! also holds a `vaultBackendPassphrase`; the struct below deliberately has no
 //! field for it, so it is dropped during parsing and can never reach a caller.
 //!
@@ -23,7 +24,7 @@ use serde_json::Value;
 
 use crate::paths::Paths;
 use crate::probe::{unknown_profile, unsupported_verify, Probe};
-use crate::types::{PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
+use crate::types::{Expiry, PermissionsReport, Profile, SwitchOutcome, ToolStatus, VerifyOutcome};
 use crate::util::{backup, read_text, serialize_json_preserving_style, write_atomic};
 
 pub struct InfisicalProbe {
@@ -118,14 +119,14 @@ impl Probe for InfisicalProbe {
         let installed = self.paths.has_binary("infisical") || path.is_file();
         let mut status = ToolStatus::empty(Self::TOOL, installed);
         for note in self.paths.path_notes("infisical") {
-            status.note(note);
+            status.push_note(note);
         }
 
         let text = match read_text(&path) {
             Ok(Some(text)) => text,
             Ok(None) => return Ok(status),
             Err(e) => {
-                status.note(e);
+                status.problem(e);
                 return Ok(status);
             }
         };
@@ -133,15 +134,23 @@ impl Probe for InfisicalProbe {
         let config: Config = match serde_json::from_str(&text) {
             Ok(config) => config,
             Err(e) => {
-                status.note(format!("infisical-config.json is not valid JSON ({e})"));
+                status.problem(format!("infisical-config.json is not valid JSON ({e})"));
                 return Ok(status);
             }
         };
+
+        // The JWT — and with it the only copy of its deadline — lives in the
+        // vault backend the config names, which patchbay does not open.
+        let expiry = Expiry::unknown(format!(
+            "in the {} vault backend",
+            config.vault_backend_type.as_deref().unwrap_or("configured")
+        ));
 
         for user in &config.logged_in_users {
             let Some(email) = &user.email else { continue };
             status.profiles.push(
                 Profile::new(email)
+                    .expiry(expiry.clone())
                     .with_meta("domain", user.domain.clone())
                     .with_meta("vault_backend", config.vault_backend_type.clone()),
             );
@@ -152,18 +161,12 @@ impl Probe for InfisicalProbe {
                 // The active account is not always mirrored into the list.
                 status.profiles.push(
                     Profile::new(active)
+                        .expiry(expiry.clone())
                         .with_meta("domain", config.logged_in_user_domain.clone())
                         .with_meta("vault_backend", config.vault_backend_type.clone()),
                 );
             }
             status.active = Some(active.clone());
-        }
-
-        if !status.profiles.is_empty() {
-            status.note(format!(
-                "token expiry is unknown because the JWT is kept in the {} vault backend, not in this config",
-                config.vault_backend_type.as_deref().unwrap_or("configured")
-            ));
         }
 
         Ok(status)
@@ -317,6 +320,7 @@ impl Probe for InfisicalProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::NoteKind;
     use std::fs;
     use std::path::PathBuf;
 
@@ -343,7 +347,17 @@ mod tests {
             status.profiles[1].meta["domain"],
             "https://eu.infisical.com/api"
         );
-        assert!(status.profiles.iter().all(|p| p.expires_at.is_none()));
+        // The paragraph that used to say this is now the expiry state, and it
+        // names the backend the JWT actually went into.
+        assert!(status
+            .profiles
+            .iter()
+            .all(|p| p.expiry == Expiry::unknown("in the file vault backend")
+                && p.expires_at().is_none()));
+        assert!(!status
+            .notes
+            .iter()
+            .any(|n| n.text.contains("vault backend")));
 
         // The vault passphrase must never survive parsing.
         let json = serde_json::to_string(&status).unwrap();
@@ -401,7 +415,10 @@ mod tests {
             .unwrap();
         assert!(status.installed);
         assert!(status.profiles.is_empty());
-        assert!(status.notes.iter().any(|n| n.contains("not valid JSON")));
+        assert!(status
+            .notes
+            .iter()
+            .any(|n| n.kind == NoteKind::Problem && n.text.contains("not valid JSON")));
     }
 
     /// The real shape of this file on a two-account machine, pretty-printed

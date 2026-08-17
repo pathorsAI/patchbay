@@ -6,7 +6,7 @@
 
 use anstyle::{AnsiColor, Effects, Style};
 use chrono::{DateTime, Duration, Utc};
-use patchbay_core::{Advisory, CheckReport, ToolStatus};
+use patchbay_core::{Advisory, CheckReport, Note, NoteKind, ToolStatus};
 
 /// Total budget for the status table. Keeps the board readable in a
 /// 100-column terminal, which is the narrowest window we design for.
@@ -69,6 +69,55 @@ fn yellow() -> Style {
 }
 
 // ---------------------------------------------------------------------------
+// notes
+// ---------------------------------------------------------------------------
+
+/// The marker that leads a note, or `None` for the quiet kind.
+///
+/// [`NoteKind::Info`] deliberately gets nothing. Most notes on a healthy board
+/// are explanations of how a tool works, and giving each one a glyph is how the
+/// board came to read as a list of complaints. The two kinds that mean
+/// *something is wrong* keep the table's existing vocabulary: `⚠` is already the
+/// advisory marker, and `✖` is reserved for the loudest kind so the two stay
+/// distinguishable at a glance.
+pub fn note_marker(kind: NoteKind) -> Option<&'static str> {
+    match kind {
+        NoteKind::Info => None,
+        NoteKind::Warn => Some("⚠"),
+        NoteKind::Problem => Some("✖"),
+    }
+}
+
+/// The color a note's kind paints its text: quiet for info, and the same
+/// yellow/red the expiry column already uses for the two that matter.
+pub fn note_style(kind: NoteKind) -> Style {
+    match kind {
+        NoteKind::Info => dim(),
+        NoteKind::Warn => yellow(),
+        NoteKind::Problem => red(),
+    }
+}
+
+/// One note as a single line, marker included: `✖ config.json is not valid JSON`.
+fn note_text(note: &Note) -> String {
+    match note_marker(note.kind) {
+        Some(marker) => format!("{marker} {}", one_line(&note.text)),
+        None => one_line(&note.text),
+    }
+}
+
+/// The note that most deserves the one line a table cell has.
+///
+/// Not `notes.first()`: probes emit their notes in the order they discover
+/// them, so a Problem routinely lands behind two Infos and would never be seen.
+/// Ties keep the earlier note, which is the order the probe chose.
+fn loudest(notes: &[Note]) -> Option<&Note> {
+    notes
+        .iter()
+        .reduce(|best, note| if note.kind > best.kind { note } else { best })
+}
+
+// ---------------------------------------------------------------------------
 // duration humanizing
 // ---------------------------------------------------------------------------
 
@@ -81,6 +130,10 @@ pub enum ExpiryLevel {
     Warn,
     /// Comfortably far out.
     Normal,
+    /// Not a deadline at all — the cell is carrying a state label such as
+    /// `no expiry` or `auto-renewed`. Nothing here is counting down, so it must
+    /// not borrow the colour of something that is.
+    Quiet,
 }
 
 impl ExpiryLevel {
@@ -91,6 +144,7 @@ impl ExpiryLevel {
             ExpiryLevel::Critical => red(),
             ExpiryLevel::Warn => yellow(),
             ExpiryLevel::Normal => Style::new(),
+            ExpiryLevel::Quiet => dim(),
         }
     }
 }
@@ -209,8 +263,12 @@ pub struct StatusRow {
     pub active: Option<String>,
     pub profiles: usize,
     pub expires: Option<ExpiryCell>,
-    /// First note, condensed to one line. `None` when the tool has no notes.
+    /// The loudest note, condensed to one line and led by its kind's marker.
+    /// `None` when the tool has no notes.
     pub note: Option<String>,
+    /// The kind of the note in `note`, so the cell can be coloured without
+    /// re-deriving it from the text.
+    pub note_kind: Option<NoteKind>,
     /// Standalone vault keys filed against this tool.
     pub keys: usize,
     /// How many of those have expired or are about to.
@@ -227,16 +285,27 @@ pub struct StatusRow {
 pub fn build_row(status: &ToolStatus, now: DateTime<Utc>) -> StatusRow {
     // Prefer the active profile's own expiry; fall back to the soonest across
     // all profiles, flagged so nobody reads it as the active credential's.
+    // Failing both, say what the active profile's expiry actually *is* — a
+    // static AWS key and a token patchbay cannot date are different facts, and
+    // an em dash told the reader neither.
     let expires = match status.active_expiry() {
         Some(at) => Some(ExpiryCell {
             text: humanize_expiry(now, at),
             level: expiry_level(now, at),
         }),
-        None => status.soonest_expiry().map(|at| ExpiryCell {
-            text: format!("{} (other)", humanize_expiry(now, at)),
-            level: expiry_level(now, at),
-        }),
+        None => match status.soonest_expiry() {
+            Some(at) => Some(ExpiryCell {
+                text: format!("{} (other)", humanize_expiry(now, at)),
+                level: expiry_level(now, at),
+            }),
+            None => active_profile(status).map(|p| ExpiryCell {
+                text: p.expiry.label().to_string(),
+                level: ExpiryLevel::Quiet,
+            }),
+        },
     };
+
+    let note = loudest(&status.notes);
 
     StatusRow {
         tool: status.tool.clone(),
@@ -244,7 +313,8 @@ pub fn build_row(status: &ToolStatus, now: DateTime<Utc>) -> StatusRow {
         active: status.active.clone(),
         profiles: status.profiles.len(),
         expires,
-        note: status.notes.first().map(|n| one_line(n)),
+        note: note.map(note_text),
+        note_kind: note.map(|n| n.kind),
         keys: status.registered_keys.len(),
         keys_attention: status.keys_needing_attention().len(),
         update: status
@@ -254,6 +324,13 @@ pub fn build_row(status: &ToolStatus, now: DateTime<Utc>) -> StatusRow {
             .and_then(|v| v.marker()),
         advisories: status.advisories.len(),
     }
+}
+
+/// The profile the tool currently treats as active, if it names one that
+/// actually exists among its profiles.
+fn active_profile(status: &ToolStatus) -> Option<&patchbay_core::Profile> {
+    let active = status.active.as_ref()?;
+    status.profiles.iter().find(|p| &p.id == active)
 }
 
 /// The `↑ 2.95.0 → 2.97.0` marker, or `None` when the tool is current or has
@@ -345,11 +422,22 @@ pub fn render_status(statuses: &[ToolStatus], now: DateTime<Utc>, styles: &Style
         };
         // Markers lead the notes cell, most urgent first, so a busy row reads
         // as "⚠ advisory · ↑ 2.95.0 → 2.97.0 · +1 key · <the usual caveat>".
-        let mut cell: Vec<String> = [advisory_marker(row), update_marker(row), keys_marker(row)]
-            .into_iter()
-            .flatten()
-            .collect();
-        if !note_text.is_empty() {
+        //
+        // A Problem note jumps ahead of all of them. The cell is truncated to
+        // fit, and on a row carrying an advisory and an update the caveat was
+        // being cut off entirely — which is how a kubeconfig that will not load
+        // ends up less visible than a minor version bump.
+        let note_leads = row.installed && row.note_kind == Some(NoteKind::Problem);
+        let mut cell: Vec<String> = Vec::new();
+        if note_leads {
+            cell.push(note_text.clone());
+        }
+        cell.extend(
+            [advisory_marker(row), update_marker(row), keys_marker(row)]
+                .into_iter()
+                .flatten(),
+        );
+        if !note_leads && !note_text.is_empty() {
             cell.push(note_text);
         }
         let note = truncate(&cell.join(" · "), notes_w);
@@ -368,10 +456,13 @@ pub fn render_status(statuses: &[ToolStatus], now: DateTime<Utc>, styles: &Style
                 Some(style) => styles.paint(style, &expires_padded),
                 None => expires_padded,
             };
+            // The whole cell takes the note's colour: a row whose one caveat is
+            // a broken config should be findable by scanning for red, and the
+            // markers sharing the cell are about the same row anyway.
             let note_cell = if note.is_empty() {
                 note.clone()
             } else {
-                styles.paint(dim(), &note)
+                styles.paint(note_style(row.note_kind.unwrap_or(NoteKind::Info)), &note)
             };
             let line = format!(
                 "{tool}{gap}{active_cell}{gap}{profiles}{gap}{expires_cell}{gap}{note_cell}"
@@ -392,7 +483,9 @@ pub fn render_status(statuses: &[ToolStatus], now: DateTime<Utc>, styles: &Style
         out.push('\n');
         for status in with_notes {
             for note in &status.notes {
-                out.push_str(&format!("  {}: {}\n", status.tool, one_line(note)));
+                let line = format!("  {}: {}", status.tool, note_text(note));
+                out.push_str(&styles.paint(note_style(note.kind), &line));
+                out.push('\n');
             }
         }
     }
@@ -570,6 +663,33 @@ pub fn indent_lines(items: &[String]) -> String {
         .join("\n")
 }
 
+/// One kinded note as an indented line, ready to print.
+///
+/// `Info` keeps the `note:` label these lines have always carried: in a block
+/// of `config:` / `backup:` lines a bare sentence reads as stray prose. The two
+/// louder kinds trade the label for their marker — `⚠` and `✖` say the same
+/// thing in less space, and say it more urgently.
+pub fn note_line(indent: &str, note: &Note, styles: &Styles) -> String {
+    let body = match note_marker(note.kind) {
+        Some(marker) => format!("{marker} {}", one_line(&note.text)),
+        None => format!("note: {}", one_line(&note.text)),
+    };
+    styles.paint(note_style(note.kind), &format!("{indent}{body}"))
+}
+
+/// Kinded notes, one indented line each, marker included.
+///
+/// The colour is applied per line rather than to the block: a report usually
+/// mixes an explanation with the one caveat that matters, and painting them
+/// alike is what made the caveat invisible.
+pub fn indent_notes(notes: &[Note], styles: &Styles) -> String {
+    notes
+        .iter()
+        .map(|n| styles.paint(note_style(n.kind), &format!("  {}", note_text(n))))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Scopes, one per line under the `scopes:` heading, so a long grant list
 /// stays scannable instead of becoming a wall of comma-separated text.
 pub fn render_scopes(scopes: &[String]) -> String {
@@ -583,7 +703,7 @@ pub fn render_scopes(scopes: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use patchbay_core::{Profile, ToolStatus};
+    use patchbay_core::{Expiry, Profile, ToolStatus};
 
     fn now() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
@@ -714,8 +834,8 @@ mod tests {
         let mut status = ToolStatus::empty("gcloud", true);
         status.active = Some("me@example.com".into());
         status.profiles = vec![
-            Profile::new("other@example.com").expires_at(Some(now() + Duration::hours(1))),
-            Profile::new("me@example.com").expires_at(Some(now() + Duration::days(3))),
+            Profile::new("other@example.com").expiry(Expiry::At(now() + Duration::hours(1))),
+            Profile::new("me@example.com").expiry(Expiry::At(now() + Duration::days(3))),
         ];
         let row = build_row(&status, now());
         let cell = row.expires.unwrap();
@@ -727,7 +847,7 @@ mod tests {
     #[test]
     fn test_row_falls_back_to_soonest_and_flags_it() {
         let mut status = ToolStatus::empty("aws", true);
-        status.profiles = vec![Profile::new("prod").expires_at(Some(now() + Duration::hours(2)))];
+        status.profiles = vec![Profile::new("prod").expiry(Expiry::At(now() + Duration::hours(2)))];
         let row = build_row(&status, now());
         let cell = row.expires.unwrap();
         assert_eq!(cell.text, "in 2h (other)");
@@ -735,25 +855,106 @@ mod tests {
     }
 
     #[test]
-    fn test_row_without_expiry_is_empty() {
+    fn test_row_without_a_deadline_names_the_state_instead() {
         let mut status = ToolStatus::empty("gh", true);
-        status.profiles = vec![Profile::new("octocat")];
+        status.profiles =
+            vec![Profile::new("octocat").expiry(Expiry::unknown("in the system keychain"))];
         status.active = Some("octocat".into());
         let row = build_row(&status, now());
-        assert!(row.expires.is_none());
+        let cell = row.expires.unwrap();
+        assert_eq!(cell.text, "expiry unknown");
+        assert_eq!(cell.level, ExpiryLevel::Quiet);
         assert_eq!(row.profiles, 1);
     }
 
     #[test]
-    fn test_row_note_is_first_note_on_one_line() {
+    fn test_row_note_is_one_line_and_an_info_note_carries_no_marker() {
         let mut status = ToolStatus::empty("gcloud", true);
-        status.note("ADC account\ndiffers from the\nactive account");
-        status.note("second");
+        status.info("ADC account\ndiffers from the\nactive account");
+        status.info("second");
         let row = build_row(&status, now());
+        // Info is the quiet kind: no glyph, and the first one wins the tie.
         assert_eq!(
             row.note.as_deref(),
             Some("ADC account differs from the active account")
         );
+        assert_eq!(row.note_kind, Some(NoteKind::Info));
+    }
+
+    #[test]
+    fn test_the_cell_takes_the_loudest_note_not_the_first() {
+        // The trap: probes emit notes in discovery order, so a broken config
+        // routinely lands behind two explanations and never reaches the board.
+        let mut status = ToolStatus::empty("docker", true);
+        status.info("docker holds credentials for several registries at once");
+        status.problem("~/.docker/config.json is not valid JSON");
+        status.warn("credentials are stored base64-encoded, not encrypted");
+
+        let row = build_row(&status, now());
+        assert_eq!(
+            row.note.as_deref(),
+            Some("✖ ~/.docker/config.json is not valid JSON")
+        );
+        assert_eq!(row.note_kind, Some(NoteKind::Problem));
+
+        // With nothing broken, the warning is the loudest thing there is.
+        let mut milder = ToolStatus::empty("docker", true);
+        milder.info("docker holds credentials for several registries at once");
+        milder.warn("credentials are stored base64-encoded, not encrypted");
+        let row = build_row(&milder, now());
+        assert_eq!(
+            row.note.as_deref(),
+            Some("⚠ credentials are stored base64-encoded, not encrypted")
+        );
+        assert_eq!(row.note_kind, Some(NoteKind::Warn));
+    }
+
+    #[test]
+    fn test_a_profile_that_cannot_expire_says_so_instead_of_a_dash() {
+        // An em dash in the EXPIRES column used to mean four different things.
+        let cases = [
+            (Expiry::NoExpiry, "no expiry"),
+            (Expiry::unknown("in the system keychain"), "expiry unknown"),
+            (
+                Expiry::Refreshable {
+                    access_token_expires: Some(now() - Duration::hours(5)),
+                },
+                "auto-renewed",
+            ),
+        ];
+        for (expiry, label) in cases {
+            let mut status = ToolStatus::empty("wrangler", true);
+            status.active = Some("pathors".into());
+            status.profiles = vec![Profile::new("pathors").expiry(expiry.clone())];
+            let cell = build_row(&status, now())
+                .expires
+                .unwrap_or_else(|| panic!("{expiry:?} produced no expiry cell"));
+            assert_eq!(cell.text, label);
+            // None of these is a countdown, so none of them may be coloured
+            // like one — an auto-renewed token in particular has an access
+            // token five hours stale and is still perfectly healthy.
+            assert_eq!(cell.level, ExpiryLevel::Quiet, "{expiry:?}");
+        }
+
+        let out = render_status(
+            &[{
+                let mut status = ToolStatus::empty("aws", true);
+                status.active = Some("prod".into());
+                status.profiles = vec![Profile::new("prod").expiry(Expiry::NoExpiry)];
+                status
+            }],
+            now(),
+            &Styles::new(false),
+        );
+        assert!(out.contains("no expiry"), "{out}");
+    }
+
+    #[test]
+    fn test_a_tool_with_no_active_profile_still_shows_a_dash() {
+        // "Nothing is selected" is not a claim about any expiry.
+        let mut status = ToolStatus::empty("rclone", true);
+        status.profiles = vec![Profile::new("legal").expiry(Expiry::NoExpiry)];
+        assert!(build_row(&status, now()).expires.is_none());
     }
 
     #[test]
@@ -761,7 +962,7 @@ mod tests {
         let mut installed = ToolStatus::empty("gcloud", true);
         installed.active = Some("me@example.com".into());
         installed.profiles =
-            vec![Profile::new("me@example.com").expires_at(Some(now() + Duration::days(3)))];
+            vec![Profile::new("me@example.com").expiry(Expiry::At(now() + Duration::days(3)))];
         let absent = ToolStatus::empty("wrangler", false);
 
         let out = render_status(&[installed, absent], now(), &Styles::new(false));
@@ -815,7 +1016,7 @@ mod tests {
 
         // The marker leads the cell and the real note follows it.
         let mut noted = urgent.clone();
-        noted.note("two wrangler configs exist");
+        noted.info("two wrangler configs exist");
         let out = render_status(&[noted], now(), &Styles::new(false));
         assert!(out.contains("+2 keys! · two wrangler configs"), "{out}");
     }
@@ -942,7 +1143,7 @@ mod tests {
             expires_at: None,
             expiry_state: KeyExpiryState::Valid,
         }];
-        status.note("two config directories exist");
+        status.info("two config directories exist");
 
         let out = render_status(&[status], now(), &Styles::new(false));
         let row_line = out.lines().find(|l| l.starts_with("neon")).unwrap();
@@ -955,6 +1156,30 @@ mod tests {
             assert!(at >= last, "{marker} is out of order in {row_line:?}");
             last = at;
         }
+    }
+
+    #[test]
+    fn test_a_problem_note_outranks_the_version_markers() {
+        // The row this exists for: an advisory and an update between them fill
+        // the cell, and the broken config gets truncated away.
+        let mut status = with_version("kubectl", "1.32.2", Some("1.35.0"));
+        status.advisories = vec![advisory("kubectl", false)];
+        status.problem("~/.kube/config is a directory of kubeconfigs, not a kubeconfig file");
+
+        let out = render_status(&[status], now(), &Styles::new(false));
+        let line = out.lines().find(|l| l.starts_with("kubectl")).unwrap();
+        let problem = line.find('✖').expect("the problem must survive truncation");
+        let advisory_at = line.find("⚠ advisory").unwrap_or(usize::MAX);
+        assert!(problem < advisory_at, "{line:?}");
+
+        // A quieter note keeps its place after the markers: only a problem is
+        // urgent enough to displace them.
+        let mut milder = with_version("kubectl", "1.32.2", Some("1.35.0"));
+        milder.advisories = vec![advisory("kubectl", false)];
+        milder.warn("2 contexts mint tokens through an exec credential plugin");
+        let out = render_status(&[milder], now(), &Styles::new(false));
+        let line = out.lines().find(|l| l.starts_with("kubectl")).unwrap();
+        assert!(line.find("⚠ advisory") < line.find('↑'), "{line:?}");
     }
 
     #[test]
@@ -1071,13 +1296,25 @@ mod tests {
     }
 
     #[test]
-    fn test_table_lists_full_notes_below() {
+    fn test_table_lists_full_notes_below_each_led_by_its_kind() {
         let mut status = ToolStatus::empty("gcloud", true);
-        status.note("ADC points at a different account than gcloud config");
+        status.warn("ADC points at a different account than gcloud config");
+        status.info("read from ~/.config/gcloud/configurations");
+        status.problem("active_config names `work` but there is no configurations/config_work");
+
         let out = render_status(&[status], now(), &Styles::new(false));
         assert!(out.contains("\nnotes\n"), "{out}");
         assert!(
-            out.contains("  gcloud: ADC points at a different account"),
+            out.contains("  gcloud: ⚠ ADC points at a different account"),
+            "{out}"
+        );
+        assert!(
+            out.contains("  gcloud: ✖ active_config names `work`"),
+            "{out}"
+        );
+        // The quiet kind stays quiet: no glyph at all, in either section.
+        assert!(
+            out.contains("  gcloud: read from ~/.config/gcloud/configurations"),
             "{out}"
         );
     }
@@ -1086,7 +1323,7 @@ mod tests {
     fn test_table_emits_ansi_when_color_is_on() {
         let mut status = ToolStatus::empty("aws", true);
         status.active = Some("prod".into());
-        status.profiles = vec![Profile::new("prod").expires_at(Some(now() - Duration::days(1)))];
+        status.profiles = vec![Profile::new("prod").expiry(Expiry::At(now() - Duration::days(1)))];
         let out = render_status(&[status], now(), &Styles::new(true));
         assert!(out.contains('\u{1b}'));
         assert!(out.contains("expired 1d ago"));
