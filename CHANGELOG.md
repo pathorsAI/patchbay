@@ -5,6 +5,21 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **The panel no longer claims installed CLIs are "not available on PATH".**
+  macOS launches GUI apps — and the MCP servers GUI clients spawn — with the
+  bare launchd `PATH` (`/usr/bin:/bin:/usr/sbin:/sbin`), so the panel could
+  not see a gcloud living in `~/google-cloud-sdk/bin` or a Homebrew-installed
+  gh, and every tier-2 button answered "install it" for a tool that works
+  fine in the terminal. The panel and `patchbay-mcp` now detect that bare
+  inheritance at startup and adopt the login shell's `PATH` (asked of the
+  user's own shell, with a hard timeout), so they resolve exactly the
+  binaries a terminal would. Terminal launches are untouched: a `PATH` with
+  any user entry on it is left alone.
+
 ## [0.4.0] - 2026-08-17
 
 ### Added

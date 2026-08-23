@@ -23,6 +23,10 @@ use server::PatchbayServer;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // A GUI MCP client (Claude Desktop, an IDE) spawns this server with
+    // launchd's bare PATH, under which every `which gcloud` fails. Adopt the
+    // login shell's PATH before the first probe can resolve a binary.
+    patchbay_core::adopt_login_shell_path();
     // Detect once: the probe set is bound to this machine's config paths, and
     // each probe re-reads its files on every call, so nothing goes stale.
     let registry = patchbay_core::Registry::detect()?;
