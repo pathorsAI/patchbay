@@ -46,6 +46,7 @@ pub mod paths;
 pub mod probe;
 pub mod probes;
 pub mod registry;
+pub mod shell_path;
 pub mod types;
 pub mod util;
 pub mod versions;
@@ -69,6 +70,7 @@ pub use migrate::{
 pub use paths::Paths;
 pub use probe::Probe;
 pub use registry::Registry;
+pub use shell_path::adopt_login_shell_path;
 pub use types::{
     ActiveConcept, ConnectionState, Expiry, KeyRef, Note, NoteKind, PermissionScope,
     PermissionsReport, Profile, SwitchOutcome, ToolCategory, ToolStatus, VerifyOutcome,

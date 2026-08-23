@@ -369,6 +369,10 @@ async fn mcp_copy(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Launched from Finder or the Dock, this process gets launchd's bare
+    // PATH and every `which gcloud` inside the probes fails. Adopt the login
+    // shell's PATH before the first command can run a probe.
+    patchbay_core::adopt_login_shell_path();
     tauri::Builder::default()
         // Self-update. The updater reads the signed feed named in
         // tauri.conf.json; `process` supplies the relaunch that takes the user
