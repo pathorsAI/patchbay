@@ -32,8 +32,8 @@ use chrono::{DateTime, Utc};
 
 use super::bundle::{self, BundleFile, BundleMcpServer, BundleSecret, Payload};
 use super::manifest::{
-    EnvEnvironmentRecord, EnvProjectRecord, EnvSyncRecord, KeyRecord, Manifest, McpRecord,
-    SetupItem, Source, ToolRecord, BUNDLE_VERSION,
+    EnvEnvironmentRecord, EnvProjectRecord, EnvSyncRecord, KeyRecord, Manifest, ManifestKind,
+    McpRecord, SetupItem, Source, ToolRecord, BUNDLE_VERSION,
 };
 use super::policy::{policy_for, Portability};
 use super::setup;
@@ -175,6 +175,33 @@ pub struct Exporter<'a> {
 impl Exporter<'_> {
     /// Read the machine and build the payload. Nothing is written here.
     pub fn payload(&self, keys: &KeySelection, now: DateTime<Utc>) -> anyhow::Result<Payload> {
+        self.build(keys, now, ManifestKind::Bundle)
+    }
+
+    /// The readable half on its own: no credential file is opened, no vault
+    /// secret is read, and the result carries nothing that has to be encrypted.
+    ///
+    /// This is the artifact you can commit, sync or paste into a chat — the
+    /// record of *what this machine uses*, which on a new machine is enough for
+    /// `pb plan --manifest` (or an agent over `plan_setup`) to say what to
+    /// install and what to log into.
+    pub fn manifest(&self, now: DateTime<Utc>) -> anyhow::Result<Manifest> {
+        Ok(self
+            .build(&KeySelection::None, now, ManifestKind::Inventory)?
+            .manifest)
+    }
+
+    fn build(
+        &self,
+        keys: &KeySelection,
+        now: DateTime<Utc>,
+        kind: ManifestKind,
+    ) -> anyhow::Result<Payload> {
+        // An inventory reads no credential file at all. Skipping the walk is
+        // not an optimisation: opening every credential on the machine to
+        // produce a file that will hold none of them is exactly the kind of
+        // unnecessary handling this command exists to avoid.
+        let carry_files = kind == ManifestKind::Bundle;
         let mut files = Vec::new();
         let mut tools = Vec::new();
         let mut gaps = Vec::new();
@@ -201,7 +228,12 @@ impl Exporter<'_> {
             };
 
             if let Some(policy) = policy {
-                for location in policy.portability.locations() {
+                for location in policy
+                    .portability
+                    .locations()
+                    .iter()
+                    .filter(|_| carry_files)
+                {
                     for found in location.collect(self.paths) {
                         let bytes = match std::fs::read(&found.source) {
                             Ok(bytes) => bytes,
@@ -259,12 +291,13 @@ impl Exporter<'_> {
 
         let (key_records, secrets, key_gaps) = self.collect_keys(keys)?;
         gaps.extend(key_gaps);
-        let (mcp_records, mcp_servers) = self.collect_mcp();
+        let (mcp_records, mcp_servers) = self.collect_mcp(carry_files);
         let (env_records, env_entries, env_gaps) = self.collect_env_projects();
         gaps.extend(env_gaps);
 
         let manifest = Manifest {
             version: BUNDLE_VERSION,
+            kind,
             created_at: now,
             source: Source {
                 patchbay_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -458,7 +491,11 @@ impl Exporter<'_> {
     /// Every user-scope MCP registration, by name in the manifest and with
     /// values in the payload. Project scopes are read but never carried: they
     /// belong to a repository, not to the machine.
-    fn collect_mcp(&self) -> (Vec<McpRecord>, Vec<BundleMcpServer>) {
+    /// `carry_values` is false for an inventory: the registrations are still
+    /// worth listing (that is the point of the file), but nothing about them
+    /// travels, and a record claiming otherwise is the one thing a manifest
+    /// must never do.
+    fn collect_mcp(&self, carry_values: bool) -> (Vec<McpRecord>, Vec<BundleMcpServer>) {
         let mut records = Vec::new();
         let mut servers = Vec::new();
         for client in self.clients.clients() {
@@ -466,7 +503,9 @@ impl Exporter<'_> {
                 if !entry.is_writable_scope() {
                     continue;
                 }
-                let spec = self.clients.read_spec(&client.client, &entry.name).ok();
+                let spec = carry_values
+                    .then(|| self.clients.read_spec(&client.client, &entry.name).ok())
+                    .flatten();
                 if let Some(spec) = &spec {
                     let (transport, command, args, url) = match &spec.transport {
                         TransportSpec::Stdio { command, args } => {
@@ -844,6 +883,70 @@ pub(crate) mod tests {
         let all = exporter.payload(&KeySelection::All, Utc::now()).unwrap();
         assert_eq!(all.secrets.len(), 2);
         assert!(!all.manifest.gaps.iter().any(|g| g.id.starts_with("key:")));
+    }
+
+    #[test]
+    fn test_an_inventory_manifest_carries_nothing_and_says_so() {
+        // A machine with a portable credential file, a keychain-bound tool, and
+        // an MCP registration whose env holds a secret — one of each kind that
+        // an export would treat differently.
+        let home = fake_home(&[
+            (
+                ".config/gh/hosts.yml",
+                "github.com:\n    user: octocat\n    users:\n        octocat:\n",
+            ),
+            (
+                ".config/gcloud/configurations/config_default",
+                "[core]\naccount = a@b.com\n",
+            ),
+            (
+                ".cursor/mcp.json",
+                r#"{"mcpServers":{"grafana":{"command":"uvx","args":["mcp-grafana"],"env":{"GRAFANA_TOKEN":"glsa_secret"}}}}"#,
+            ),
+        ]);
+        let (paths, registry, vault, clients, envs) = exporter_parts(home.path());
+        let exporter = Exporter {
+            paths: &paths,
+            registry: &registry,
+            vault: &vault,
+            clients: &clients,
+            envs: &envs,
+        };
+
+        // The bundle path reads the files; the inventory must not.
+        let bundle = exporter.payload(&KeySelection::All, Utc::now()).unwrap();
+        assert!(!bundle.files.is_empty(), "the bundle should carry files");
+        assert_eq!(bundle.manifest.kind, ManifestKind::Bundle);
+
+        let manifest = exporter.manifest(Utc::now()).unwrap();
+        assert_eq!(manifest.kind, ManifestKind::Inventory);
+
+        // Nothing may claim to have travelled, because nothing did.
+        assert!(
+            manifest.tools.iter().all(|t| t.carried.is_empty()),
+            "an inventory carries no file, so no tool may list a carried location"
+        );
+        assert!(
+            manifest.mcp.iter().all(|r| !r.carried),
+            "an inventory carries no MCP value"
+        );
+        assert!(manifest.keys.iter().all(|k| !k.included));
+
+        // But it is still a record: the tools and registrations are named.
+        assert!(manifest.tools.iter().any(|t| t.tool == "gh"));
+        let grafana = manifest
+            .mcp
+            .iter()
+            .find(|r| r.name == "grafana")
+            .expect("the registration is the point of the file");
+        assert_eq!(grafana.env_keys, vec!["GRAFANA_TOKEN".to_string()]);
+
+        // And the file is safe to commit: the variable name travels, its value
+        // does not, and neither does anything else secret-shaped.
+        let json = manifest.to_json();
+        assert!(json.contains("GRAFANA_TOKEN"), "{json}");
+        assert!(!json.contains("glsa_secret"), "{json}");
+        assert!(!json.contains("oauth_token"), "{json}");
     }
 
     #[test]

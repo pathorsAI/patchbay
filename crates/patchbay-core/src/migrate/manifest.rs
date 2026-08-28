@@ -231,10 +231,42 @@ pub struct Source {
     pub os: String,
 }
 
+/// How a manifest was produced, and therefore what a reader may assume.
+///
+/// The distinction matters to anyone planning against one. A `Bundle` manifest
+/// travelled beside the credential files it describes, so `carried` is the list
+/// of things that really did move. An `Inventory` manifest travelled alone —
+/// it is a record of what this machine uses, nothing more, and every login on
+/// the new machine has to be made by hand. `pb plan` re-probes either way, so
+/// this changes what the file *claims*, not what the checklist checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManifestKind {
+    /// Written inside an encrypted bundle, beside the files it describes.
+    #[default]
+    Bundle,
+    /// Written on its own by `pb manifest`. Carries no credential, and nothing
+    /// it names has travelled.
+    Inventory,
+}
+
+impl ManifestKind {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Bundle => "bundle",
+            Self::Inventory => "inventory",
+        }
+    }
+}
+
 /// The whole readable manifest.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
     pub version: u32,
+    /// Bundle or inventory. Defaults to `bundle` so a manifest written by an
+    /// older patchbay still reads correctly.
+    #[serde(default)]
+    pub kind: ManifestKind,
     pub created_at: DateTime<Utc>,
     pub source: Source,
     pub tools: Vec<ToolRecord>,
@@ -282,6 +314,7 @@ mod tests {
     fn manifest_with_secret_shaped_everything() -> Manifest {
         Manifest {
             version: BUNDLE_VERSION,
+            kind: ManifestKind::default(),
             created_at: Utc::now(),
             source: Source {
                 patchbay_version: "0.1.0".into(),

@@ -30,7 +30,7 @@
 - **[Key vault](docs/key-vault.md)** — standalone API keys no CLI tracks: values in the macOS Keychain, metadata on disk, provider-aware `pb key verify`, and AI registration over MCP.
 - **[Project env vault](docs/env-vault.md)** — a project's environment variables without a plaintext `.env`: pull from Infisical, keep hand-set local overrides that never sync back, run a command with the merged result. A project is a portable name, not a path — `pb export` carries the manifest to a new machine (or copy the one file), clone the repo, pull.
 - **[Keeping CLIs current](#keeping-clis-current)** — which tools are outdated, which were renamed out from under you, and the exact command to update each one.
-- **[Migrate](docs/migration.md)** — export to a new machine; whatever can't travel, your AI walks you through re-authing.
+- **[Migrate](docs/migration.md)** — export to a new machine; whatever can't travel, your AI walks you through re-authing. Or `pb manifest`: the secret-free record of what you use, safe to commit, and enough for an agent to rebuild a machine from.
 
 ## Install
 
@@ -104,6 +104,20 @@ pb export                        # one encrypted .pbx: the logins that can trave
 pb import patchbay-*.pbx         # --dry-run first; existing files are backed up
 pb plan                          # what's left, with the exact command for each
 ```
+
+Or carry no credential at all:
+
+```sh
+pb manifest -o setup/manifest.json   # the record of what this machine uses
+pb plan --manifest setup/manifest.json   # …on the new machine: install this, log into that
+```
+
+`pb manifest` writes the readable half on its own — which CLIs you use, which
+accounts are active, what is in the key vault, which MCP servers are registered.
+**No secret value is in it and no credential file is even opened**, so it is
+meant to be committed and synced. On a new machine it is the input your agent
+plans against, which is the difference between "set this laptop up" and "set
+this laptop up like the last one".
 
 Files that work anywhere get copied (`gcloud`, `aws`, `kubectl`, `wrangler`,
 `rclone`, `npm`, `docker`, `ssh` config…). Credentials the OS keychain or the

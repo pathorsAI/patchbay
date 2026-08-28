@@ -126,6 +126,12 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Write the secret-free record of what this machine uses.
+    Manifest {
+        /// Where to write it. Defaults to stdout.
+        #[arg(long, short)]
+        out: Option<std::path::PathBuf>,
+    },
     /// Restore a bundle onto this machine.
     Import {
         bundle: std::path::PathBuf,
@@ -301,6 +307,7 @@ fn run() -> Result<i32> {
             },
             &styles(),
         ),
+        Command::Manifest { out } => migrate::run(migrate::Command::Manifest { out }, &styles()),
         Command::Import {
             bundle,
             dry_run,

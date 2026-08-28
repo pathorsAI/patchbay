@@ -5,6 +5,47 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-08-28
+
+### Added
+
+- **`pb manifest` — the record of what this machine uses, with no credential in
+  it.** `manifest.json` already existed and already had the right shape: no
+  secret by construction, and the thing `pb plan --manifest` plans against. But
+  it only ever existed *inside* an encrypted bundle, so getting the readable
+  half meant producing the dangerous half first and then unpacking it. The one
+  artifact that was safe to commit was the one you could not get without
+  encrypting every credential on the machine.
+
+  `pb manifest` writes it on its own, to stdout or `-o <file>`. It opens no
+  credential file — not an optimisation, but the point: reading every
+  credential to produce a file that will hold none of them is exactly the
+  handling this command exists to avoid. The vault is listed and never
+  unlocked, MCP servers are named with their env/header variable NAMES and
+  never their values, and `carried` is empty everywhere because nothing was
+  carried.
+
+  Manifests now say which kind they are — `"kind": "inventory"` here,
+  `"bundle"` inside an export, defaulting to `bundle` so an older file still
+  reads. An inventory that claimed things had travelled would be the one lie
+  this format must never tell.
+
+  The intended shape: keep it in a repo you sync, and a new machine's whole
+  setup is `pb plan --manifest setup/manifest.json` — install this, log into
+  that — or the same list over MCP, worked one item at a time by an agent.
+
+- **`write_manifest` MCP tool.** The one part of a machine move an agent can do
+  unsupervised, because it touches no credential. `pb export` and `pb import`
+  stay in the CLI, where the human and the passphrase are.
+
+### Fixed
+
+- **MCP records no longer claim to have been carried when they were not.**
+  `collect_mcp` marked a registration `carried: true` whenever its spec was
+  readable, which was true for a bundle and wrong for anything that does not
+  carry values. Found while building the inventory path; it never affected a
+  real export, where the two happened to coincide.
+
 ## [0.5.0] - 2026-08-28
 
 ### Added

@@ -204,6 +204,7 @@ pub fn portability_label(kind: PortabilityKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::migrate::manifest::ManifestKind;
     use crate::migrate::manifest::{
         EnvEnvironmentRecord, EnvProjectRecord, EnvSyncRecord, KeyRecord, McpRecord, SetupItem,
         Source, ToolRecord, BUNDLE_VERSION,
@@ -215,6 +216,7 @@ mod tests {
     fn manifest() -> Manifest {
         Manifest {
             version: BUNDLE_VERSION,
+            kind: ManifestKind::default(),
             created_at: Utc::now(),
             source: Source {
                 patchbay_version: "0.1.0".into(),

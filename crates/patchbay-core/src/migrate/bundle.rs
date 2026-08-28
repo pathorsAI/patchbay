@@ -331,6 +331,7 @@ pub fn read(path: &Path, passphrase: &str) -> anyhow::Result<Payload> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::migrate::manifest::ManifestKind;
     use crate::migrate::manifest::Source;
     use chrono::{DateTime, Utc};
 
@@ -342,6 +343,7 @@ mod tests {
             version: BUNDLE_VERSION,
             manifest: Manifest {
                 version: BUNDLE_VERSION,
+                kind: ManifestKind::default(),
                 created_at: DateTime::parse_from_rfc3339("2026-08-13T00:00:00Z")
                     .unwrap()
                     .with_timezone(&Utc),
