@@ -42,6 +42,7 @@ use crate::keys::KeyRegistry;
 use crate::mcp_clients::{McpClientRegistry, TransportSpec};
 use crate::paths::Paths;
 use crate::registry::Registry;
+use crate::types::ToolStatus;
 
 /// Which vault secrets travel inside the encrypted payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,85 +208,8 @@ impl Exporter<'_> {
         let mut gaps = Vec::new();
 
         for status in self.registry.status_all() {
-            let policy = policy_for(&status.tool);
-            let mut record = ToolRecord {
-                tool: status.tool.clone(),
-                category: status.category,
-                installed: status.installed,
-                portability: policy
-                    .map(|p| p.portability.kind())
-                    .unwrap_or(super::policy::PortabilityKind::PointerOnly),
-                reason: policy.map(|p| p.portability.reason()).unwrap_or("").into(),
-                profiles: status.profiles.clone(),
-                active: status.active.clone(),
-                carried: Vec::new(),
-                subject: None,
-                scopes: Vec::new(),
-                // The bundle is a portable record, not a live board: its notes
-                // are prose for whoever reads the manifest on the new machine,
-                // so the severity a probe attached here does not travel.
-                notes: status.notes.iter().map(|n| n.text.clone()).collect(),
-            };
-
-            if let Some(policy) = policy {
-                for location in policy
-                    .portability
-                    .locations()
-                    .iter()
-                    .filter(|_| carry_files)
-                {
-                    for found in location.collect(self.paths) {
-                        let bytes = match std::fs::read(&found.source) {
-                            Ok(bytes) => bytes,
-                            // A file that vanished between the walk and the
-                            // read is a note, not a failed export.
-                            Err(e) => {
-                                record.notes.push(format!(
-                                    "could not read {}: {e}; it is not in the bundle",
-                                    found.source.display()
-                                ));
-                                continue;
-                            }
-                        };
-                        if !record.carried.contains(location) {
-                            record.carried.push(*location);
-                        }
-                        files.push(BundleFile::encode(
-                            &status.tool,
-                            *location,
-                            found.rel.clone(),
-                            found.mode,
-                            &bytes,
-                        ));
-                    }
-                }
-
-                // What the active credential may do, for the tools where
-                // re-creating it by hand is easy to get wrong.
-                if policy.record_permissions && status.installed && self.paths.may_exec() {
-                    if let Ok(report) = self.registry.permissions(&status.tool) {
-                        if report.supported {
-                            record.subject = report.subject;
-                            record.scopes = report.scopes;
-                        }
-                    }
-                }
-
-                if let Some(gap) = tool_gap(policy, &status) {
-                    gaps.push(gap);
-                }
-            }
-
-            // Docker's file names the credential helper; the helper's secrets
-            // stay in the keychain. Say so where the user will see it.
-            if status.tool == "docker" && !record.carried.is_empty() {
-                record.notes.push(
-                    "the registry list travelled; any secret held by a credential helper \
-                     (`credsStore`) stayed in this machine's keychain — `docker login` again on \
-                     the new machine if a pull is refused"
-                        .to_string(),
-                );
-            }
+            let (record, gap) = self.tool_record(&status, carry_files, &mut files);
+            gaps.extend(gap);
             tools.push(record);
         }
 
@@ -320,6 +244,108 @@ impl Exporter<'_> {
             mcp: mcp_servers,
             env_projects: env_entries,
         })
+    }
+
+    /// One tool's manifest row, and the gap it leaves if it cannot travel.
+    ///
+    /// Appends to `files` rather than returning them: a tool contributes zero
+    /// or many files, and threading a second vector back out of here only to
+    /// splice it into the same place would obscure that the caller's list is
+    /// the one being built.
+    fn tool_record(
+        &self,
+        status: &ToolStatus,
+        carry_files: bool,
+        files: &mut Vec<BundleFile>,
+    ) -> (ToolRecord, Option<SetupItem>) {
+        let policy = policy_for(&status.tool);
+        let mut record = ToolRecord {
+            tool: status.tool.clone(),
+            category: status.category,
+            installed: status.installed,
+            portability: policy
+                .map(|p| p.portability.kind())
+                .unwrap_or(super::policy::PortabilityKind::PointerOnly),
+            reason: policy.map(|p| p.portability.reason()).unwrap_or("").into(),
+            profiles: status.profiles.clone(),
+            active: status.active.clone(),
+            carried: Vec::new(),
+            subject: None,
+            scopes: Vec::new(),
+            // The bundle is a portable record, not a live board: its notes
+            // are prose for whoever reads the manifest on the new machine,
+            // so the severity a probe attached here does not travel.
+            notes: status.notes.iter().map(|n| n.text.clone()).collect(),
+        };
+
+        let Some(policy) = policy else {
+            return (record, None);
+        };
+
+        if carry_files {
+            self.carry_tool_files(status, policy, &mut record, files);
+        }
+
+        // What the active credential may do, for the tools where re-creating
+        // it by hand is easy to get wrong.
+        if policy.record_permissions && status.installed && self.paths.may_exec() {
+            if let Ok(report) = self.registry.permissions(&status.tool) {
+                if report.supported {
+                    record.subject = report.subject;
+                    record.scopes = report.scopes;
+                }
+            }
+        }
+
+        // Docker's file names the credential helper; the helper's secrets
+        // stay in the keychain. Say so where the user will see it.
+        if status.tool == "docker" && !record.carried.is_empty() {
+            record.notes.push(
+                "the registry list travelled; any secret held by a credential helper \
+                 (`credsStore`) stayed in this machine's keychain — `docker login` again on \
+                 the new machine if a pull is refused"
+                    .to_string(),
+            );
+        }
+
+        (record, tool_gap(policy, status))
+    }
+
+    /// Copy every file this tool's policy points at into the bundle, recording
+    /// which locations actually yielded one.
+    fn carry_tool_files(
+        &self,
+        status: &ToolStatus,
+        policy: &super::policy::ToolPolicy,
+        record: &mut ToolRecord,
+        files: &mut Vec<BundleFile>,
+    ) {
+        for location in policy.portability.locations() {
+            for found in location.collect(self.paths) {
+                let bytes = match std::fs::read(&found.source) {
+                    Ok(bytes) => bytes,
+                    // A file that vanished between the walk and the read is a
+                    // note, not a failed export.
+                    Err(e) => {
+                        record.notes.push(format!(
+                            "could not read {}: {e}; it is not in the bundle",
+                            found.source.display()
+                        ));
+                        continue;
+                    }
+                };
+                if !record.carried.contains(location) {
+                    record.carried.push(*location);
+                }
+                files.push(BundleFile::encode(
+                    &status.tool,
+                    *location,
+                    found.rel.clone(),
+                    found.mode,
+                    &bytes,
+                ));
+            }
+        }
     }
 
     /// Vault metadata always; values only for the selected ids.
