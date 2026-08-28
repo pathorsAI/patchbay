@@ -207,10 +207,18 @@ the distinct names a consumer would see (a local override shares its name with t
 variable it shadows, so the counts do not simply add up). `synced_at: null` means this \
 environment has NEVER been pulled — it exists on local values alone, which is normal, not broken.
 - `sync` is the remote this project pulls from — { provider, project_id, account, domain, \
-env_map } — or null when the project has never been linked. `account` is the login a pull must \
-run as; `env_map` is patchbay's environment name -> the remote's own slug, for remotes that call \
-`production` something else. A null `sync` is why a pull_env would fail, and the fix is \
+env_map, secret_path } — or null when the project has never been linked. `account` is the login a \
+pull must run as; `env_map` is patchbay's environment name -> the remote's own slug, for remotes \
+that call `production` something else. A null `sync` is why a pull_env would fail, and the fix is \
 `pb env link` in a terminal.
+- `secret_path` is WHICH FOLDER INSIDE THE REMOTE PROJECT a pull reads: Infisical's secrets are a \
+tree, and a project keeping one folder per service is ordinary. '/' is the root and the default. \
+It is NOT a directory on this machine and has nothing to do with `roots` — it is the same string \
+for every teammate on every laptop. Read it before explaining an empty environment: a pull from \
+the wrong folder succeeds, returns nothing and reports no error, so 'the project has no variables' \
+and 'patchbay is looking in the wrong place' are the same evidence until you check this field. \
+Changing it is `pb env link --project-id <id> --path /<folder>` in a terminal; no tool here \
+writes it.
 - Variable NAMES are not listed here; use list_env_vars for one environment. Variable VALUES are \
 not returned by this or any other tool.")]
     async fn list_env_projects(&self) -> Result<CallToolResult, ErrorData> {
@@ -315,10 +323,16 @@ remote themselves.
 NOT gated behind PATCHBAY_ALLOW_SECRET_READ: the result carries names and counts only, never a \
 value, even though values were fetched and stored on the way through.
 
-Returns { project, env, remote_env, count, overridden[], notes[] }.
+Returns { project, env, remote_env, secret_path, count, overridden[], notes[] }.
 
 - `remote_env` is the remote's own slug for this environment, which is not always the name you \
 passed (`production` -> `prod`, via the project's env_map).
+- `secret_path` is the folder INSIDE the remote project this pull actually read, '/' being its \
+root. Say it out loud whenever the count surprises the user: an export from a folder that holds \
+nothing succeeds and returns zero variables, so a pull pointed at '/' on a project that keeps its \
+secrets under '/outbox' looks exactly like a project with no variables at all. The fix is \
+`pb env link --project-id <id> --path /<folder>` in a terminal — patchbay's own `notes[]` will \
+have said so too.
 - `count` is how many variables the synced layer now holds.
 - `overridden[]` are local names that shadow a synced one AFTER this pull. Those variables did \
 not change for a consumer, however new the pulled value is — say so if the user was expecting \
@@ -552,6 +566,7 @@ mod tests {
             env_map: [("production".to_string(), "prod".to_string())]
                 .into_iter()
                 .collect(),
+            secret_path: "/outbox".into(),
         });
 
         let sync = described(&p)["sync"].clone();
@@ -562,6 +577,9 @@ mod tests {
         assert_eq!(sync["account"], "contact@pathors.com");
         assert_eq!(sync["domain"], "https://eu.infisical.com/api");
         assert_eq!(sync["env_map"]["production"], "prod");
+        // Which folder of the remote the pull reads. Without it an agent
+        // cannot tell an empty project from one being read in the wrong place.
+        assert_eq!(sync["secret_path"], "/outbox");
     }
 
     #[test]
@@ -684,6 +702,31 @@ mod tests {
             text.contains("A project is a NAME, not a directory"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn test_both_tools_explain_the_secret_path_and_that_it_is_not_a_directory() {
+        // The confusion worth pre-empting: `secret_path` and `roots` are both
+        // slash-separated strings on the same object, and only one of them is
+        // a place on this machine.
+        let listed = description("list_env_projects");
+        assert!(listed.contains("secret_path"), "{listed}");
+        assert!(
+            listed.contains("WHICH FOLDER INSIDE THE REMOTE PROJECT"),
+            "{listed}"
+        );
+        assert!(
+            listed.contains("NOT a directory on this machine"),
+            "{listed}"
+        );
+        assert!(listed.contains("--path /<folder>"), "{listed}");
+
+        // And on a pull, the failure it explains: an empty answer that is not
+        // an error.
+        let pulled = description("pull_env");
+        assert!(pulled.contains("secret_path"), "{pulled}");
+        assert!(pulled.contains("returns zero variables"), "{pulled}");
+        assert!(pulled.contains("--path /<folder>"), "{pulled}");
     }
 
     #[test]

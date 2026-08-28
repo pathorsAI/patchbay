@@ -14,6 +14,13 @@
 //! repo lives somewhere else on the next laptop, and a manifest that hard-codes
 //! `/Users/you/repos/x` is a manifest that cannot travel.
 //!
+//! One string in here looks like a path and is not one:
+//! [`SyncConfig::secret_path`], the folder *inside the Infisical project* a
+//! pull reads. It names nothing on this machine and is identical for everyone
+//! on the team, so it travels exactly as well as the remote project id beside
+//! it. The rule above is about local directories; do not read it as a ban on
+//! anything containing a slash.
+//!
 //! One project may have several attached roots. Git worktrees are the case that
 //! forces it: `repo/`, `repo/.worktrees/feature-a` and a second clone are the
 //! same project and want the same environment, and asking the user to register
@@ -87,6 +94,10 @@ pub const DEFAULT_ENV: &str = "dev";
 /// directory root. See [`read_marker`] and [`EnvRegistry::find_by_dir`].
 pub const MARKER_FILE: &str = ".patchbay.toml";
 
+/// The folder inside the *remote* a pull reads when nobody says otherwise: the
+/// Infisical project's root. See [`SyncConfig::secret_path`].
+pub const DEFAULT_SECRET_PATH: &str = "/";
+
 // ---------------------------------------------------------------------------
 // validation
 // ---------------------------------------------------------------------------
@@ -126,6 +137,34 @@ pub fn validate_var_name(name: &str) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// An Infisical secret path, in the one spelling patchbay stores: a leading
+/// slash, no trailing one, `/` for the root.
+///
+/// This is **not** a filesystem path and is never checked against one — it is a
+/// folder *inside the remote project*, which is why it is normalised by string
+/// surgery rather than by [`std::path`]. See [`SyncConfig::secret_path`] for the
+/// distinction this module works hard not to blur.
+///
+/// Empty, `""`, `"/"` and `"//"` all mean the root, because a user who passes
+/// `--path ""` means "no subfolder" rather than "a folder with no name". A
+/// non-root path is stored `/like/this` so that two spellings of the same
+/// folder — `outbox`, `/outbox/` — can never produce two registry entries that
+/// pull the same secrets while looking different in `pb env projects`.
+pub fn normalize_secret_path(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let inner = trimmed.trim_matches('/');
+    if inner.is_empty() {
+        return DEFAULT_SECRET_PATH.to_string();
+    }
+    format!("/{inner}")
+}
+
+/// serde's `default` for [`SyncConfig::secret_path`]: the root, which is what
+/// every registry written before the field existed meant.
+fn default_secret_path() -> String {
+    DEFAULT_SECRET_PATH.to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -200,6 +239,30 @@ pub struct SyncConfig {
     /// itself.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env_map: BTreeMap<String, String>,
+    /// Which folder **inside the Infisical project** a pull reads, e.g.
+    /// `/outbox`. `/` — the project root — is the default and was patchbay's
+    /// only behaviour before this field existed.
+    ///
+    /// **This is not a filesystem path**, and it is not the exception to the
+    /// "a project is a name, not a path" rule this module's header states. That
+    /// rule is about *this machine's* directories: `projects.json` records no
+    /// `/Users/you/repos/x`, because such a file could not be copied to another
+    /// laptop. A secret path is a coordinate inside the remote — the same
+    /// string for everyone on the team, on every machine — so it is exactly as
+    /// portable as `project_id` next to it, and belongs in the same file.
+    ///
+    /// Infisical's secrets are a tree, and one project holding a folder per
+    /// service is the shape teams actually use: `pathorsAI/coldmail` keeps its
+    /// variables under `/outbox`, so a pull from `/` returns nothing at all and
+    /// says so with an empty, entirely truthful "pulled 0 variables".
+    ///
+    /// Old registries have no such key at all, so it deserialises to `/` rather
+    /// than failing the whole file — which is why
+    /// [`PROJECTS_FILE_VERSION`] does not move for it: a patchbay from before
+    /// this field reads a file that carries it just as happily, because nothing
+    /// here is `deny_unknown_fields`.
+    #[serde(default = "default_secret_path")]
+    pub secret_path: String,
 }
 
 impl SyncConfig {
@@ -209,6 +272,23 @@ impl SyncConfig {
             .get(env)
             .cloned()
             .unwrap_or_else(|| env.to_string())
+    }
+
+    /// The secret path in its stored spelling, normalised again on the way out.
+    ///
+    /// [`EnvRegistry::set_sync`] already normalises what it writes, so this is
+    /// a second pass over a value that should need none. It is here because
+    /// `projects.json` is a file people hand-edit and hand-copy between
+    /// machines, and a stray `outbox` or `/outbox/` typed into it should pull
+    /// the right folder rather than send a shape the remote never matches.
+    pub fn remote_path(&self) -> String {
+        normalize_secret_path(&self.secret_path)
+    }
+
+    /// Whether the pull reads the project root, i.e. whether the path is worth
+    /// a reader's attention at all.
+    pub fn is_root_path(&self) -> bool {
+        self.remote_path() == DEFAULT_SECRET_PATH
     }
 }
 
@@ -801,7 +881,10 @@ impl EnvRegistry {
     }
 
     /// Point a project at a remote, replacing whatever it was linked to.
-    pub fn set_sync(&self, id: &str, sync: SyncConfig) -> anyhow::Result<ProjectEntry> {
+    ///
+    /// The secret path is normalised on the way in, so the registry holds one
+    /// spelling of a folder rather than the four a person might type.
+    pub fn set_sync(&self, id: &str, mut sync: SyncConfig) -> anyhow::Result<ProjectEntry> {
         if sync.provider != "infisical" {
             anyhow::bail!(
                 "`{}` is not a sync provider patchbay knows; the only one today is `infisical`",
@@ -811,6 +894,7 @@ impl EnvRegistry {
         for env in sync.env_map.keys() {
             validate_env_name(env)?;
         }
+        sync.secret_path = normalize_secret_path(&sync.secret_path);
 
         let mut file = self.load()?;
         let project = project_mut(&mut file, id)?;
@@ -2155,6 +2239,7 @@ mod tests {
                     env_map: [("production".to_string(), "prod".to_string())]
                         .into_iter()
                         .collect(),
+                    secret_path: DEFAULT_SECRET_PATH.into(),
                 },
             )
             .unwrap();
@@ -2173,6 +2258,7 @@ mod tests {
                     account: "a@b.com".into(),
                     domain: None,
                     env_map: BTreeMap::new(),
+                    secret_path: DEFAULT_SECRET_PATH.into(),
                 },
             )
             .unwrap_err()
@@ -2180,6 +2266,98 @@ mod tests {
         assert!(err.contains("the only one today is `infisical`"), "{err}");
         // The good config is still in place.
         assert!(v.registry.get("pathors").unwrap().unwrap().sync.is_some());
+    }
+
+    #[test]
+    fn test_a_secret_path_is_stored_in_one_spelling() {
+        for typed in ["/outbox", "outbox", "outbox/", "/outbox/", " /outbox "] {
+            assert_eq!(normalize_secret_path(typed), "/outbox", "{typed}");
+        }
+        // Everything that means "no folder" means the root, including the
+        // empty string a shell hands over for `--path ""`.
+        for typed in ["", "/", "//", "   "] {
+            assert_eq!(normalize_secret_path(typed), DEFAULT_SECRET_PATH, "{typed}");
+        }
+        // Nesting survives; only the ends are patchbay's business.
+        assert_eq!(normalize_secret_path("outbox/worker/"), "/outbox/worker");
+
+        // And the registry normalises on the way in, so two spellings of one
+        // folder cannot produce two entries that look different in
+        // `pb env projects` while pulling the same secrets.
+        let v = vault();
+        v.registry.register("pathors", "dev").unwrap();
+        let entry = v
+            .registry
+            .set_sync(
+                "pathors",
+                SyncConfig {
+                    provider: "infisical".into(),
+                    project_id: "3ab516bd".into(),
+                    account: "contact@pathors.com".into(),
+                    domain: None,
+                    env_map: BTreeMap::new(),
+                    secret_path: "outbox/".into(),
+                },
+            )
+            .unwrap();
+        let sync = entry.sync.unwrap();
+        assert_eq!(sync.secret_path, "/outbox");
+        assert_eq!(sync.remote_path(), "/outbox");
+        assert!(!sync.is_root_path());
+        assert!(std::fs::read_to_string(v.registry.path())
+            .unwrap()
+            .contains("/outbox"));
+    }
+
+    #[test]
+    fn test_a_registry_written_before_secret_paths_existed_still_loads() {
+        // Byte-for-byte what patchbay 0.4 wrote: a `sync` block with no
+        // `secret_path` key at all, and the schema version it has always
+        // carried. Adding a field must not turn every existing machine's
+        // projects.json into a hard error — which is what the version guard
+        // would do if the field were required, and what a bump would announce
+        // for a change that is compatible in both directions.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("projects.json"),
+            r#"{
+  "version": 1,
+  "projects": [
+    {
+      "id": "coldmail",
+      "default_env": "dev",
+      "created_at": "2026-08-01T00:00:00Z",
+      "environments": {
+        "dev": { "synced_names": ["API_KEY"], "local_names": [], "synced_at": null }
+      },
+      "sync": {
+        "provider": "infisical",
+        "project_id": "3ab516bd-248c-4be7-8f1a-bda73fe69d50",
+        "account": "contact@pathors.com"
+      }
+    }
+  ]
+}"#,
+        )
+        .unwrap();
+        let registry = registry_at(dir.path(), Box::new(MemoryKeystore::new()));
+
+        let entry = registry.get("coldmail").unwrap().unwrap();
+        let sync = entry.sync.clone().unwrap();
+        assert_eq!(sync.project_id, "3ab516bd-248c-4be7-8f1a-bda73fe69d50");
+        // The absent key means what it has always meant: the project root, so
+        // an upgraded patchbay pulls exactly what the old one did.
+        assert_eq!(sync.secret_path, DEFAULT_SECRET_PATH);
+        assert!(sync.is_root_path());
+        assert_eq!(entry.env("dev").unwrap().synced_names, vec!["API_KEY"]);
+
+        // And a write from the new build fills the field in rather than
+        // leaving the next reader to guess.
+        registry
+            .set_local("coldmail", "dev", "LOCAL_ONLY", "1")
+            .unwrap();
+        let raw = std::fs::read_to_string(registry.path()).unwrap();
+        assert!(raw.contains("\"secret_path\""), "{raw}");
     }
 
     // --- layers -------------------------------------------------------------

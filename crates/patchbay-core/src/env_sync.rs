@@ -15,6 +15,13 @@
 //! problem with the project rather than the wrong login. So the pull records
 //! the account it expects, checks it *before* spending a subprocess, and when
 //! they disagree it says both addresses and the command that fixes it.
+//!
+//! **Where in the remote** is the other pinned coordinate. Infisical's secrets
+//! are a tree, not a flat set, and a project holding one folder per service is
+//! the ordinary shape — `pathorsAI/coldmail` keeps everything under `/outbox`.
+//! A pull therefore reads [`crate::envs::SyncConfig::secret_path`] and passes
+//! it to the CLI; the default `/` is the project root and the behaviour every
+//! patchbay had before the field existed.
 
 use std::collections::BTreeMap;
 
@@ -37,6 +44,11 @@ pub struct PullOutcome {
     pub env: String,
     /// The remote's slug for it, which is not always the same thing.
     pub remote_env: String,
+    /// The folder inside the remote project this pull read, `/` for its root.
+    /// Reported on every pull, including the default one: "0 variables" and
+    /// "0 variables *from `/`*" are the same sentence until you know the
+    /// project keeps everything under `/outbox`.
+    pub secret_path: String,
     /// How many variables the synced layer now holds.
     pub count: usize,
     /// Local names that shadow a synced one, after this pull.
@@ -105,6 +117,7 @@ pub fn pull(
     }
 
     let remote_env = sync.remote_env(env);
+    let secret_path = sync.remote_path();
     let mut args: Vec<String> = vec![
         "export".into(),
         "--projectId".into(),
@@ -117,6 +130,15 @@ pub fn pull(
         // has to stay parseable JSON.
         "--silent".into(),
     ];
+    // `--path` only when it says something. `infisical export` defaults to the
+    // project root, so passing `--path /` would change no result on any CLI
+    // that has the flag while breaking every CLI old enough not to — and a
+    // subprocess should not carry an argument whose only effect is to narrow
+    // the versions it runs under.
+    if secret_path != crate::envs::DEFAULT_SECRET_PATH {
+        args.push("--path".into());
+        args.push(secret_path.clone());
+    }
     if let Some(domain) = &sync.domain {
         args.push("--domain".into());
         args.push(domain.clone());
@@ -137,7 +159,8 @@ pub fn pull(
             ));
         }
         anyhow::bail!(
-            "`infisical export` failed for `{}/{env}` (remote environment `{remote_env}`): {detail}",
+            "`infisical export` failed for `{}/{env}` (remote environment `{remote_env}`, secret \
+             path `{secret_path}`): {detail}",
             project.id
         );
     }
@@ -178,6 +201,25 @@ pub fn pull(
     }
 
     let count = vars.len();
+    // An empty answer is a successful export of a folder that holds nothing,
+    // and the likeliest reason is looking in the wrong one: Infisical's secrets
+    // are a tree, and a project that keeps everything under `/outbox` answers
+    // `/` with exactly this — no error, no secrets. Saying so here is the
+    // difference between a one-line fix and an afternoon of "the pull works
+    // but the app still has no DATABASE_URL".
+    if count == 0 {
+        let advice = if secret_path == crate::envs::DEFAULT_SECRET_PATH {
+            "that is the project root, and a project that keeps its secrets in a folder answers \
+             it with exactly this"
+        } else {
+            "that folder is empty, or spelled differently in the remote"
+        };
+        notes.push(format!(
+            "the remote returned nothing under `{secret_path}` of `{remote_env}`: {advice}; \
+             `pb env link --project-id {} --path /<folder>` points the pull somewhere else",
+            sync.project_id
+        ));
+    }
     registry.replace_synced(&project.id, env, vars, Utc::now())?;
 
     let overridden: Vec<String> = registry
@@ -202,6 +244,7 @@ pub fn pull(
     Ok(PullOutcome {
         env: env.to_string(),
         remote_env,
+        secret_path,
         count,
         overridden,
         notes,
@@ -325,6 +368,7 @@ mod tests {
             account: account.into(),
             domain: None,
             env_map: BTreeMap::new(),
+            secret_path: crate::envs::DEFAULT_SECRET_PATH.into(),
         }
     }
 
@@ -339,6 +383,9 @@ mod tests {
         let outcome = pull(&rig.paths, &rig.registry, &project, "dev").unwrap();
         assert_eq!(outcome.env, "dev");
         assert_eq!(outcome.remote_env, "dev");
+        // The default is the project root, and it is reported even though it
+        // was never typed.
+        assert_eq!(outcome.secret_path, "/");
         assert_eq!(outcome.count, 2);
         assert!(outcome.overridden.is_empty());
         assert!(outcome.notes.is_empty(), "{:?}", outcome.notes);
@@ -356,7 +403,9 @@ mod tests {
                 "--format",
                 "json",
                 "--silent",
-            ]
+            ],
+            "the root path must add no flag: it changes no result, and only \
+             narrows the infisical versions this runs under"
         );
 
         assert_eq!(
@@ -413,6 +462,55 @@ mod tests {
             .unwrap()
             .env("production")
             .is_some());
+    }
+
+    #[test]
+    fn test_a_secret_path_reaches_the_command_line_and_the_outcome() {
+        let rig = rig(
+            Some("contact@pathors.com"),
+            FakeExec::new().on("export", true, EXPORT, ""),
+        );
+        let mut sync = sync_for("contact@pathors.com");
+        // As a person would type it, rather than as the registry stores it.
+        sync.secret_path = "outbox/".into();
+        let project = rig.link(sync);
+
+        let outcome = pull(&rig.paths, &rig.registry, &project, "dev").unwrap();
+        assert_eq!(outcome.secret_path, "/outbox");
+        assert_eq!(outcome.count, 2);
+
+        let line = rig.exec.last().unwrap().line();
+        assert!(line.contains("--path /outbox"), "{line}");
+        // The path is a coordinate in the remote and nothing else changes with
+        // it: the environment is still patchbay's own name for it.
+        assert!(line.contains("--env dev"), "{line}");
+
+        // `set_sync` stored one spelling, so the registry cannot end up with
+        // two entries pulling the same folder.
+        let stored = rig.registry.get("pathors").unwrap().unwrap();
+        assert_eq!(stored.sync.unwrap().secret_path, "/outbox");
+    }
+
+    #[test]
+    fn test_an_empty_folder_says_which_one_it_read() {
+        let rig = rig(
+            Some("contact@pathors.com"),
+            FakeExec::new().on("export", true, "[]", ""),
+        );
+        let project = rig.link(sync_for("contact@pathors.com"));
+
+        // The coldmail case in miniature: the export succeeds, the folder is
+        // simply the wrong one, and a bare "pulled 0 variables" would look like
+        // an empty project rather than a misdirected pull.
+        let outcome = pull(&rig.paths, &rig.registry, &project, "dev").unwrap();
+        assert_eq!(outcome.count, 0);
+        assert!(
+            outcome.notes.iter().any(|n| n.contains("under `/`")
+                && n.contains("pb env link")
+                && n.contains("--path /<folder>")),
+            "{:?}",
+            outcome.notes
+        );
     }
 
     #[test]

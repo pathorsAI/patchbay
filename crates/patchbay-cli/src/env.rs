@@ -21,7 +21,8 @@ use chrono::{DateTime, Utc};
 use clap::{Args, Subcommand, ValueEnum};
 use patchbay_core::envs::{
     parse_dotenv, read_marker, render_dotenv, validate_project_id, write_marker, Attachment,
-    EnvRegistry, EnvVarInfo, EnvVarSource, ProjectEntry, SyncConfig, DEFAULT_ENV, MARKER_FILE,
+    EnvRegistry, EnvVarInfo, EnvVarSource, ProjectEntry, SyncConfig, DEFAULT_ENV,
+    DEFAULT_SECRET_PATH, MARKER_FILE,
 };
 use patchbay_core::paths::Paths;
 use patchbay_core::probes::infisical;
@@ -33,7 +34,11 @@ const TABLE_WIDTH: usize = 100;
 const GAP: usize = 2;
 const COL_ID_MAX: usize = 24;
 const COL_ENVS_MAX: usize = 22;
-const COL_SYNC_MAX: usize = 32;
+/// Wide enough for `infisical:` plus a work email plus a short secret path —
+/// the SYNC cell's three parts, and the last one is the one a reader cannot
+/// reconstruct from anywhere else. The column only grows to what the rows
+/// need, so projects pulling from the root are no wider than they were.
+const COL_SYNC_MAX: usize = 42;
 const COL_NAME_MAX: usize = 40;
 /// Wide enough for `local override`, the longest source label there is.
 const COL_SOURCE: usize = 14;
@@ -105,6 +110,11 @@ pub enum Command {
         /// Account the pull must run as. Defaults to the active infisical login.
         #[arg(long, value_name = "EMAIL")]
         account: Option<String>,
+        /// Folder inside the Infisical project to pull from: `--path /outbox`.
+        /// Defaults to `/`, the root — which holds nothing at all in a project
+        /// that keeps a folder per service.
+        #[arg(long, value_name = "PATH")]
+        path: Option<String>,
         /// API base URL, for self-hosted or EU instances.
         #[arg(long, value_name = "URL")]
         domain: Option<String>,
@@ -316,6 +326,7 @@ pub fn run(command: Command, styles: &Styles) -> Result<i32> {
             project_id,
             project,
             account,
+            path,
             domain,
             map,
         } => {
@@ -337,6 +348,11 @@ pub fn run(command: Command, styles: &Styles) -> Result<i32> {
                     account,
                     domain,
                     env_map: parse_env_map(&map)?,
+                    // `link` replaces the whole config, so an omitted --path
+                    // means the root here rather than "keep the old folder" —
+                    // the same rule --domain and --map have always followed.
+                    // `set_sync` normalises the spelling.
+                    secret_path: path.unwrap_or_else(|| DEFAULT_SECRET_PATH.to_string()),
                 },
             )?;
 
@@ -410,6 +426,7 @@ pub fn run(command: Command, styles: &Styles) -> Result<i32> {
                 outcome.env
             );
             println!("  remote environment: {}", outcome.remote_env);
+            println!("  secret path:        {}", outcome.secret_path);
             for note in &outcome.notes {
                 println!("  note: {note}");
             }
@@ -834,6 +851,10 @@ fn print_adopted_sync(registry: &EnvRegistry, entry: &ProjectEntry, root: &Path)
                     account,
                     domain: None,
                     env_map: BTreeMap::new(),
+                    // `.infisical.json` records a workspace, never a folder
+                    // inside it, so an adopted link reads the project root and
+                    // `pb env link --path` is how it learns better.
+                    secret_path: DEFAULT_SECRET_PATH.to_string(),
                 },
             )?;
             println!("  read {INFISICAL_FILE} in the project root");
@@ -880,6 +901,10 @@ fn print_sync(entry: &ProjectEntry) {
     };
     println!("  sync:        {} {}", sync.provider, sync.project_id);
     println!("  account:     {}", sync.account);
+    // Always, including the root: this is the line that tells somebody who
+    // linked a project whose secrets live in a folder that they have just
+    // pointed patchbay at an empty one.
+    println!("  secret path: {}", sync.remote_path());
     if let Some(domain) = &sync.domain {
         println!("  domain:      {domain}");
     }
@@ -1115,9 +1140,35 @@ pub fn render_projects(
         let room = width.saturating_sub(suffix.chars().count());
         format!("{}{suffix}", render::truncate(&shown[0], room))
     };
-    let sync_cell = |p: &ProjectEntry| match &p.sync {
+    // A non-root secret path is shown because a reader cannot infer it and it
+    // decides what a pull returns; the root is left off, since a column saying
+    // `/` on every row would be pure noise. The suffix is reserved out of the
+    // width rather than left to the row's own truncation — the same trick the
+    // ROOTS column plays with `+N more`, and for the same reason: truncation
+    // eats the end of the cell, which is exactly the part nobody could guess.
+    let sync_full = |p: &ProjectEntry| match &p.sync {
+        Some(sync) if !sync.is_root_path() => {
+            format!("{}:{} {}", sync.provider, sync.account, sync.remote_path())
+        }
         Some(sync) => format!("{}:{}", sync.provider, sync.account),
         None => DASH.to_string(),
+    };
+    let sync_cell = |p: &ProjectEntry, width: usize| {
+        let full = sync_full(p);
+        if full.chars().count() <= width {
+            return full;
+        }
+        match &p.sync {
+            Some(sync) if !sync.is_root_path() => {
+                let suffix = format!(" {}", sync.remote_path());
+                let room = width.saturating_sub(suffix.chars().count());
+                format!(
+                    "{}{suffix}",
+                    render::truncate(&format!("{}:{}", sync.provider, sync.account), room)
+                )
+            }
+            _ => render::truncate(&full, width),
+        }
     };
     let envs_cell = |p: &ProjectEntry| {
         let names = p.env_names();
@@ -1139,7 +1190,7 @@ pub fn render_projects(
         COL_ENVS_MAX,
     );
     let sync_w = column_width(
-        projects.iter().map(|p| sync_cell(p).chars().count()),
+        projects.iter().map(|p| sync_full(p).chars().count()),
         "SYNC",
         COL_SYNC_MAX,
     );
@@ -1166,7 +1217,7 @@ pub fn render_projects(
             root_w,
         );
         let envs = pad(&render::truncate(&envs_cell(project), envs_w), envs_w);
-        let sync = render::truncate(&sync_cell(project), sync_w);
+        let sync = sync_cell(project, sync_w);
         // An unlinked project is a fact about the project, not a warning.
         let sync = if project.sync.is_none() {
             styles.paint(dim(), &sync)
@@ -1403,6 +1454,7 @@ mod tests {
                     account: "contact@pathors.com".into(),
                     domain: None,
                     env_map: BTreeMap::new(),
+                    secret_path: DEFAULT_SECRET_PATH.into(),
                 },
             )
             .unwrap();
@@ -1424,6 +1476,53 @@ mod tests {
         let col = lines[0].find("ROOTS").unwrap();
         assert!(lines[1][col..].starts_with("/repos/pathors"), "{out}");
         assert!(lines[2][col..].starts_with("/repos/side-project"), "{out}");
+    }
+
+    #[test]
+    fn test_the_sync_column_shows_a_secret_path_and_hides_the_root_one() {
+        let (_dir, registry) = vault();
+        registry.register("coldmail", "dev").unwrap();
+        registry.attach("/repos/coldmail", "coldmail").unwrap();
+        registry.register("pathors", "dev").unwrap();
+        registry.attach("/repos/pathors", "pathors").unwrap();
+        let link = |id: &str, path: &str| {
+            registry
+                .set_sync(
+                    id,
+                    SyncConfig {
+                        provider: "infisical".into(),
+                        project_id: "3ab516bd".into(),
+                        account: "contact@pathors.com".into(),
+                        domain: None,
+                        env_map: BTreeMap::new(),
+                        secret_path: path.into(),
+                    },
+                )
+                .unwrap();
+        };
+        link("coldmail", "/outbox");
+        link("pathors", DEFAULT_SECRET_PATH);
+
+        let out = render_projects(
+            &registry.projects().unwrap(),
+            &roots_of(&registry),
+            &Styles::new(false),
+        );
+        let lines: Vec<&str> = out.lines().collect();
+
+        // Which folder a project pulls from is the one thing in this row a
+        // reader cannot work out for themselves, so it is shown whole.
+        assert!(lines[1].starts_with("coldmail"), "{out}");
+        assert!(
+            lines[1].contains("infisical:contact@pathors.com /outbox"),
+            "{out}"
+        );
+        // And the default says nothing, because `/` on every row is noise.
+        assert!(lines[2].starts_with("pathors"), "{out}");
+        assert!(
+            lines[2].trim_end().ends_with("contact@pathors.com"),
+            "{out}"
+        );
     }
 
     #[test]
