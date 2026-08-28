@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
-use crate::envs::{validate_var_name, EnvRegistry, EnvVarSource, ProjectEntry};
+use crate::envs::{validate_var_name, EnvRegistry, EnvVarSource, ProjectEntry, SyncConfig};
 use crate::paths::Paths;
 use crate::probes::infisical;
 
@@ -68,13 +68,19 @@ struct RemoteSecret {
     value: String,
 }
 
-/// Replace one environment's synced layer with what the remote holds.
-pub fn pull(
-    paths: &Paths,
-    registry: &EnvRegistry,
-    project: &ProjectEntry,
-    env: &str,
-) -> anyhow::Result<PullOutcome> {
+/// Everything that has to hold before a pull is worth a subprocess, in the
+/// order a person can act on: is this project linked at all, is it linked to
+/// something patchbay can read, is the machine-global login the right one, and
+/// is the CLI even here. Each answer is a different command to type, so each
+/// gets its own message rather than one "cannot pull" covering four causes.
+///
+/// The account check comes before the binary check on purpose. Both are local,
+/// so neither is cheaper; but a machine with the wrong login is the failure
+/// this module exists for (see the module docs), and a person who has both
+/// problems wants to hear about that one first.
+///
+/// Returns the [`SyncConfig`] the caller would otherwise have to unwrap again.
+fn preflight<'a>(paths: &Paths, project: &'a ProjectEntry) -> anyhow::Result<&'a SyncConfig> {
     let Some(sync) = &project.sync else {
         anyhow::bail!(
             "no sync configured for `{}`; link it with `pb env link --project-id <infisical \
@@ -116,14 +122,20 @@ pub fn pull(
         );
     }
 
-    let remote_env = sync.remote_env(env);
-    let secret_path = sync.remote_path();
+    Ok(sync)
+}
+
+/// The argv for one `infisical export`. Kept whole and separate because it is
+/// the module's contract with a program patchbay does not own: every element is
+/// a version-sensitive promise about a CLI's surface, and tests assert on it
+/// word for word.
+fn export_args(sync: &SyncConfig, remote_env: &str, secret_path: &str) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "export".into(),
         "--projectId".into(),
         sync.project_id.clone(),
         "--env".into(),
-        remote_env.clone(),
+        remote_env.into(),
         "--format".into(),
         "json".into(),
         // Without it the CLI decorates stdout with its own banner, and stdout
@@ -137,12 +149,62 @@ pub fn pull(
     // the versions it runs under.
     if secret_path != crate::envs::DEFAULT_SECRET_PATH {
         args.push("--path".into());
-        args.push(secret_path.clone());
+        args.push(secret_path.into());
     }
     if let Some(domain) = &sync.domain {
         args.push("--domain".into());
         args.push(domain.clone());
     }
+    args
+}
+
+/// The remote's array folded into the map a synced layer is made of, plus the
+/// notes explaining what the fold lost.
+///
+/// Both anomalies are recorded rather than raised. A remote is a shared thing:
+/// one name the shell could not export, or one key someone entered twice, must
+/// not stop everyone else's pull — but it does have to be visible, because the
+/// map alone cannot show that it once held something else.
+fn index_secrets(secrets: Vec<RemoteSecret>) -> (BTreeMap<String, String>, Vec<String>) {
+    let mut notes = Vec::new();
+    let mut vars: BTreeMap<String, String> = BTreeMap::new();
+    let mut duplicated: Vec<String> = Vec::new();
+    for secret in secrets {
+        if let Err(e) = validate_var_name(&secret.key) {
+            notes.push(format!("skipped a remote name: {e}"));
+            continue;
+        }
+        if vars.insert(secret.key.clone(), secret.value).is_some()
+            && !duplicated.contains(&secret.key)
+        {
+            duplicated.push(secret.key);
+        }
+    }
+    if !duplicated.is_empty() {
+        notes.push(format!(
+            "the remote returned {} more than once; the last value won",
+            duplicated
+                .iter()
+                .map(|k| format!("`{k}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    (vars, notes)
+}
+
+/// Replace one environment's synced layer with what the remote holds.
+pub fn pull(
+    paths: &Paths,
+    registry: &EnvRegistry,
+    project: &ProjectEntry,
+    env: &str,
+) -> anyhow::Result<PullOutcome> {
+    let sync = preflight(paths, project)?;
+
+    let remote_env = sync.remote_env(env);
+    let secret_path = sync.remote_path();
+    let args = export_args(sync, &remote_env, &secret_path);
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
     let out = paths.run_env("infisical", &argv, &[])?;
 
@@ -173,32 +235,7 @@ pub fn pull(
         )
     })?;
 
-    let mut notes = Vec::new();
-    let mut vars: BTreeMap<String, String> = BTreeMap::new();
-    let mut duplicated: Vec<String> = Vec::new();
-    for secret in secrets {
-        // A name the shell could not export is skipped, not fatal: one odd key
-        // in a shared project must not stop everyone else's pull.
-        if let Err(e) = validate_var_name(&secret.key) {
-            notes.push(format!("skipped a remote name: {e}"));
-            continue;
-        }
-        if vars.insert(secret.key.clone(), secret.value).is_some()
-            && !duplicated.contains(&secret.key)
-        {
-            duplicated.push(secret.key);
-        }
-    }
-    if !duplicated.is_empty() {
-        notes.push(format!(
-            "the remote returned {} more than once; the last value won",
-            duplicated
-                .iter()
-                .map(|k| format!("`{k}`"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
+    let (vars, mut notes) = index_secrets(secrets);
 
     let count = vars.len();
     // An empty answer is a successful export of a folder that holds nothing,

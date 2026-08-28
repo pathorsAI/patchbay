@@ -1104,80 +1104,93 @@ fn column_width(values: impl Iterator<Item = usize>, header: &str, max: usize) -
         .max(header.len())
 }
 
+/// The ROOTS cell for one project: this machine's attachments for it, comma
+/// joined while they fit and collapsed to the first plus `+N more` when they do
+/// not. An ellipsis in the middle of the second path would say less than the
+/// count does: what a reader wants from a wide list is *how many*, and one full
+/// path to recognise the project by.
+///
+/// The count is reserved out of `width` rather than left to the row's own
+/// truncation, which would eat it and leave a bare `…` claiming nothing in
+/// particular.
+fn roots_cell(paths: Option<&[PathBuf]>, width: usize) -> String {
+    let paths = match paths {
+        Some(paths) if !paths.is_empty() => paths,
+        // Not attached *here*. Normal for a project that arrived with a copied
+        // projects.json, and for a repo resolved by its marker.
+        _ => return DASH.to_string(),
+    };
+    let shown: Vec<String> = paths.iter().map(|path| render::tilde(path)).collect();
+    let joined = shown.join(", ");
+    if joined.chars().count() <= width || shown.len() == 1 {
+        return joined;
+    }
+    let suffix = format!(" +{} more", shown.len() - 1);
+    let room = width.saturating_sub(suffix.chars().count());
+    format!("{}{suffix}", render::truncate(&shown[0], room))
+}
+
+/// The SYNC cell at its natural width, which is also what the column is sized
+/// against.
+///
+/// A non-root secret path is shown because a reader cannot infer it and it
+/// decides what a pull returns; the root is left off, since a column saying `/`
+/// on every row would be pure noise.
+fn sync_full(p: &ProjectEntry) -> String {
+    match &p.sync {
+        Some(sync) if !sync.is_root_path() => {
+            format!("{}:{} {}", sync.provider, sync.account, sync.remote_path())
+        }
+        Some(sync) => format!("{}:{}", sync.provider, sync.account),
+        None => DASH.to_string(),
+    }
+}
+
+/// The SYNC cell squeezed into `width`. The path suffix is reserved out of the
+/// width rather than left to the row's own truncation — the same trick the
+/// ROOTS column plays with `+N more`, and for the same reason: truncation eats
+/// the end of the cell, which is exactly the part nobody could guess.
+fn sync_cell(p: &ProjectEntry, width: usize) -> String {
+    let full = sync_full(p);
+    if full.chars().count() <= width {
+        return full;
+    }
+    match &p.sync {
+        Some(sync) if !sync.is_root_path() => {
+            let suffix = format!(" {}", sync.remote_path());
+            let room = width.saturating_sub(suffix.chars().count());
+            format!(
+                "{}{suffix}",
+                render::truncate(&format!("{}:{}", sync.provider, sync.account), room)
+            )
+        }
+        _ => render::truncate(&full, width),
+    }
+}
+
+/// The ENVS cell: the environment names, or a dash for a project that has none
+/// registered yet.
+fn envs_cell(p: &ProjectEntry) -> String {
+    let names = p.env_names();
+    if names.is_empty() {
+        DASH.to_string()
+    } else {
+        names.join(",")
+    }
+}
+
 /// The project table. Roots are long, so ROOTS takes whatever the other columns
 /// leave and gets truncated into it.
 ///
 /// `roots` is this machine's attachments, by project id — a project may have
 /// several (worktrees), and one copied from another machine may have none here
 /// at all.
-///
-/// Several roots are comma-joined while they fit, and collapse to the first
-/// plus `+N more` when they do not. An ellipsis in the middle of the second
-/// path would say less than the count does: what a reader wants from a wide
-/// list is *how many*, and one full path to recognise the project by.
 pub fn render_projects(
     projects: &[ProjectEntry],
     roots: &BTreeMap<String, Vec<PathBuf>>,
     styles: &Styles,
 ) -> String {
     let unattached = projects.iter().any(|p| !roots.contains_key(&p.id));
-    let roots_cell = |p: &ProjectEntry, width: usize| {
-        let paths = match roots.get(&p.id) {
-            Some(paths) if !paths.is_empty() => paths,
-            // Not attached *here*. Normal for a project that arrived with a
-            // copied projects.json, and for a repo resolved by its marker.
-            _ => return DASH.to_string(),
-        };
-        let shown: Vec<String> = paths.iter().map(|path| render::tilde(path)).collect();
-        let joined = shown.join(", ");
-        if joined.chars().count() <= width || shown.len() == 1 {
-            return joined;
-        }
-        // The count is reserved out of the width rather than left to the row's
-        // own truncation, which would eat it and leave a bare `…` claiming
-        // nothing in particular.
-        let suffix = format!(" +{} more", shown.len() - 1);
-        let room = width.saturating_sub(suffix.chars().count());
-        format!("{}{suffix}", render::truncate(&shown[0], room))
-    };
-    // A non-root secret path is shown because a reader cannot infer it and it
-    // decides what a pull returns; the root is left off, since a column saying
-    // `/` on every row would be pure noise. The suffix is reserved out of the
-    // width rather than left to the row's own truncation — the same trick the
-    // ROOTS column plays with `+N more`, and for the same reason: truncation
-    // eats the end of the cell, which is exactly the part nobody could guess.
-    let sync_full = |p: &ProjectEntry| match &p.sync {
-        Some(sync) if !sync.is_root_path() => {
-            format!("{}:{} {}", sync.provider, sync.account, sync.remote_path())
-        }
-        Some(sync) => format!("{}:{}", sync.provider, sync.account),
-        None => DASH.to_string(),
-    };
-    let sync_cell = |p: &ProjectEntry, width: usize| {
-        let full = sync_full(p);
-        if full.chars().count() <= width {
-            return full;
-        }
-        match &p.sync {
-            Some(sync) if !sync.is_root_path() => {
-                let suffix = format!(" {}", sync.remote_path());
-                let room = width.saturating_sub(suffix.chars().count());
-                format!(
-                    "{}{suffix}",
-                    render::truncate(&format!("{}:{}", sync.provider, sync.account), room)
-                )
-            }
-            _ => render::truncate(&full, width),
-        }
-    };
-    let envs_cell = |p: &ProjectEntry| {
-        let names = p.env_names();
-        if names.is_empty() {
-            DASH.to_string()
-        } else {
-            names.join(",")
-        }
-    };
 
     let id_w = column_width(
         projects.iter().map(|p| p.id.chars().count()),
@@ -1213,7 +1226,10 @@ pub fn render_projects(
     for project in projects {
         let id = pad(&render::truncate(&project.id, id_w), id_w);
         let root = pad(
-            &render::truncate(&roots_cell(project, root_w), root_w),
+            &render::truncate(
+                &roots_cell(roots.get(&project.id).map(Vec::as_slice), root_w),
+                root_w,
+            ),
             root_w,
         );
         let envs = pad(&render::truncate(&envs_cell(project), envs_w), envs_w);
