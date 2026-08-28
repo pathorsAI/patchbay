@@ -798,6 +798,7 @@ mod tests {
                     account: "me@home.com".into(),
                     domain: None,
                     env_map: Default::default(),
+                    secret_path: crate::envs::DEFAULT_SECRET_PATH.into(),
                 },
             )
             .unwrap();

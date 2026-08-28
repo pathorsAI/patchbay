@@ -5,6 +5,35 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`pb env pull` can read a folder inside an Infisical project, not just its
+  root.** Infisical's secrets are a tree, and a project holding one folder per
+  service is the ordinary shape — but patchbay had no idea such a thing
+  existed and always exported from `/`. A pull aimed at the root of a project
+  that keeps everything under `/outbox` does not fail: it succeeds, returns
+  nothing, and reports `0 variables`, which reads exactly like a project nobody
+  has filled in yet. `pathorsAI/coldmail` could therefore not use the env vault
+  at all and ran `infisical run --path /outbox -- <cmd>` by hand.
+
+  `pb env link --project-id <id> --path /outbox` now pins the folder alongside
+  the account, `pb env pull` passes it to the CLI, and every place the sync
+  config is visible says which folder it is: the `secret path:` line under
+  `pb env link` and `pb env init`, the SYNC column of `pb env projects`, the
+  `secret_path` field on a pull's result, and `sync.secret_path` in the MCP
+  `list_env_projects`. A pull that comes back empty now names the folder it
+  read and the command that repoints it, rather than leaving `0` to be
+  interpreted.
+
+  Nothing changes for a project that pulls from the root, which is still the
+  default and still adds no flag to the `infisical` command line. Registries
+  written by earlier versions have no such field and are read as `/`, so
+  `projects.json` needs no migration and no version bump — the folder inside
+  the remote is the same string on every machine, so it travels in the portable
+  manifest exactly like the remote project id beside it.
+
 ## [0.4.1] - 2026-08-24
 
 ### Fixed

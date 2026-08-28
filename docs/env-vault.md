@@ -32,7 +32,9 @@ work from, and copying it is the supported way to take your projects with you.
 Which directories on *this* machine belong to which project is a separate list,
 `~/.config/patchbay/attachments.json`, because the same repo lives somewhere
 else on the next laptop and a manifest that hard-codes `/Users/you/repos/x` is a
-manifest that cannot travel.
+manifest that cannot travel. (One string in there does look like a path and is
+not one: the [secret path](#which-folder-of-the-remote) names a folder *inside
+Infisical*, is identical on every machine, and travels with the rest.)
 
 A directory resolves to a project two ways, in this order:
 
@@ -208,7 +210,9 @@ advice to Infisical's own message.
 
 `pb env init` picks the pin up for you when it registers a *new* project: it
 reads `.infisical.json` in the directory for the `workspaceId` and records the
-currently active account alongside it. An `init` that only attaches a second
+currently active account alongside it. That file names a workspace and never a
+folder inside one, so an adopted link always starts at the root; `pb env link
+--path` is how it learns better. An `init` that only attaches a second
 worktree to a project that already exists reads nothing — that project's link is
 already decided, and re-reading this checkout's file could silently replace an
 env map somebody set by hand. `pb env link` sets or replaces the same thing
@@ -227,6 +231,52 @@ odd. A remote name that is not a usable shell identifier is skipped with a
 note rather than failing the pull: one strange key in a shared project must not
 stop everybody else. A name the remote returned twice is noted too; the last
 value won.
+
+### Which folder of the remote
+
+Infisical's secrets are a **tree**, not a flat set. One project routinely holds
+a folder per service — `/outbox`, `/worker`, `/web` — and a pull that reads the
+wrong one does not fail. It succeeds, returns nothing, and reports `0 variables`
+with a completely straight face, which is indistinguishable from a project
+nobody has put anything in yet. `pathorsAI/coldmail` is the case that forced
+this: everything it needs lives under `/outbox`, so until patchbay could be told
+that, the repo could not use the env vault at all and fell back to
+`infisical run --path /outbox -- <cmd>` by hand.
+
+So each project's sync config pins a **secret path** alongside the account:
+
+```sh
+pb env link --project-id 3ab516bd-… --path /outbox
+```
+
+The default is `/`, the project's root, which is what every registry written
+before the field existed meant and what every pull did. The spelling is
+normalised on the way in — `outbox`, `/outbox/` and `/outbox` are one folder,
+stored once as `/outbox` — so two links to the same place cannot produce two
+entries that look different in `pb env projects` while pulling the same
+secrets. An empty `--path ""` means the root, because somebody who passes it
+means "no subfolder" rather than "a folder with no name".
+
+`pb env link` replaces the whole sync config, exactly as it does for `--domain`
+and `--map`: re-linking without `--path` puts the project back on `/`. And the
+path is only passed to the CLI when it is *not* `/` — `infisical export`
+already defaults to the root, so sending `--path /` would change no result while
+narrowing the CLI versions patchbay runs under.
+
+Where you see it: `pb env link` and `pb env init` echo a `secret path:` line,
+`pb env projects` shows a non-root path in the SYNC column (`/` is left off,
+since a column saying the same thing on every row is noise), and every pull
+reports the folder it read. A pull that comes back empty says which folder was
+empty and names the command that repoints it.
+
+**This is not a filesystem path**, and it is not an exception to *A project is a
+name, not a path* above. That rule is about directories on **this machine**:
+`projects.json` records no `/Users/you/repos/x`, because a manifest holding one
+cannot travel to the next laptop — which is why the roots live in
+`attachments.json` instead. A secret path is a coordinate **inside the remote**.
+It is the same string for every teammate on every machine, exactly as portable
+as the Infisical project id sitting next to it, and it belongs in the file you
+copy. Two slash-separated strings, two entirely different lifetimes.
 
 ### Getting values out
 
@@ -290,7 +340,7 @@ pb env init   [--id <slug>] [--dir <path>] [--default-env <env>] [--no-marker]
 pb env attach <id> [--dir <path>]
 pb env detach [--dir <path>]
 pb env link --project-id <uuid> [--project <slug>] [--account <email>]
-            [--domain <url>] [--map dev=development,...]
+            [--path /outbox] [--domain <url>] [--map dev=development,...]
 pb env projects [--json]
 pb env list   [-e <env>] [--project <id>] [--json]
 pb env pull   [-e <env>] [--project <id>] [--json]
@@ -444,4 +494,8 @@ the spelling that attached.
 
 **One provider.** `infisical` is the only thing `pull` knows, and `pb env link`
 refuses anything else by name rather than failing later. Everything else on the
-machine arrives through `pb env import`.
+machine arrives through `pb env import`. The secret path is stored as the string
+you gave it and is never checked against the remote: patchbay cannot tell a
+folder that is empty from one that does not exist, because the CLI answers both
+with an empty export and a zero exit code. What it can do is say which folder it
+read, and it does, on every pull.
