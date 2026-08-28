@@ -32,8 +32,8 @@ use chrono::{DateTime, Utc};
 
 use super::bundle::{self, BundleFile, BundleMcpServer, BundleSecret, Payload};
 use super::manifest::{
-    EnvEnvironmentRecord, EnvProjectRecord, EnvSyncRecord, KeyRecord, Manifest, McpRecord,
-    SetupItem, Source, ToolRecord, BUNDLE_VERSION,
+    EnvEnvironmentRecord, EnvProjectRecord, EnvSyncRecord, KeyRecord, Manifest, ManifestKind,
+    McpRecord, SetupItem, Source, ToolRecord, BUNDLE_VERSION,
 };
 use super::policy::{policy_for, Portability};
 use super::setup;
@@ -42,6 +42,7 @@ use crate::keys::KeyRegistry;
 use crate::mcp_clients::{McpClientRegistry, TransportSpec};
 use crate::paths::Paths;
 use crate::registry::Registry;
+use crate::types::ToolStatus;
 
 /// Which vault secrets travel inside the encrypted payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,96 +176,52 @@ pub struct Exporter<'a> {
 impl Exporter<'_> {
     /// Read the machine and build the payload. Nothing is written here.
     pub fn payload(&self, keys: &KeySelection, now: DateTime<Utc>) -> anyhow::Result<Payload> {
+        self.build(keys, now, ManifestKind::Bundle)
+    }
+
+    /// The readable half on its own: no credential file is opened, no vault
+    /// secret is read, and the result carries nothing that has to be encrypted.
+    ///
+    /// This is the artifact you can commit, sync or paste into a chat — the
+    /// record of *what this machine uses*, which on a new machine is enough for
+    /// `pb plan --manifest` (or an agent over `plan_setup`) to say what to
+    /// install and what to log into.
+    pub fn manifest(&self, now: DateTime<Utc>) -> anyhow::Result<Manifest> {
+        Ok(self
+            .build(&KeySelection::None, now, ManifestKind::Inventory)?
+            .manifest)
+    }
+
+    fn build(
+        &self,
+        keys: &KeySelection,
+        now: DateTime<Utc>,
+        kind: ManifestKind,
+    ) -> anyhow::Result<Payload> {
+        // An inventory reads no credential file at all. Skipping the walk is
+        // not an optimisation: opening every credential on the machine to
+        // produce a file that will hold none of them is exactly the kind of
+        // unnecessary handling this command exists to avoid.
+        let carry_files = kind == ManifestKind::Bundle;
         let mut files = Vec::new();
         let mut tools = Vec::new();
         let mut gaps = Vec::new();
 
         for status in self.registry.status_all() {
-            let policy = policy_for(&status.tool);
-            let mut record = ToolRecord {
-                tool: status.tool.clone(),
-                category: status.category,
-                installed: status.installed,
-                portability: policy
-                    .map(|p| p.portability.kind())
-                    .unwrap_or(super::policy::PortabilityKind::PointerOnly),
-                reason: policy.map(|p| p.portability.reason()).unwrap_or("").into(),
-                profiles: status.profiles.clone(),
-                active: status.active.clone(),
-                carried: Vec::new(),
-                subject: None,
-                scopes: Vec::new(),
-                // The bundle is a portable record, not a live board: its notes
-                // are prose for whoever reads the manifest on the new machine,
-                // so the severity a probe attached here does not travel.
-                notes: status.notes.iter().map(|n| n.text.clone()).collect(),
-            };
-
-            if let Some(policy) = policy {
-                for location in policy.portability.locations() {
-                    for found in location.collect(self.paths) {
-                        let bytes = match std::fs::read(&found.source) {
-                            Ok(bytes) => bytes,
-                            // A file that vanished between the walk and the
-                            // read is a note, not a failed export.
-                            Err(e) => {
-                                record.notes.push(format!(
-                                    "could not read {}: {e}; it is not in the bundle",
-                                    found.source.display()
-                                ));
-                                continue;
-                            }
-                        };
-                        if !record.carried.contains(location) {
-                            record.carried.push(*location);
-                        }
-                        files.push(BundleFile::encode(
-                            &status.tool,
-                            *location,
-                            found.rel.clone(),
-                            found.mode,
-                            &bytes,
-                        ));
-                    }
-                }
-
-                // What the active credential may do, for the tools where
-                // re-creating it by hand is easy to get wrong.
-                if policy.record_permissions && status.installed && self.paths.may_exec() {
-                    if let Ok(report) = self.registry.permissions(&status.tool) {
-                        if report.supported {
-                            record.subject = report.subject;
-                            record.scopes = report.scopes;
-                        }
-                    }
-                }
-
-                if let Some(gap) = tool_gap(policy, &status) {
-                    gaps.push(gap);
-                }
-            }
-
-            // Docker's file names the credential helper; the helper's secrets
-            // stay in the keychain. Say so where the user will see it.
-            if status.tool == "docker" && !record.carried.is_empty() {
-                record.notes.push(
-                    "the registry list travelled; any secret held by a credential helper \
-                     (`credsStore`) stayed in this machine's keychain — `docker login` again on \
-                     the new machine if a pull is refused"
-                        .to_string(),
-                );
-            }
+            let (record, gap) = self.tool_record(&status, carry_files, &mut files);
+            gaps.extend(gap);
             tools.push(record);
         }
 
         let (key_records, secrets, key_gaps) = self.collect_keys(keys)?;
         gaps.extend(key_gaps);
-        let (mcp_records, mcp_servers) = self.collect_mcp();
+        let (mcp_records, mcp_servers) = self.collect_mcp(carry_files);
         let (env_records, env_entries, env_gaps) = self.collect_env_projects();
         gaps.extend(env_gaps);
 
         let manifest = Manifest {
             version: BUNDLE_VERSION,
+            kind,
             created_at: now,
             source: Source {
                 patchbay_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -287,6 +244,108 @@ impl Exporter<'_> {
             mcp: mcp_servers,
             env_projects: env_entries,
         })
+    }
+
+    /// One tool's manifest row, and the gap it leaves if it cannot travel.
+    ///
+    /// Appends to `files` rather than returning them: a tool contributes zero
+    /// or many files, and threading a second vector back out of here only to
+    /// splice it into the same place would obscure that the caller's list is
+    /// the one being built.
+    fn tool_record(
+        &self,
+        status: &ToolStatus,
+        carry_files: bool,
+        files: &mut Vec<BundleFile>,
+    ) -> (ToolRecord, Option<SetupItem>) {
+        let policy = policy_for(&status.tool);
+        let mut record = ToolRecord {
+            tool: status.tool.clone(),
+            category: status.category,
+            installed: status.installed,
+            portability: policy
+                .map(|p| p.portability.kind())
+                .unwrap_or(super::policy::PortabilityKind::PointerOnly),
+            reason: policy.map(|p| p.portability.reason()).unwrap_or("").into(),
+            profiles: status.profiles.clone(),
+            active: status.active.clone(),
+            carried: Vec::new(),
+            subject: None,
+            scopes: Vec::new(),
+            // The bundle is a portable record, not a live board: its notes
+            // are prose for whoever reads the manifest on the new machine,
+            // so the severity a probe attached here does not travel.
+            notes: status.notes.iter().map(|n| n.text.clone()).collect(),
+        };
+
+        let Some(policy) = policy else {
+            return (record, None);
+        };
+
+        if carry_files {
+            self.carry_tool_files(status, policy, &mut record, files);
+        }
+
+        // What the active credential may do, for the tools where re-creating
+        // it by hand is easy to get wrong.
+        if policy.record_permissions && status.installed && self.paths.may_exec() {
+            if let Ok(report) = self.registry.permissions(&status.tool) {
+                if report.supported {
+                    record.subject = report.subject;
+                    record.scopes = report.scopes;
+                }
+            }
+        }
+
+        // Docker's file names the credential helper; the helper's secrets
+        // stay in the keychain. Say so where the user will see it.
+        if status.tool == "docker" && !record.carried.is_empty() {
+            record.notes.push(
+                "the registry list travelled; any secret held by a credential helper \
+                 (`credsStore`) stayed in this machine's keychain — `docker login` again on \
+                 the new machine if a pull is refused"
+                    .to_string(),
+            );
+        }
+
+        (record, tool_gap(policy, status))
+    }
+
+    /// Copy every file this tool's policy points at into the bundle, recording
+    /// which locations actually yielded one.
+    fn carry_tool_files(
+        &self,
+        status: &ToolStatus,
+        policy: &super::policy::ToolPolicy,
+        record: &mut ToolRecord,
+        files: &mut Vec<BundleFile>,
+    ) {
+        for location in policy.portability.locations() {
+            for found in location.collect(self.paths) {
+                let bytes = match std::fs::read(&found.source) {
+                    Ok(bytes) => bytes,
+                    // A file that vanished between the walk and the read is a
+                    // note, not a failed export.
+                    Err(e) => {
+                        record.notes.push(format!(
+                            "could not read {}: {e}; it is not in the bundle",
+                            found.source.display()
+                        ));
+                        continue;
+                    }
+                };
+                if !record.carried.contains(location) {
+                    record.carried.push(*location);
+                }
+                files.push(BundleFile::encode(
+                    &status.tool,
+                    *location,
+                    found.rel.clone(),
+                    found.mode,
+                    &bytes,
+                ));
+            }
+        }
     }
 
     /// Vault metadata always; values only for the selected ids.
@@ -458,7 +517,11 @@ impl Exporter<'_> {
     /// Every user-scope MCP registration, by name in the manifest and with
     /// values in the payload. Project scopes are read but never carried: they
     /// belong to a repository, not to the machine.
-    fn collect_mcp(&self) -> (Vec<McpRecord>, Vec<BundleMcpServer>) {
+    /// `carry_values` is false for an inventory: the registrations are still
+    /// worth listing (that is the point of the file), but nothing about them
+    /// travels, and a record claiming otherwise is the one thing a manifest
+    /// must never do.
+    fn collect_mcp(&self, carry_values: bool) -> (Vec<McpRecord>, Vec<BundleMcpServer>) {
         let mut records = Vec::new();
         let mut servers = Vec::new();
         for client in self.clients.clients() {
@@ -466,7 +529,9 @@ impl Exporter<'_> {
                 if !entry.is_writable_scope() {
                     continue;
                 }
-                let spec = self.clients.read_spec(&client.client, &entry.name).ok();
+                let spec = carry_values
+                    .then(|| self.clients.read_spec(&client.client, &entry.name).ok())
+                    .flatten();
                 if let Some(spec) = &spec {
                     let (transport, command, args, url) = match &spec.transport {
                         TransportSpec::Stdio { command, args } => {
@@ -844,6 +909,70 @@ pub(crate) mod tests {
         let all = exporter.payload(&KeySelection::All, Utc::now()).unwrap();
         assert_eq!(all.secrets.len(), 2);
         assert!(!all.manifest.gaps.iter().any(|g| g.id.starts_with("key:")));
+    }
+
+    #[test]
+    fn test_an_inventory_manifest_carries_nothing_and_says_so() {
+        // A machine with a portable credential file, a keychain-bound tool, and
+        // an MCP registration whose env holds a secret — one of each kind that
+        // an export would treat differently.
+        let home = fake_home(&[
+            (
+                ".config/gh/hosts.yml",
+                "github.com:\n    user: octocat\n    users:\n        octocat:\n",
+            ),
+            (
+                ".config/gcloud/configurations/config_default",
+                "[core]\naccount = a@b.com\n",
+            ),
+            (
+                ".cursor/mcp.json",
+                r#"{"mcpServers":{"grafana":{"command":"uvx","args":["mcp-grafana"],"env":{"GRAFANA_TOKEN":"glsa_secret"}}}}"#,
+            ),
+        ]);
+        let (paths, registry, vault, clients, envs) = exporter_parts(home.path());
+        let exporter = Exporter {
+            paths: &paths,
+            registry: &registry,
+            vault: &vault,
+            clients: &clients,
+            envs: &envs,
+        };
+
+        // The bundle path reads the files; the inventory must not.
+        let bundle = exporter.payload(&KeySelection::All, Utc::now()).unwrap();
+        assert!(!bundle.files.is_empty(), "the bundle should carry files");
+        assert_eq!(bundle.manifest.kind, ManifestKind::Bundle);
+
+        let manifest = exporter.manifest(Utc::now()).unwrap();
+        assert_eq!(manifest.kind, ManifestKind::Inventory);
+
+        // Nothing may claim to have travelled, because nothing did.
+        assert!(
+            manifest.tools.iter().all(|t| t.carried.is_empty()),
+            "an inventory carries no file, so no tool may list a carried location"
+        );
+        assert!(
+            manifest.mcp.iter().all(|r| !r.carried),
+            "an inventory carries no MCP value"
+        );
+        assert!(manifest.keys.iter().all(|k| !k.included));
+
+        // But it is still a record: the tools and registrations are named.
+        assert!(manifest.tools.iter().any(|t| t.tool == "gh"));
+        let grafana = manifest
+            .mcp
+            .iter()
+            .find(|r| r.name == "grafana")
+            .expect("the registration is the point of the file");
+        assert_eq!(grafana.env_keys, vec!["GRAFANA_TOKEN".to_string()]);
+
+        // And the file is safe to commit: the variable name travels, its value
+        // does not, and neither does anything else secret-shaped.
+        let json = manifest.to_json();
+        assert!(json.contains("GRAFANA_TOKEN"), "{json}");
+        assert!(!json.contains("glsa_secret"), "{json}");
+        assert!(!json.contains("oauth_token"), "{json}");
     }
 
     #[test]

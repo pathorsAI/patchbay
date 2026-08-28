@@ -41,8 +41,8 @@ pub use export::{
 };
 pub use import::{EnvProjectResult, FileOutcome, ImportOptions, ImportReport, Importer};
 pub use manifest::{
-    EnvEnvironmentRecord, EnvProjectRecord, EnvSyncRecord, Manifest, SetupItem, SetupStatus,
-    ToolRecord, BUNDLE_VERSION,
+    EnvEnvironmentRecord, EnvProjectRecord, EnvSyncRecord, Manifest, ManifestKind, SetupItem,
+    SetupStatus, ToolRecord, BUNDLE_VERSION,
 };
 pub use plan::{plan, recheck};
 pub use policy::{policy_for, Location, Portability, PortabilityKind, ToolPolicy, POLICIES};

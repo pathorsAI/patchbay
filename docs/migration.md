@@ -21,6 +21,55 @@ pb import patchbay-2026-08-13.pbx
 pb plan                         # what is left
 ```
 
+## The inventory: `pb manifest`
+
+A bundle answers "move my logins". There is a smaller question underneath it —
+*what do I even use?* — and answering that needs no encryption, no passphrase,
+and no credential at all.
+
+```sh
+pb manifest                          # to stdout
+pb manifest -o setup/manifest.json   # to a file you commit
+```
+
+It writes `manifest.json` — part 3 of a bundle — on its own. Same schema, same
+`pb plan --manifest` on the other end, with `"kind": "inventory"` so a reader
+knows nothing beside it travelled.
+
+**No credential file is opened.** That is not an optimisation: reading every
+credential on the machine to produce a file that will hold none of them is
+exactly the handling this command exists to avoid. The vault is listed but never
+unlocked, and `carried` is empty everywhere because nothing was carried.
+
+So it is safe where a bundle is not — a repository, a synced folder, a paste
+into a chat with your agent:
+
+| | `pb export` | `pb manifest` |
+|---|---|---|
+| credential files | copied into the bundle | never opened |
+| vault secret values | only with `--keys` | never |
+| MCP env/header values | carried | names only |
+| encrypted | yes, passphrase required | no — there is nothing to encrypt |
+| safe to commit | **no** | yes |
+| refuses a cloud-sync folder | yes | no; that is where it belongs |
+
+One thing does travel verbatim that is worth knowing about: a key's `purpose`
+note is free text written by whoever registered it. patchbay never puts a secret
+there, but a human can. It is the one field to look at before committing the
+file the first time.
+
+The intended shape is: keep the inventory in a repo you sync, and on a new
+machine the whole setup is
+
+```sh
+pb plan --manifest setup/manifest.json
+```
+
+or the same list over MCP (`plan_setup`), which an agent works one item at a
+time — installing what it can, handing you every browser login, re-probing after
+each. Your agent can also write the file: `write_manifest` is the one part of a
+move it can do unsupervised, precisely because it touches no credential.
+
 ## What is in a bundle
 
 One encrypted file, four parts:
@@ -166,6 +215,11 @@ reason next to it. A probe added without a policy fails the build's
 - **`mark_setup_done(item_id)`** — re-probes that one tool and reports whether
   the gap actually closed. It does not believe the agent, and it does not
   believe the user.
+- **`write_manifest(path)`** — writes the inventory above. The only one of the
+  three that changes anything on disk, and it is still safe to hand an agent:
+  the file it writes contains no secret and no credential was read to make it.
+  Exporting and importing stay in the CLI, where the human and the passphrase
+  are.
 
 The rule the tool descriptions give an agent: work the list one item at a time,
 run only what `auto` allows, hand every `needs_browser` item to the human with

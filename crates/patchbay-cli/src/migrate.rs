@@ -40,6 +40,12 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Write the secret-free record of what this machine uses.
+    Manifest {
+        /// Where to write it. Defaults to stdout.
+        #[arg(long, short)]
+        out: Option<PathBuf>,
+    },
     /// Restore a bundle onto this machine.
     Import {
         bundle: PathBuf,
@@ -101,6 +107,32 @@ pub fn run(command: Command, styles: &Styles) -> Result<i32> {
                 println!("{}", serde_json::to_string_pretty(&export_json(&report))?);
             } else {
                 print_export(&report, styles);
+            }
+            Ok(0)
+        }
+
+        Command::Manifest { out } => {
+            let manifest = Exporter {
+                paths: &paths,
+                registry: &registry,
+                vault: &vault,
+                clients: &clients,
+                envs: &envs,
+            }
+            .manifest(Utc::now())?;
+
+            // No passphrase, no cloud-folder check, no warning about moving the
+            // file carefully: this one is meant to be committed and synced.
+            // Those guards exist for bundles, and repeating them here would
+            // teach people to ignore them where they matter.
+            let json = manifest.to_json();
+            match out {
+                Some(path) => {
+                    std::fs::write(&path, format!("{json}\n"))
+                        .with_context(|| format!("writing {}", path.display()))?;
+                    print_manifest(&manifest, &path, styles);
+                }
+                None => println!("{json}"),
             }
             Ok(0)
         }
@@ -304,6 +336,34 @@ fn print_export(report: &export::ExportReport, styles: &Styles) {
     println!(
         "\nnext: copy the file across, then `pb import {}`",
         file_name(&report.path)
+    );
+}
+
+/// Written-to-a-file summary. Deliberately counts rather than lists: the file
+/// itself is the listing, and a wall of tool names between the command and the
+/// path buries the one line the reader needs.
+fn print_manifest(manifest: &Manifest, path: &std::path::Path, styles: &Styles) {
+    let installed = manifest.tools.iter().filter(|t| t.installed).count();
+    println!("wrote {}", path.display());
+    println!(
+        "  {installed} CLI(s) installed, {} key(s), {} MCP registration(s), {} env project(s)",
+        manifest.keys.len(),
+        manifest.mcp.len(),
+        manifest.env_projects.len(),
+    );
+    println!(
+        "  {}",
+        styles.paint(
+            dim_style(),
+            "no secret value is in this file — commit it, sync it, hand it to an agent"
+        )
+    );
+    println!(
+        "  {}",
+        styles.paint(
+            dim_style(),
+            "on the new machine: pb plan --manifest <this file>"
+        )
     );
 }
 

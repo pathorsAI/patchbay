@@ -11,15 +11,17 @@
 //! * `mark_setup_done` — re-probes one item and says whether it actually
 //!   closed. It ignores what the caller claims; the probe decides.
 //!
-//! Neither tool exports, imports or decrypts anything. Those touch every
-//! credential on the machine and want a passphrase typed by a human, so they
-//! stay in the CLI where the human is.
+//! There is a third, of a different kind: `write_manifest` writes the
+//! secret-free inventory this machine could hand to a new one. It is safe for
+//! an agent because it is the one part of a move that touches no credential —
+//! `pb export` and `pb import` do, and want a passphrase typed by a human, so
+//! they stay in the CLI where the human is.
 
 #[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
 
-use patchbay_core::migrate::{self, Manifest, SetupItem, SetupStatus};
+use patchbay_core::migrate::{self, Exporter, Manifest, SetupItem, SetupStatus};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 use rmcp::{tool, tool_router, ErrorData};
@@ -35,6 +37,13 @@ pub struct PlanParams {
     /// not". Without it, the plan is "what on this machine is not logged in",
     /// which is still useful — omit it rather than guessing at a path.
     pub manifest_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct WriteManifestParams {
+    /// Where to write the file. A path the user named, or somewhere they will
+    /// find it again — a repository they sync, not a temp directory.
+    pub path: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -143,6 +152,69 @@ about the key vault.")]
         })
         .await?;
         Ok(json_ok(plan_json(&items)?))
+    }
+
+    #[tool(description = "\
+TIER 1, CHEAP. Write this machine's inventory — the record of which CLIs it uses, which profiles \
+and accounts are active, which API keys are in the vault and which MCP servers are registered — \
+to a `manifest.json` the user can commit, sync or carry to a new machine.
+
+NO SECRET VALUE IS IN THIS FILE, by construction and by test. No credential file is even opened. \
+It carries names, accounts, scopes, expiry dates and the NAMES of the environment variables an \
+MCP server sets — never a value. That is what makes it the one part of a machine move an agent \
+can do unsupervised, and what makes the file safe to put in a repository.
+
+Use it when the user wants a record of what they have set up, wants their setup reproducible on \
+another machine, or is about to move machines and does not want to move credentials.
+
+It is NOT a backup and it will not log anybody in. On the new machine the file is the INPUT to \
+`plan_setup(manifest_path)`, which turns it into the checklist: install this, log into that. To \
+actually carry credentials the user runs `pb export` themselves — that needs a passphrase and \
+belongs to them, not to you.
+
+One caveat worth relaying: a key's `purpose` note is free text written by whoever registered it, \
+and it travels verbatim. If someone has pasted a secret into a purpose, it will be in this file. \
+Nothing patchbay stores as a secret is.
+
+Returns { path, tools, keys, mcp, env_projects, gaps } — counts, not contents.")]
+    async fn write_manifest(
+        &self,
+        Parameters(WriteManifestParams { path }): Parameters<WriteManifestParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let registry = self.registry.clone();
+        let keys = self.keys.clone();
+        let clients = self.clients.clone();
+        let envs = self.envs.clone();
+        let target = PathBuf::from(&path);
+        let written = offload(move || {
+            let manifest = Exporter {
+                paths: registry.paths(),
+                registry: &registry,
+                vault: &keys,
+                clients: &clients,
+                envs: &envs,
+            }
+            .manifest(chrono::Utc::now())?;
+            std::fs::write(&target, format!("{}\n", manifest.to_json()))
+                .map_err(|e| anyhow::anyhow!("could not write {}: {e}", target.display()))?;
+            Ok::<_, anyhow::Error>(manifest)
+        })
+        .await?;
+        // The write is the fallible half; a failed write must come back as a
+        // tool error the agent can read, not as a transport-level failure.
+        let written = match written {
+            Ok(manifest) => manifest,
+            Err(err) => return Ok(tool_error(err)),
+        };
+
+        Ok(json_ok(serde_json::json!({
+            "path": path,
+            "tools": written.tools.iter().filter(|t| t.installed).count(),
+            "keys": written.keys.len(),
+            "mcp": written.mcp.len(),
+            "env_projects": written.env_projects.len(),
+            "gaps": written.gaps.len(),
+        })))
     }
 
     #[tool(description = "\
