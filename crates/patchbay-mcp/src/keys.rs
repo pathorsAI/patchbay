@@ -277,6 +277,52 @@ fn clear_set(clear: &[String]) -> Result<BTreeSet<String>, String> {
     Ok(out)
 }
 
+/// A patch field that can be set, blanked, or left alone: `Some(Some(v))`
+/// sets, `Some(None)` blanks, `None` leaves it as it is.
+fn nullable<T>(given: Option<T>, cleared: bool) -> Option<Option<T>> {
+    match (given, cleared) {
+        (Some(value), _) => Some(Some(value)),
+        (None, true) => Some(None),
+        (None, false) => None,
+    }
+}
+
+/// Turns an `update_key` request into the patch it describes, or into the
+/// message explaining why it is not a patch at all.
+fn build_patch(params: UpdateKeyParams) -> Result<KeyPatch, String> {
+    let cleared = clear_set(&params.clear.unwrap_or_default())?;
+    for (field, given) in [
+        ("purpose", params.purpose.is_some()),
+        ("expires_at", params.expires_at.is_some()),
+        ("endpoint", params.endpoint.is_some()),
+        ("env", params.env.is_some()),
+    ] {
+        if given && cleared.contains(field) {
+            return Err(format!(
+                "`{field}` is both set and listed in `clear`; pass one or the other"
+            ));
+        }
+    }
+
+    let expires_at = params.expires_at.as_deref().map(parse_expiry).transpose()?;
+    let patch = KeyPatch {
+        provider: params.provider,
+        label: params.label,
+        scopes: params.scopes,
+        purpose: nullable(params.purpose, cleared.contains("purpose")),
+        expires_at: nullable(expires_at, cleared.contains("expires_at")),
+        endpoint: nullable(params.endpoint, cleared.contains("endpoint")),
+        env: nullable(params.env, cleared.contains("env")),
+    };
+
+    if patch.is_empty() {
+        return Err(
+            "nothing to change: pass at least one field to set, or name one in `clear`".to_string(),
+        );
+    }
+    Ok(patch)
+}
+
 /// An entry that looks like a wanted name without being named it, plus the
 /// reason it was offered — a suggestion the caller cannot explain is one they
 /// cannot confirm with the user.
@@ -667,61 +713,13 @@ last4, source, endpoint, env, expiry_state, linked_tool }.")]
         &self,
         Parameters(params): Parameters<UpdateKeyParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let cleared = match clear_set(&params.clear.unwrap_or_default()) {
-            Ok(set) => set,
+        let id = params.id.clone();
+        let patch = match build_patch(params) {
+            Ok(patch) => patch,
             Err(message) => return Ok(tool_error(anyhow::anyhow!(message))),
         };
-        for (field, given) in [
-            ("purpose", params.purpose.is_some()),
-            ("expires_at", params.expires_at.is_some()),
-            ("endpoint", params.endpoint.is_some()),
-            ("env", params.env.is_some()),
-        ] {
-            if given && cleared.contains(field) {
-                return Ok(tool_error(anyhow::anyhow!(
-                    "`{field}` is both set and listed in `clear`; pass one or the other"
-                )));
-            }
-        }
-
-        let mut patch = KeyPatch {
-            provider: params.provider,
-            label: params.label,
-            scopes: params.scopes,
-            ..KeyPatch::default()
-        };
-        if let Some(purpose) = params.purpose {
-            patch.purpose = Some(Some(purpose));
-        } else if cleared.contains("purpose") {
-            patch.purpose = Some(None);
-        }
-        if let Some(raw) = params.expires_at {
-            match parse_expiry(&raw) {
-                Ok(at) => patch.expires_at = Some(Some(at)),
-                Err(message) => return Ok(tool_error(anyhow::anyhow!(message))),
-            }
-        } else if cleared.contains("expires_at") {
-            patch.expires_at = Some(None);
-        }
-        if let Some(endpoint) = params.endpoint {
-            patch.endpoint = Some(Some(endpoint));
-        } else if cleared.contains("endpoint") {
-            patch.endpoint = Some(None);
-        }
-        if let Some(env) = params.env {
-            patch.env = Some(Some(env));
-        } else if cleared.contains("env") {
-            patch.env = Some(None);
-        }
-
-        if patch.is_empty() {
-            return Ok(tool_error(anyhow::anyhow!(
-                "nothing to change: pass at least one field to set, or name one in `clear`"
-            )));
-        }
 
         let keys = self.keys.clone();
-        let id = params.id;
         match offload(move || keys.update_metadata(&id, patch)).await? {
             Ok(entry) => Ok(json_ok(describe(&entry, Utc::now())?)),
             Err(err) => Ok(tool_error(err)),
@@ -1485,5 +1483,75 @@ mod tests {
         assert!(RESOLVE_NOTE.contains("pb key run"));
         assert!(RESOLVE_NOTE.contains("pb env run"));
         assert!(RESOLVE_NOTE.contains("update_key"));
+    }
+    fn update_params(id: &str) -> UpdateKeyParams {
+        UpdateKeyParams {
+            id: id.to_string(),
+            provider: None,
+            label: None,
+            purpose: None,
+            scopes: None,
+            expires_at: None,
+            endpoint: None,
+            env: None,
+            clear: None,
+        }
+    }
+
+    #[test]
+    fn test_build_patch_sets_one_field_and_leaves_the_rest_alone() {
+        let mut params = update_params("cf-api");
+        params.env = Some("CLOUDFLARE_API_TOKEN".to_string());
+        let patch = build_patch(params).expect("a set is a patch");
+        assert_eq!(patch.env, Some(Some("CLOUDFLARE_API_TOKEN".to_string())));
+        assert_eq!(patch.purpose, None);
+        assert_eq!(patch.expires_at, None);
+        assert_eq!(patch.endpoint, None);
+    }
+
+    #[test]
+    fn test_build_patch_blanks_a_field_named_in_clear() {
+        let mut params = update_params("cf-api");
+        params.clear = Some(vec!["endpoint".to_string()]);
+        let patch = build_patch(params).expect("a clear is a patch");
+        assert_eq!(patch.endpoint, Some(None));
+        assert_eq!(patch.env, None);
+    }
+
+    #[test]
+    fn test_build_patch_refuses_a_field_that_is_both_set_and_cleared() {
+        let mut params = update_params("cf-api");
+        params.purpose = Some("deploys the worker".to_string());
+        params.clear = Some(vec!["purpose".to_string()]);
+        let err = build_patch(params).unwrap_err();
+        assert_eq!(
+            err,
+            "`purpose` is both set and listed in `clear`; pass one or the other"
+        );
+    }
+
+    #[test]
+    fn test_build_patch_refuses_a_call_that_changes_nothing() {
+        let err = build_patch(update_params("cf-api")).unwrap_err();
+        assert!(err.starts_with("nothing to change"), "{err}");
+    }
+
+    #[test]
+    fn test_build_patch_surfaces_an_unreadable_expiry() {
+        let mut params = update_params("cf-api");
+        params.expires_at = Some("whenever".to_string());
+        let err = build_patch(params).unwrap_err();
+        assert!(err.contains("RFC 3339"), "{err}");
+    }
+
+    #[test]
+    fn test_build_patch_reads_both_expiry_shapes() {
+        let mut params = update_params("cf-api");
+        params.expires_at = Some("2027-01-01".to_string());
+        let patch = build_patch(params).expect("a date is an expiry");
+        assert_eq!(
+            patch.expires_at,
+            Some(Some(parse_expiry("2027-01-01").unwrap()))
+        );
     }
 }

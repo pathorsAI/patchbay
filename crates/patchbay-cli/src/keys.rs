@@ -15,7 +15,7 @@ use std::process::{Command as Process, Stdio};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDate, NaiveTime, TimeZone, Utc};
-use clap::Subcommand;
+use clap::{Args, Subcommand};
 use patchbay_core::keys::{
     expiring_within_at, filter_keys, validate_env_name, KeyEntry, KeyFilter, KeyPatch, KeyRegistry,
     NewKey,
@@ -45,96 +45,15 @@ pub enum Command {
     ///
     /// The secret is read from stdin when something is piped in, and from a
     /// hidden prompt otherwise. It is never taken as an argument.
-    Add {
-        /// Lowercase slug, unique in the vault, e.g. `cf-gh-actions-deploy`.
-        id: String,
-        /// Who issued it: `cloudflare`, `github`, `openai`, … Free-form.
-        #[arg(long)]
-        provider: Option<String>,
-        /// Display name. Defaults to the id.
-        #[arg(long)]
-        label: Option<String>,
-        /// What it is for, e.g. "deploy from GitHub Actions in repo X".
-        #[arg(long)]
-        purpose: Option<String>,
-        /// Granted scopes, comma-separated.
-        #[arg(long, value_delimiter = ',')]
-        scopes: Vec<String>,
-        /// Expiry: `2027-01-01`, or a full RFC 3339 timestamp.
-        #[arg(long, value_name = "DATE")]
-        expires: Option<String>,
-        /// Instance URL, for providers with more than one address —
-        /// `https://<you>.grafana.net`. Grafana needs it to verify.
-        #[arg(long, value_name = "URL")]
-        endpoint: Option<String>,
-        /// Environment variable the key is exposed as, UPPER_SNAKE_CASE:
-        /// `CLOUDFLARE_API_TOKEN`. What `pb key run` injects it as, and what an
-        /// agent looks it up by.
-        #[arg(long, value_name = "NAME")]
-        env: Option<String>,
-        /// Replace an existing entry with the same id (a rotation).
-        #[arg(long)]
-        overwrite: bool,
-    },
+    Add(AddArgs),
     /// List registered keys. Metadata only — never values.
-    List {
-        #[arg(long)]
-        json: bool,
-        /// Only keys expiring within this many days (already-expired included).
-        #[arg(long, value_name = "DAYS")]
-        expiring: Option<i64>,
-        /// Only keys from this issuer.
-        #[arg(long, value_name = "P")]
-        provider: Option<String>,
-        /// Only the key(s) exposed as this variable name.
-        #[arg(long, value_name = "NAME")]
-        env: Option<String>,
-        /// Free text over id, label, provider, purpose and variable name.
-        #[arg(long, value_name = "TEXT")]
-        grep: Option<String>,
-    },
+    List(ListArgs),
     /// Change a key's metadata. The stored value is never touched.
     ///
     /// Every `--no-*` clears its field. `id`, `last4` and the registration date
     /// are not editable: they describe the value in the keychain, and editing
     /// them here would only make the registry lie about it.
-    Edit {
-        /// The key to edit.
-        id: String,
-        /// Who issued it: `cloudflare`, `github`, `openai`, … Free-form.
-        #[arg(long)]
-        provider: Option<String>,
-        /// Display name.
-        #[arg(long)]
-        label: Option<String>,
-        /// What it is for, e.g. "deploy from GitHub Actions in repo X".
-        #[arg(long, conflicts_with = "no_purpose")]
-        purpose: Option<String>,
-        /// Forget what this key is for.
-        #[arg(long = "no-purpose")]
-        no_purpose: bool,
-        /// Replace the recorded scopes, comma-separated.
-        #[arg(long, value_delimiter = ',')]
-        scopes: Vec<String>,
-        /// Expiry: `2027-01-01`, or a full RFC 3339 timestamp.
-        #[arg(long, value_name = "DATE", conflicts_with = "no_expires")]
-        expires: Option<String>,
-        /// Forget the expiry.
-        #[arg(long = "no-expires")]
-        no_expires: bool,
-        /// Instance URL, for providers with more than one address.
-        #[arg(long, value_name = "URL", conflicts_with = "no_endpoint")]
-        endpoint: Option<String>,
-        /// Forget the instance URL.
-        #[arg(long = "no-endpoint")]
-        no_endpoint: bool,
-        /// Environment variable the key is exposed as, UPPER_SNAKE_CASE.
-        #[arg(long, value_name = "NAME", conflicts_with = "no_env")]
-        env: Option<String>,
-        /// Forget the variable name.
-        #[arg(long = "no-env")]
-        no_env: bool,
-    },
+    Edit(EditArgs),
     /// Put a key's value on the clipboard, without printing it.
     Copy { id: String },
     /// Run a command with keys in its environment.
@@ -178,295 +97,320 @@ pub enum Command {
     },
 }
 
+/// Everything `pb key add` takes. The secret is deliberately absent: it is
+/// read from stdin or a hidden prompt, never from argv.
+#[derive(Args, Debug)]
+pub struct AddArgs {
+    /// Lowercase slug, unique in the vault, e.g. `cf-gh-actions-deploy`.
+    id: String,
+    /// Who issued it: `cloudflare`, `github`, `openai`, … Free-form.
+    #[arg(long)]
+    provider: Option<String>,
+    /// Display name. Defaults to the id.
+    #[arg(long)]
+    label: Option<String>,
+    /// What it is for, e.g. "deploy from GitHub Actions in repo X".
+    #[arg(long)]
+    purpose: Option<String>,
+    /// Granted scopes, comma-separated.
+    #[arg(long, value_delimiter = ',')]
+    scopes: Vec<String>,
+    /// Expiry: `2027-01-01`, or a full RFC 3339 timestamp.
+    #[arg(long, value_name = "DATE")]
+    expires: Option<String>,
+    /// Instance URL, for providers with more than one address —
+    /// `https://<you>.grafana.net`. Grafana needs it to verify.
+    #[arg(long, value_name = "URL")]
+    endpoint: Option<String>,
+    /// Environment variable the key is exposed as, UPPER_SNAKE_CASE:
+    /// `CLOUDFLARE_API_TOKEN`. What `pb key run` injects it as, and what an
+    /// agent looks it up by.
+    #[arg(long, value_name = "NAME")]
+    env: Option<String>,
+    /// Replace an existing entry with the same id (a rotation).
+    #[arg(long)]
+    overwrite: bool,
+}
+
+/// The listing's output mode and the filters that narrow it.
+#[derive(Args, Debug)]
+pub struct ListArgs {
+    #[arg(long)]
+    json: bool,
+    /// Only keys expiring within this many days (already-expired included).
+    #[arg(long, value_name = "DAYS")]
+    expiring: Option<i64>,
+    /// Only keys from this issuer.
+    #[arg(long, value_name = "P")]
+    provider: Option<String>,
+    /// Only the key(s) exposed as this variable name.
+    #[arg(long, value_name = "NAME")]
+    env: Option<String>,
+    /// Free text over id, label, provider, purpose and variable name.
+    #[arg(long, value_name = "TEXT")]
+    grep: Option<String>,
+}
+
+/// Which key to edit, and what to make of it.
+#[derive(Args, Debug)]
+pub struct EditArgs {
+    /// The key to edit.
+    id: String,
+    #[command(flatten)]
+    fields: EditFields,
+}
+
+/// The editable half of `pb key edit`, split out so the patch it describes can
+/// be built — and tested — without a vault to write it to.
+#[derive(Args, Debug)]
+pub struct EditFields {
+    /// Who issued it: `cloudflare`, `github`, `openai`, … Free-form.
+    #[arg(long)]
+    provider: Option<String>,
+    /// Display name.
+    #[arg(long)]
+    label: Option<String>,
+    /// What it is for, e.g. "deploy from GitHub Actions in repo X".
+    #[arg(long, conflicts_with = "no_purpose")]
+    purpose: Option<String>,
+    /// Forget what this key is for.
+    #[arg(long = "no-purpose")]
+    no_purpose: bool,
+    /// Replace the recorded scopes, comma-separated.
+    #[arg(long, value_delimiter = ',')]
+    scopes: Vec<String>,
+    /// Expiry: `2027-01-01`, or a full RFC 3339 timestamp.
+    #[arg(long, value_name = "DATE", conflicts_with = "no_expires")]
+    expires: Option<String>,
+    /// Forget the expiry.
+    #[arg(long = "no-expires")]
+    no_expires: bool,
+    /// Instance URL, for providers with more than one address.
+    #[arg(long, value_name = "URL", conflicts_with = "no_endpoint")]
+    endpoint: Option<String>,
+    /// Forget the instance URL.
+    #[arg(long = "no-endpoint")]
+    no_endpoint: bool,
+    /// Environment variable the key is exposed as, UPPER_SNAKE_CASE.
+    #[arg(long, value_name = "NAME", conflicts_with = "no_env")]
+    env: Option<String>,
+    /// Forget the variable name.
+    #[arg(long = "no-env")]
+    no_env: bool,
+}
+
 /// Returns the process exit code.
 pub fn run(command: Command, styles: &Styles) -> Result<i32> {
     let registry = KeyRegistry::detect()?;
 
     match command {
-        Command::Add {
-            id,
-            provider,
-            label,
-            purpose,
-            scopes,
-            expires,
-            endpoint,
-            env,
-            overwrite,
-        } => {
-            let expires_at = expires.as_deref().map(parse_expiry).transpose()?;
-            let new = NewKey::new(&id, "cli")
-                .provider(provider.clone().unwrap_or_else(|| "unknown".to_string()))
-                .label(label.unwrap_or_else(|| id.clone()))
-                .purpose(purpose)
-                .scopes(scopes)
-                .expires_at(expires_at)
-                .endpoint(endpoint)
-                .env(env);
-
-            let secret = read_secret(&id)?;
-            let entry = registry.add(new, &secret, overwrite)?;
-            drop(secret);
-
-            println!("registered {} (…{})", entry.id, entry.last4);
-            if let Some(endpoint) = &entry.endpoint {
-                println!("  instance: {endpoint}");
-            }
-            if let Some(name) = &entry.env {
-                println!("  env:      {name}");
-            }
-            println!("  value:    {}", registry.store_name());
-            println!("  metadata: {}", registry.path().display());
-            if provider.is_none() {
-                println!("  hint: --provider makes the board far easier to scan");
-            }
-            if entry.expires_at.is_none() {
-                println!("  hint: --expires lets patchbay warn you before it dies");
-            }
-            if entry.env.is_none() {
-                println!(
-                    "  hint: --env NAME lets `pb key run` and agents find it by the name code reads"
-                );
-            }
-            Ok(0)
-        }
-
-        Command::List {
-            json,
-            expiring,
-            provider,
-            env,
-            grep,
-        } => {
-            let filter = KeyFilter {
-                provider,
-                env,
-                query: grep,
-            };
-            let mut entries = registry.list()?;
-            if let Some(days) = expiring {
-                entries = expiring_within_at(&entries, Utc::now(), days);
-            }
-            // After the expiring cut, so the two narrow the same listing rather
-            // than fighting over it.
-            entries = filter_keys(&entries, &filter);
-
-            if json {
-                // Machine-readable: JSON only, no ANSI, no extras.
-                println!("{}", serde_json::to_string_pretty(&entries)?);
-                return Ok(0);
-            }
-            if entries.is_empty() {
-                let active = active_filters(expiring, &filter);
-                if active.is_empty() {
-                    println!("no keys registered yet");
-                    println!("  pb key add <id> --provider <who> --label \"<what>\"");
-                } else if filter.is_empty() {
-                    // The expiring-only question deserves its own sentence: an
-                    // empty answer there is good news, not a failed search.
-                    println!(
-                        "no registered key expires within {}d",
-                        expiring.unwrap_or_default()
-                    );
-                } else {
-                    println!("no registered key matches");
-                    println!("  filters: {}", active.join(", "));
-                }
-                return Ok(0);
-            }
-            print!("{}", render_table(&entries, Utc::now(), styles));
-            Ok(0)
-        }
-
-        Command::Edit {
-            id,
-            provider,
-            label,
-            purpose,
-            no_purpose,
-            scopes,
-            expires,
-            no_expires,
-            endpoint,
-            no_endpoint,
-            env,
-            no_env,
-        } => {
-            let mut patch = KeyPatch::default();
-            let mut touched: Vec<Field> = Vec::new();
-
-            if let Some(provider) = provider {
-                patch.provider = Some(provider);
-                touched.push(Field::Provider);
-            }
-            if let Some(label) = label {
-                patch.label = Some(label);
-                touched.push(Field::Label);
-            }
-            if no_purpose || purpose.is_some() {
-                patch.purpose = Some(purpose);
-                touched.push(Field::Purpose);
-            }
-            if !scopes.is_empty() {
-                patch.scopes = Some(scopes);
-                touched.push(Field::Scopes);
-            }
-            if no_expires || expires.is_some() {
-                patch.expires_at = Some(expires.as_deref().map(parse_expiry).transpose()?);
-                touched.push(Field::Expires);
-            }
-            if no_endpoint || endpoint.is_some() {
-                patch.endpoint = Some(endpoint);
-                touched.push(Field::Endpoint);
-            }
-            if no_env || env.is_some() {
-                patch.env = Some(env);
-                touched.push(Field::Env);
-            }
-            if patch.is_empty() {
-                anyhow::bail!(
-                    "nothing to change; pass at least one of --provider, --label, --purpose, \
-                     --scopes, --expires, --endpoint, --env (or a --no-* to clear one)"
-                );
-            }
-
-            // A rejected name (`pb key edit x --env cf_token`) surfaces the
-            // core's error verbatim: it already suggests the right spelling.
-            let updated = registry.update_metadata(&id, patch)?;
-            println!("updated {}", updated.id);
-            for field in touched {
-                let name = format!("{}:", field.label());
-                println!("  {name:<FIELD_COL$} {}", field.value(&updated));
-            }
-            Ok(0)
-        }
-
-        Command::Copy { id } => {
-            let entry = registry
-                .get(&id)?
-                .ok_or_else(|| anyhow::anyhow!("no key registered as `{id}`"))?;
-            let secret = registry.get_secret(&id)?;
-            to_clipboard(&secret)?;
-            drop(secret);
-            println!("copied {} (…{}) to the clipboard", entry.id, entry.last4);
-            println!("  it stays there until you copy something else — paste it and move on");
-            Ok(0)
-        }
-
+        Command::Add(args) => add(&registry, args),
+        Command::List(args) => list(&registry, args, styles),
+        Command::Edit(args) => edit(&registry, args),
+        Command::Copy { id } => copy(&registry, &id),
         Command::Run {
             keys,
             aliases,
             command,
-        } => {
-            let (bin, args) = command
-                .split_first()
-                .ok_or_else(|| anyhow::anyhow!("nothing to run; pass a command after `--`"))?;
-            let aliases = parse_aliases(&aliases)?;
-
-            // Everything is resolved before anything is spawned: a typo has to
-            // fail here, not halfway through a deploy.
-            let mut entries: Vec<KeyEntry> = Vec::new();
-            for id in keys.iter().chain(aliases.iter().map(|(_, id)| id)) {
-                if entries.iter().any(|e| &e.id == id) {
-                    continue;
-                }
-                entries.push(
-                    registry
-                        .get(id)?
-                        .ok_or_else(|| anyhow::anyhow!("no key registered as `{id}`"))?,
-                );
-            }
-            let plan = injection_plan(&entries, &keys, &aliases)?;
-
-            // stderr, so a command whose stdout is being piped stays clean —
-            // and names only, never a value or a fragment of one.
-            let named: Vec<String> = plan
-                .iter()
-                .map(|(name, id)| format!("{name} ({id})"))
-                .collect();
-            eprintln!("injecting {} into `{bin}`", named.join(", "));
-
-            let mut child = std::process::Command::new(bin);
-            child.args(args);
-            // The parent environment is inherited on purpose: unlike
-            // `pb env run`, this adds a few credentials to an otherwise normal
-            // shell rather than defining the whole environment.
-            for (name, id) in &plan {
-                let secret = registry.get_secret(id)?;
-                child.env(name, &secret);
-                drop(secret);
-            }
-            let status = child
-                .status()
-                .with_context(|| format!("could not run `{bin}`"))?;
-
-            match status.code() {
-                Some(code) => Ok(code),
-                None => {
-                    eprintln!("pb: `{bin}` was killed by a signal");
-                    Ok(1)
-                }
-            }
-        }
-
+        } => run_command(&registry, &keys, &aliases, &command),
         Command::Verify {
             id,
             json,
             no_update,
-        } => {
-            let entry = registry
-                .get(&id)?
-                .ok_or_else(|| anyhow::anyhow!("no key registered as `{id}`"))?;
-            // The secret lives for exactly this call and is never printed.
-            let secret = registry.get_secret(&id)?;
-            let outcome = verify_key(&entry, &secret);
-            drop(secret);
-
-            let updated = if no_update {
-                Vec::new()
-            } else {
-                absorb(&registry, &entry, &outcome)?
-            };
-
-            if json {
-                let mut value = serde_json::to_value(&outcome)?;
-                if let Some(map) = value.as_object_mut() {
-                    map.insert("id".into(), entry.id.clone().into());
-                    map.insert("provider".into(), entry.provider.clone().into());
-                    map.insert("metadata_updated".into(), updated.clone().into());
-                }
-                println!("{}", serde_json::to_string_pretty(&value)?);
-            } else {
-                print_verify(&entry, &outcome, &updated, styles);
-            }
-            Ok(match outcome.status {
-                KeyVerifyStatus::Valid | KeyVerifyStatus::Unsupported => 0,
-                KeyVerifyStatus::Invalid | KeyVerifyStatus::Expired => 1,
-                // Distinct from 1: nothing was learned about the key.
-                KeyVerifyStatus::Unreachable => 2,
-            })
-        }
-
-        Command::Rm { id, yes } => {
-            let entry = registry
-                .get(&id)?
-                .ok_or_else(|| anyhow::anyhow!("no key registered as `{id}`"))?;
-            if !yes && !confirm(&entry)? {
-                println!("left {} alone", entry.id);
-                return Ok(0);
-            }
-            let removed = registry.remove(&id)?;
-            println!("removed {} (…{})", removed.id, removed.last4);
-            println!("  the value is gone from the {}", registry.store_name());
-            println!("  revoke it at the provider too — patchbay only forgets it");
-            Ok(0)
-        }
+        } => verify(&registry, &id, json, no_update, styles),
+        Command::Rm { id, yes } => rm(&registry, &id, yes),
     }
+}
+
+// ---------------------------------------------------------------------------
+// add
+// ---------------------------------------------------------------------------
+
+/// `pb key add` — register a key and hand its value to the keychain.
+fn add(registry: &KeyRegistry, args: AddArgs) -> Result<i32> {
+    let AddArgs {
+        id,
+        provider,
+        label,
+        purpose,
+        scopes,
+        expires,
+        endpoint,
+        env,
+        overwrite,
+    } = args;
+
+    let expires_at = expires.as_deref().map(parse_expiry).transpose()?;
+    let new = NewKey::new(&id, "cli")
+        .provider(provider.clone().unwrap_or_else(|| "unknown".to_string()))
+        .label(label.unwrap_or_else(|| id.clone()))
+        .purpose(purpose)
+        .scopes(scopes)
+        .expires_at(expires_at)
+        .endpoint(endpoint)
+        .env(env);
+
+    let secret = read_secret(&id)?;
+    let entry = registry.add(new, &secret, overwrite)?;
+    drop(secret);
+
+    println!("registered {} (…{})", entry.id, entry.last4);
+    if let Some(endpoint) = &entry.endpoint {
+        println!("  instance: {endpoint}");
+    }
+    if let Some(name) = &entry.env {
+        println!("  env:      {name}");
+    }
+    println!("  value:    {}", registry.store_name());
+    println!("  metadata: {}", registry.path().display());
+    if provider.is_none() {
+        println!("  hint: --provider makes the board far easier to scan");
+    }
+    if entry.expires_at.is_none() {
+        println!("  hint: --expires lets patchbay warn you before it dies");
+    }
+    if entry.env.is_none() {
+        println!("  hint: --env NAME lets `pb key run` and agents find it by the name code reads");
+    }
+    Ok(0)
+}
+
+// ---------------------------------------------------------------------------
+// list
+// ---------------------------------------------------------------------------
+
+/// `pb key list` — the board, or the same rows as JSON.
+fn list(registry: &KeyRegistry, args: ListArgs, styles: &Styles) -> Result<i32> {
+    let ListArgs {
+        json,
+        expiring,
+        provider,
+        env,
+        grep,
+    } = args;
+
+    let filter = KeyFilter {
+        provider,
+        env,
+        query: grep,
+    };
+    let mut entries = registry.list()?;
+    if let Some(days) = expiring {
+        entries = expiring_within_at(&entries, Utc::now(), days);
+    }
+    // After the expiring cut, so the two narrow the same listing rather
+    // than fighting over it.
+    entries = filter_keys(&entries, &filter);
+
+    if json {
+        // Machine-readable: JSON only, no ANSI, no extras.
+        println!("{}", serde_json::to_string_pretty(&entries)?);
+        return Ok(0);
+    }
+    if entries.is_empty() {
+        let active = active_filters(expiring, &filter);
+        if active.is_empty() {
+            println!("no keys registered yet");
+            println!("  pb key add <id> --provider <who> --label \"<what>\"");
+        } else if filter.is_empty() {
+            // The expiring-only question deserves its own sentence: an
+            // empty answer there is good news, not a failed search.
+            println!(
+                "no registered key expires within {}d",
+                expiring.unwrap_or_default()
+            );
+        } else {
+            println!("no registered key matches");
+            println!("  filters: {}", active.join(", "));
+        }
+        return Ok(0);
+    }
+    print!("{}", render_table(&entries, Utc::now(), styles));
+    Ok(0)
+}
+
+// ---------------------------------------------------------------------------
+// copy
+// ---------------------------------------------------------------------------
+
+/// `pb key copy` — keychain → clipboard, with the value never touching stdout.
+fn copy(registry: &KeyRegistry, id: &str) -> Result<i32> {
+    let entry = registry
+        .get(id)?
+        .ok_or_else(|| anyhow::anyhow!("no key registered as `{id}`"))?;
+    let secret = registry.get_secret(id)?;
+    to_clipboard(&secret)?;
+    drop(secret);
+    println!("copied {} (…{}) to the clipboard", entry.id, entry.last4);
+    println!("  it stays there until you copy something else — paste it and move on");
+    Ok(0)
+}
+
+// ---------------------------------------------------------------------------
+// rm
+// ---------------------------------------------------------------------------
+
+/// `pb key rm` — drop the metadata entry and the keychain item together.
+fn rm(registry: &KeyRegistry, id: &str, yes: bool) -> Result<i32> {
+    let entry = registry
+        .get(id)?
+        .ok_or_else(|| anyhow::anyhow!("no key registered as `{id}`"))?;
+    if !yes && !confirm(&entry)? {
+        println!("left {} alone", entry.id);
+        return Ok(0);
+    }
+    let removed = registry.remove(id)?;
+    println!("removed {} (…{})", removed.id, removed.last4);
+    println!("  the value is gone from the {}", registry.store_name());
+    println!("  revoke it at the provider too — patchbay only forgets it");
+    Ok(0)
 }
 
 // ---------------------------------------------------------------------------
 // verify
 // ---------------------------------------------------------------------------
+
+/// `pb key verify` — ask the issuer, then report (and usually record) what it
+/// said. Returns the exit code the subcommand's own docs promise.
+fn verify(
+    registry: &KeyRegistry,
+    id: &str,
+    json: bool,
+    no_update: bool,
+    styles: &Styles,
+) -> Result<i32> {
+    let entry = registry
+        .get(id)?
+        .ok_or_else(|| anyhow::anyhow!("no key registered as `{id}`"))?;
+    // The secret lives for exactly this call and is never printed.
+    let secret = registry.get_secret(id)?;
+    let outcome = verify_key(&entry, &secret);
+    drop(secret);
+
+    let updated = if no_update {
+        Vec::new()
+    } else {
+        absorb(registry, &entry, &outcome)?
+    };
+
+    if json {
+        let mut value = serde_json::to_value(&outcome)?;
+        if let Some(map) = value.as_object_mut() {
+            map.insert("id".into(), entry.id.clone().into());
+            map.insert("provider".into(), entry.provider.clone().into());
+            map.insert("metadata_updated".into(), updated.clone().into());
+        }
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        print_verify(&entry, &outcome, &updated, styles);
+    }
+    Ok(match outcome.status {
+        KeyVerifyStatus::Valid | KeyVerifyStatus::Unsupported => 0,
+        KeyVerifyStatus::Invalid | KeyVerifyStatus::Expired => 1,
+        // Distinct from 1: nothing was learned about the key.
+        KeyVerifyStatus::Unreachable => 2,
+    })
+}
 
 /// Write back what the issuer just told us, and report what changed.
 ///
@@ -546,6 +490,84 @@ fn print_verify(entry: &KeyEntry, outcome: &KeyVerifyOutcome, updated: &[String]
 // edit
 // ---------------------------------------------------------------------------
 
+/// `pb key edit` — apply a metadata patch, then read the stored entry back to
+/// report what actually landed.
+fn edit(registry: &KeyRegistry, args: EditArgs) -> Result<i32> {
+    let EditArgs { id, fields } = args;
+    let (patch, touched) = build_patch(fields)?;
+
+    // A rejected name (`pb key edit x --env cf_token`) surfaces the
+    // core's error verbatim: it already suggests the right spelling.
+    let updated = registry.update_metadata(&id, patch)?;
+    println!("updated {}", updated.id);
+    for field in touched {
+        let name = format!("{}:", field.label());
+        println!("  {name:<FIELD_COL$} {}", field.value(&updated));
+    }
+    Ok(0)
+}
+
+/// The patch a set of `pb key edit` flags describes, and the fields it touches
+/// — in the order they are reported. `Some(None)` is a deliberate clear, a
+/// missing entry is "leave it alone", and an edit that would change nothing is
+/// refused rather than written.
+///
+/// Pure, so every flag combination can be checked without a vault.
+fn build_patch(fields: EditFields) -> Result<(KeyPatch, Vec<Field>)> {
+    let EditFields {
+        provider,
+        label,
+        purpose,
+        no_purpose,
+        scopes,
+        expires,
+        no_expires,
+        endpoint,
+        no_endpoint,
+        env,
+        no_env,
+    } = fields;
+
+    let mut patch = KeyPatch::default();
+    let mut touched: Vec<Field> = Vec::new();
+
+    if let Some(provider) = provider {
+        patch.provider = Some(provider);
+        touched.push(Field::Provider);
+    }
+    if let Some(label) = label {
+        patch.label = Some(label);
+        touched.push(Field::Label);
+    }
+    if no_purpose || purpose.is_some() {
+        patch.purpose = Some(purpose);
+        touched.push(Field::Purpose);
+    }
+    if !scopes.is_empty() {
+        patch.scopes = Some(scopes);
+        touched.push(Field::Scopes);
+    }
+    if no_expires || expires.is_some() {
+        patch.expires_at = Some(expires.as_deref().map(parse_expiry).transpose()?);
+        touched.push(Field::Expires);
+    }
+    if no_endpoint || endpoint.is_some() {
+        patch.endpoint = Some(endpoint);
+        touched.push(Field::Endpoint);
+    }
+    if no_env || env.is_some() {
+        patch.env = Some(env);
+        touched.push(Field::Env);
+    }
+    if patch.is_empty() {
+        anyhow::bail!(
+            "nothing to change; pass at least one of --provider, --label, --purpose, \
+             --scopes, --expires, --endpoint, --env (or a --no-* to clear one)"
+        );
+    }
+    Ok((patch, touched))
+}
+
 /// An editable metadata field, so `pb key edit` can report what it changed by
 /// reading the *stored* entry back rather than echoing what was typed —
 /// trimming and normalization happen in the core, and the report should show
@@ -617,6 +639,65 @@ fn active_filters(expiring: Option<i64>, filter: &KeyFilter) -> Vec<String> {
 // ---------------------------------------------------------------------------
 // run
 // ---------------------------------------------------------------------------
+
+/// `pb key run` — resolve every requested key, then hand the values to a child
+/// process's environment and nowhere else.
+fn run_command(
+    registry: &KeyRegistry,
+    keys: &[String],
+    aliases: &[String],
+    command: &[String],
+) -> Result<i32> {
+    let (bin, args) = command
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("nothing to run; pass a command after `--`"))?;
+    let aliases = parse_aliases(aliases)?;
+
+    // Everything is resolved before anything is spawned: a typo has to
+    // fail here, not halfway through a deploy.
+    let mut entries: Vec<KeyEntry> = Vec::new();
+    for id in keys.iter().chain(aliases.iter().map(|(_, id)| id)) {
+        if entries.iter().any(|e| &e.id == id) {
+            continue;
+        }
+        entries.push(
+            registry
+                .get(id)?
+                .ok_or_else(|| anyhow::anyhow!("no key registered as `{id}`"))?,
+        );
+    }
+    let plan = injection_plan(&entries, keys, &aliases)?;
+
+    // stderr, so a command whose stdout is being piped stays clean —
+    // and names only, never a value or a fragment of one.
+    let named: Vec<String> = plan
+        .iter()
+        .map(|(name, id)| format!("{name} ({id})"))
+        .collect();
+    eprintln!("injecting {} into `{bin}`", named.join(", "));
+
+    let mut child = std::process::Command::new(bin);
+    child.args(args);
+    // The parent environment is inherited on purpose: unlike
+    // `pb env run`, this adds a few credentials to an otherwise normal
+    // shell rather than defining the whole environment.
+    for (name, id) in &plan {
+        let secret = registry.get_secret(id)?;
+        child.env(name, &secret);
+        drop(secret);
+    }
+    let status = child
+        .status()
+        .with_context(|| format!("could not run `{bin}`"))?;
+
+    match status.code() {
+        Some(code) => Ok(code),
+        None => {
+            eprintln!("pb: `{bin}` was killed by a signal");
+            Ok(1)
+        }
+    }
+}
 
 /// `NAME=ID`, split on the first `=` so a key id containing one is still
 /// readable. The name is held to the same shape a stored one is: an alias is a
@@ -1305,6 +1386,98 @@ mod tests {
         );
         assert!(parse_expiry("2027-01-01T12:30:00Z").is_ok());
         let err = parse_expiry("next tuesday").unwrap_err().to_string();
+        assert!(err.contains("2027-01-01"), "{err}");
+    }
+
+    /// No flags at all: every field left alone.
+    fn untouched() -> EditFields {
+        EditFields {
+            provider: None,
+            label: None,
+            purpose: None,
+            no_purpose: false,
+            scopes: Vec::new(),
+            expires: None,
+            no_expires: false,
+            endpoint: None,
+            no_endpoint: false,
+            env: None,
+            no_env: false,
+        }
+    }
+
+    #[test]
+    fn test_build_patch_sets_only_the_fields_that_were_given() {
+        let (patch, touched) = build_patch(EditFields {
+            provider: Some("cloudflare".into()),
+            scopes: vec!["workers:edit".into()],
+            expires: Some("2027-01-01".into()),
+            ..untouched()
+        })
+        .unwrap();
+
+        assert_eq!(patch.provider.as_deref(), Some("cloudflare"));
+        assert_eq!(
+            patch.scopes.as_deref(),
+            Some(&["workers:edit".to_string()][..])
+        );
+        assert_eq!(
+            patch.expires_at,
+            Some(Some(
+                DateTime::parse_from_rfc3339("2027-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            ))
+        );
+        // Untouched fields stay absent, so update_metadata leaves them alone.
+        assert!(patch.label.is_none());
+        assert!(patch.purpose.is_none());
+        assert!(patch.endpoint.is_none());
+        assert!(patch.env.is_none());
+        // Reported in the order the report prints them.
+        assert_eq!(
+            touched,
+            vec![Field::Provider, Field::Scopes, Field::Expires]
+        );
+    }
+
+    #[test]
+    fn test_build_patch_distinguishes_clearing_from_leaving_alone() {
+        let (patch, touched) = build_patch(EditFields {
+            no_purpose: true,
+            no_expires: true,
+            no_endpoint: true,
+            no_env: true,
+            ..untouched()
+        })
+        .unwrap();
+
+        // `Some(None)` is the clear; a missing entry would be "leave it".
+        assert_eq!(patch.purpose, Some(None));
+        assert_eq!(patch.expires_at, Some(None));
+        assert_eq!(patch.endpoint, Some(None));
+        assert_eq!(patch.env, Some(None));
+        assert_eq!(
+            touched,
+            vec![Field::Purpose, Field::Expires, Field::Endpoint, Field::Env]
+        );
+    }
+
+    #[test]
+    fn test_build_patch_refuses_an_edit_that_changes_nothing() {
+        let err = build_patch(untouched()).unwrap_err().to_string();
+        assert!(err.contains("nothing to change"), "{err}");
+        assert!(err.contains("--provider"), "{err}");
+    }
+
+    #[test]
+    fn test_build_patch_rejects_an_unparseable_expiry() {
+        let err = build_patch(EditFields {
+            expires: Some("next tuesday".into()),
+            ..untouched()
+        })
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("2027-01-01"), "{err}");
     }
 }
