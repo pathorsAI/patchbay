@@ -57,7 +57,10 @@ pub use envs::{
     Attachment, EnvLayer, EnvMeta, EnvRegistry, EnvVarInfo, EnvVarSource, MergedEnv, ProjectEntry,
     SyncConfig,
 };
-pub use keys::{KeyEntry, KeyExpiryState, KeyPatch, KeyRegistry, NewKey};
+pub use keys::{
+    filter_keys, validate_env_name, KeyEntry, KeyExpiryState, KeyFilter, KeyPatch, KeyRegistry,
+    NewKey,
+};
 pub use keys_verify::{verify_key, KeyVerifyOutcome, KeyVerifyStatus};
 pub use keystore::Keystore;
 pub use mcp_clients::{

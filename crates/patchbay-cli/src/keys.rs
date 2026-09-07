@@ -2,9 +2,10 @@
 //!
 //! Deliberate asymmetry, and the whole point of the design: **writing** a
 //! secret is easy (pipe it in, or type it blind), **reading** one back is not.
-//! There is no `pb key show`. The only way out is [`Command::Copy`], which
-//! moves the value from the keychain to the clipboard without it ever passing
-//! through this process's stdout, a shell history line or a log.
+//! There is no `pb key show`. A value leaves the vault two ways, neither of
+//! them through this process's stdout, a shell history line or a log:
+//! [`Command::Copy`] moves it from the keychain to the clipboard, and
+//! [`Command::Run`] puts it straight into a child process's environment.
 //!
 //! Secrets never arrive as arguments either: argv is world-readable through
 //! `ps` and gets written to `~/.zsh_history` verbatim.
@@ -14,8 +15,11 @@ use std::process::{Command as Process, Stdio};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDate, NaiveTime, TimeZone, Utc};
-use clap::Subcommand;
-use patchbay_core::keys::{expiring_within_at, KeyEntry, KeyPatch, KeyRegistry, NewKey};
+use clap::{Args, Subcommand};
+use patchbay_core::keys::{
+    expiring_within_at, filter_keys, validate_env_name, KeyEntry, KeyFilter, KeyPatch, KeyRegistry,
+    NewKey,
+};
 use patchbay_core::keys_verify::{verify_key, KeyVerifyOutcome, KeyVerifyStatus};
 
 use crate::render::{self, Styles};
@@ -27,7 +31,12 @@ const COL_LAST4: usize = 5;
 const COL_EXPIRES: usize = 16;
 const COL_ID_MAX: usize = 24;
 const COL_PROVIDER_MAX: usize = 12;
-const COL_LABEL_MAX: usize = 24;
+/// The ENV column pays for itself out of LABEL's budget: a variable name is
+/// what a consumer looks a key up by, a label is only ever decoration.
+const COL_ENV_MAX: usize = 22;
+const COL_LABEL_MAX: usize = 18;
+/// Width of the field-name column in `pb key edit`'s report of what changed.
+const FIELD_COL: usize = 9;
 const DASH: &str = "—";
 
 #[derive(Subcommand, Debug)]
@@ -36,42 +45,36 @@ pub enum Command {
     ///
     /// The secret is read from stdin when something is piped in, and from a
     /// hidden prompt otherwise. It is never taken as an argument.
-    Add {
-        /// Lowercase slug, unique in the vault, e.g. `cf-gh-actions-deploy`.
-        id: String,
-        /// Who issued it: `cloudflare`, `github`, `openai`, … Free-form.
-        #[arg(long)]
-        provider: Option<String>,
-        /// Display name. Defaults to the id.
-        #[arg(long)]
-        label: Option<String>,
-        /// What it is for, e.g. "deploy from GitHub Actions in repo X".
-        #[arg(long)]
-        purpose: Option<String>,
-        /// Granted scopes, comma-separated.
-        #[arg(long, value_delimiter = ',')]
-        scopes: Vec<String>,
-        /// Expiry: `2027-01-01`, or a full RFC 3339 timestamp.
-        #[arg(long, value_name = "DATE")]
-        expires: Option<String>,
-        /// Instance URL, for providers with more than one address —
-        /// `https://<you>.grafana.net`. Grafana needs it to verify.
-        #[arg(long, value_name = "URL")]
-        endpoint: Option<String>,
-        /// Replace an existing entry with the same id (a rotation).
-        #[arg(long)]
-        overwrite: bool,
-    },
+    Add(AddArgs),
     /// List registered keys. Metadata only — never values.
-    List {
-        #[arg(long)]
-        json: bool,
-        /// Only keys expiring within this many days (already-expired included).
-        #[arg(long, value_name = "DAYS")]
-        expiring: Option<i64>,
-    },
+    List(ListArgs),
+    /// Change a key's metadata. The stored value is never touched.
+    ///
+    /// Every `--no-*` clears its field. `id`, `last4` and the registration date
+    /// are not editable: they describe the value in the keychain, and editing
+    /// them here would only make the registry lie about it.
+    Edit(EditArgs),
     /// Put a key's value on the clipboard, without printing it.
     Copy { id: String },
+    /// Run a command with keys in its environment.
+    ///
+    /// The blessed path for an agent or a script that needs a credential: the
+    /// value goes keychain → child process and never through a terminal, a log
+    /// or a model's context. The parent environment is inherited and these are
+    /// added to it, so the command still sees the shell it was launched from.
+    #[command(after_help = "Examples:\n  \
+        pb key run cloudflare-api-token-yjack-macbook -- wrangler deploy\n  \
+        pb key run --as CF_TOKEN=cf-deploy neon-peregrine-ci -- ./deploy.sh")]
+    Run {
+        /// Keys to inject, each under its own recorded variable name.
+        keys: Vec<String>,
+        /// Inject ID under NAME for this run, whatever name it is stored with.
+        #[arg(long = "as", value_name = "NAME=ID")]
+        aliases: Vec<String>,
+        /// The command, after `--`.
+        #[arg(last = true, required = true, value_name = "CMD")]
+        command: Vec<String>,
+    },
     /// Ask the issuer whether a key still works.
     ///
     /// Exit codes: 0 verified (or nothing patchbay can check), 1 the provider
@@ -94,143 +97,320 @@ pub enum Command {
     },
 }
 
+/// Everything `pb key add` takes. The secret is deliberately absent: it is
+/// read from stdin or a hidden prompt, never from argv.
+#[derive(Args, Debug)]
+pub struct AddArgs {
+    /// Lowercase slug, unique in the vault, e.g. `cf-gh-actions-deploy`.
+    id: String,
+    /// Who issued it: `cloudflare`, `github`, `openai`, … Free-form.
+    #[arg(long)]
+    provider: Option<String>,
+    /// Display name. Defaults to the id.
+    #[arg(long)]
+    label: Option<String>,
+    /// What it is for, e.g. "deploy from GitHub Actions in repo X".
+    #[arg(long)]
+    purpose: Option<String>,
+    /// Granted scopes, comma-separated.
+    #[arg(long, value_delimiter = ',')]
+    scopes: Vec<String>,
+    /// Expiry: `2027-01-01`, or a full RFC 3339 timestamp.
+    #[arg(long, value_name = "DATE")]
+    expires: Option<String>,
+    /// Instance URL, for providers with more than one address —
+    /// `https://<you>.grafana.net`. Grafana needs it to verify.
+    #[arg(long, value_name = "URL")]
+    endpoint: Option<String>,
+    /// Environment variable the key is exposed as, UPPER_SNAKE_CASE:
+    /// `CLOUDFLARE_API_TOKEN`. What `pb key run` injects it as, and what an
+    /// agent looks it up by.
+    #[arg(long, value_name = "NAME")]
+    env: Option<String>,
+    /// Replace an existing entry with the same id (a rotation).
+    #[arg(long)]
+    overwrite: bool,
+}
+
+/// The listing's output mode and the filters that narrow it.
+#[derive(Args, Debug)]
+pub struct ListArgs {
+    #[arg(long)]
+    json: bool,
+    /// Only keys expiring within this many days (already-expired included).
+    #[arg(long, value_name = "DAYS")]
+    expiring: Option<i64>,
+    /// Only keys from this issuer.
+    #[arg(long, value_name = "P")]
+    provider: Option<String>,
+    /// Only the key(s) exposed as this variable name.
+    #[arg(long, value_name = "NAME")]
+    env: Option<String>,
+    /// Free text over id, label, provider, purpose and variable name.
+    #[arg(long, value_name = "TEXT")]
+    grep: Option<String>,
+}
+
+/// Which key to edit, and what to make of it.
+#[derive(Args, Debug)]
+pub struct EditArgs {
+    /// The key to edit.
+    id: String,
+    #[command(flatten)]
+    fields: EditFields,
+}
+
+/// The editable half of `pb key edit`, split out so the patch it describes can
+/// be built — and tested — without a vault to write it to.
+#[derive(Args, Debug)]
+pub struct EditFields {
+    /// Who issued it: `cloudflare`, `github`, `openai`, … Free-form.
+    #[arg(long)]
+    provider: Option<String>,
+    /// Display name.
+    #[arg(long)]
+    label: Option<String>,
+    /// What it is for, e.g. "deploy from GitHub Actions in repo X".
+    #[arg(long, conflicts_with = "no_purpose")]
+    purpose: Option<String>,
+    /// Forget what this key is for.
+    #[arg(long = "no-purpose")]
+    no_purpose: bool,
+    /// Replace the recorded scopes, comma-separated.
+    #[arg(long, value_delimiter = ',')]
+    scopes: Vec<String>,
+    /// Expiry: `2027-01-01`, or a full RFC 3339 timestamp.
+    #[arg(long, value_name = "DATE", conflicts_with = "no_expires")]
+    expires: Option<String>,
+    /// Forget the expiry.
+    #[arg(long = "no-expires")]
+    no_expires: bool,
+    /// Instance URL, for providers with more than one address.
+    #[arg(long, value_name = "URL", conflicts_with = "no_endpoint")]
+    endpoint: Option<String>,
+    /// Forget the instance URL.
+    #[arg(long = "no-endpoint")]
+    no_endpoint: bool,
+    /// Environment variable the key is exposed as, UPPER_SNAKE_CASE.
+    #[arg(long, value_name = "NAME", conflicts_with = "no_env")]
+    env: Option<String>,
+    /// Forget the variable name.
+    #[arg(long = "no-env")]
+    no_env: bool,
+}
+
 /// Returns the process exit code.
 pub fn run(command: Command, styles: &Styles) -> Result<i32> {
     let registry = KeyRegistry::detect()?;
 
     match command {
-        Command::Add {
-            id,
-            provider,
-            label,
-            purpose,
-            scopes,
-            expires,
-            endpoint,
-            overwrite,
-        } => {
-            let expires_at = expires.as_deref().map(parse_expiry).transpose()?;
-            let new = NewKey::new(&id, "cli")
-                .provider(provider.clone().unwrap_or_else(|| "unknown".to_string()))
-                .label(label.unwrap_or_else(|| id.clone()))
-                .purpose(purpose)
-                .scopes(scopes)
-                .expires_at(expires_at)
-                .endpoint(endpoint);
-
-            let secret = read_secret(&id)?;
-            let entry = registry.add(new, &secret, overwrite)?;
-            drop(secret);
-
-            println!("registered {} (…{})", entry.id, entry.last4);
-            if let Some(endpoint) = &entry.endpoint {
-                println!("  instance: {endpoint}");
-            }
-            println!("  value:    {}", registry.store_name());
-            println!("  metadata: {}", registry.path().display());
-            if provider.is_none() {
-                println!("  hint: --provider makes the board far easier to scan");
-            }
-            if entry.expires_at.is_none() {
-                println!("  hint: --expires lets patchbay warn you before it dies");
-            }
-            Ok(0)
-        }
-
-        Command::List { json, expiring } => {
-            let mut entries = registry.list()?;
-            if let Some(days) = expiring {
-                entries = expiring_within_at(&entries, Utc::now(), days);
-            }
-            if json {
-                // Machine-readable: JSON only, no ANSI, no extras.
-                println!("{}", serde_json::to_string_pretty(&entries)?);
-                return Ok(0);
-            }
-            if entries.is_empty() {
-                match expiring {
-                    Some(days) => println!("no registered key expires within {days}d"),
-                    None => {
-                        println!("no keys registered yet");
-                        println!("  pb key add <id> --provider <who> --label \"<what>\"");
-                    }
-                }
-                return Ok(0);
-            }
-            print!("{}", render_table(&entries, Utc::now(), styles));
-            Ok(0)
-        }
-
-        Command::Copy { id } => {
-            let entry = registry
-                .get(&id)?
-                .ok_or_else(|| anyhow::anyhow!("no key registered as `{id}`"))?;
-            let secret = registry.get_secret(&id)?;
-            to_clipboard(&secret)?;
-            drop(secret);
-            println!("copied {} (…{}) to the clipboard", entry.id, entry.last4);
-            println!("  it stays there until you copy something else — paste it and move on");
-            Ok(0)
-        }
-
+        Command::Add(args) => add(&registry, args),
+        Command::List(args) => list(&registry, args, styles),
+        Command::Edit(args) => edit(&registry, args),
+        Command::Copy { id } => copy(&registry, &id),
+        Command::Run {
+            keys,
+            aliases,
+            command,
+        } => run_command(&registry, &keys, &aliases, &command),
         Command::Verify {
             id,
             json,
             no_update,
-        } => {
-            let entry = registry
-                .get(&id)?
-                .ok_or_else(|| anyhow::anyhow!("no key registered as `{id}`"))?;
-            // The secret lives for exactly this call and is never printed.
-            let secret = registry.get_secret(&id)?;
-            let outcome = verify_key(&entry, &secret);
-            drop(secret);
-
-            let updated = if no_update {
-                Vec::new()
-            } else {
-                absorb(&registry, &entry, &outcome)?
-            };
-
-            if json {
-                let mut value = serde_json::to_value(&outcome)?;
-                if let Some(map) = value.as_object_mut() {
-                    map.insert("id".into(), entry.id.clone().into());
-                    map.insert("provider".into(), entry.provider.clone().into());
-                    map.insert("metadata_updated".into(), updated.clone().into());
-                }
-                println!("{}", serde_json::to_string_pretty(&value)?);
-            } else {
-                print_verify(&entry, &outcome, &updated, styles);
-            }
-            Ok(match outcome.status {
-                KeyVerifyStatus::Valid | KeyVerifyStatus::Unsupported => 0,
-                KeyVerifyStatus::Invalid | KeyVerifyStatus::Expired => 1,
-                // Distinct from 1: nothing was learned about the key.
-                KeyVerifyStatus::Unreachable => 2,
-            })
-        }
-
-        Command::Rm { id, yes } => {
-            let entry = registry
-                .get(&id)?
-                .ok_or_else(|| anyhow::anyhow!("no key registered as `{id}`"))?;
-            if !yes && !confirm(&entry)? {
-                println!("left {} alone", entry.id);
-                return Ok(0);
-            }
-            let removed = registry.remove(&id)?;
-            println!("removed {} (…{})", removed.id, removed.last4);
-            println!("  the value is gone from the {}", registry.store_name());
-            println!("  revoke it at the provider too — patchbay only forgets it");
-            Ok(0)
-        }
+        } => verify(&registry, &id, json, no_update, styles),
+        Command::Rm { id, yes } => rm(&registry, &id, yes),
     }
+}
+
+// ---------------------------------------------------------------------------
+// add
+// ---------------------------------------------------------------------------
+
+/// `pb key add` — register a key and hand its value to the keychain.
+fn add(registry: &KeyRegistry, args: AddArgs) -> Result<i32> {
+    let AddArgs {
+        id,
+        provider,
+        label,
+        purpose,
+        scopes,
+        expires,
+        endpoint,
+        env,
+        overwrite,
+    } = args;
+
+    let expires_at = expires.as_deref().map(parse_expiry).transpose()?;
+    let new = NewKey::new(&id, "cli")
+        .provider(provider.clone().unwrap_or_else(|| "unknown".to_string()))
+        .label(label.unwrap_or_else(|| id.clone()))
+        .purpose(purpose)
+        .scopes(scopes)
+        .expires_at(expires_at)
+        .endpoint(endpoint)
+        .env(env);
+
+    let secret = read_secret(&id)?;
+    let entry = registry.add(new, &secret, overwrite)?;
+    drop(secret);
+
+    println!("registered {} (…{})", entry.id, entry.last4);
+    if let Some(endpoint) = &entry.endpoint {
+        println!("  instance: {endpoint}");
+    }
+    if let Some(name) = &entry.env {
+        println!("  env:      {name}");
+    }
+    println!("  value:    {}", registry.store_name());
+    println!("  metadata: {}", registry.path().display());
+    if provider.is_none() {
+        println!("  hint: --provider makes the board far easier to scan");
+    }
+    if entry.expires_at.is_none() {
+        println!("  hint: --expires lets patchbay warn you before it dies");
+    }
+    if entry.env.is_none() {
+        println!("  hint: --env NAME lets `pb key run` and agents find it by the name code reads");
+    }
+    Ok(0)
+}
+
+// ---------------------------------------------------------------------------
+// list
+// ---------------------------------------------------------------------------
+
+/// `pb key list` — the board, or the same rows as JSON.
+fn list(registry: &KeyRegistry, args: ListArgs, styles: &Styles) -> Result<i32> {
+    let ListArgs {
+        json,
+        expiring,
+        provider,
+        env,
+        grep,
+    } = args;
+
+    let filter = KeyFilter {
+        provider,
+        env,
+        query: grep,
+    };
+    let mut entries = registry.list()?;
+    if let Some(days) = expiring {
+        entries = expiring_within_at(&entries, Utc::now(), days);
+    }
+    // After the expiring cut, so the two narrow the same listing rather
+    // than fighting over it.
+    entries = filter_keys(&entries, &filter);
+
+    if json {
+        // Machine-readable: JSON only, no ANSI, no extras.
+        println!("{}", serde_json::to_string_pretty(&entries)?);
+        return Ok(0);
+    }
+    if entries.is_empty() {
+        let active = active_filters(expiring, &filter);
+        if active.is_empty() {
+            println!("no keys registered yet");
+            println!("  pb key add <id> --provider <who> --label \"<what>\"");
+        } else if filter.is_empty() {
+            // The expiring-only question deserves its own sentence: an
+            // empty answer there is good news, not a failed search.
+            println!(
+                "no registered key expires within {}d",
+                expiring.unwrap_or_default()
+            );
+        } else {
+            println!("no registered key matches");
+            println!("  filters: {}", active.join(", "));
+        }
+        return Ok(0);
+    }
+    print!("{}", render_table(&entries, Utc::now(), styles));
+    Ok(0)
+}
+
+// ---------------------------------------------------------------------------
+// copy
+// ---------------------------------------------------------------------------
+
+/// `pb key copy` — keychain → clipboard, with the value never touching stdout.
+fn copy(registry: &KeyRegistry, id: &str) -> Result<i32> {
+    let entry = registry
+        .get(id)?
+        .ok_or_else(|| anyhow::anyhow!("no key registered as `{id}`"))?;
+    let secret = registry.get_secret(id)?;
+    to_clipboard(&secret)?;
+    drop(secret);
+    println!("copied {} (…{}) to the clipboard", entry.id, entry.last4);
+    println!("  it stays there until you copy something else — paste it and move on");
+    Ok(0)
+}
+
+// ---------------------------------------------------------------------------
+// rm
+// ---------------------------------------------------------------------------
+
+/// `pb key rm` — drop the metadata entry and the keychain item together.
+fn rm(registry: &KeyRegistry, id: &str, yes: bool) -> Result<i32> {
+    let entry = registry
+        .get(id)?
+        .ok_or_else(|| anyhow::anyhow!("no key registered as `{id}`"))?;
+    if !yes && !confirm(&entry)? {
+        println!("left {} alone", entry.id);
+        return Ok(0);
+    }
+    let removed = registry.remove(id)?;
+    println!("removed {} (…{})", removed.id, removed.last4);
+    println!("  the value is gone from the {}", registry.store_name());
+    println!("  revoke it at the provider too — patchbay only forgets it");
+    Ok(0)
 }
 
 // ---------------------------------------------------------------------------
 // verify
 // ---------------------------------------------------------------------------
+
+/// `pb key verify` — ask the issuer, then report (and usually record) what it
+/// said. Returns the exit code the subcommand's own docs promise.
+fn verify(
+    registry: &KeyRegistry,
+    id: &str,
+    json: bool,
+    no_update: bool,
+    styles: &Styles,
+) -> Result<i32> {
+    let entry = registry
+        .get(id)?
+        .ok_or_else(|| anyhow::anyhow!("no key registered as `{id}`"))?;
+    // The secret lives for exactly this call and is never printed.
+    let secret = registry.get_secret(id)?;
+    let outcome = verify_key(&entry, &secret);
+    drop(secret);
+
+    let updated = if no_update {
+        Vec::new()
+    } else {
+        absorb(registry, &entry, &outcome)?
+    };
+
+    if json {
+        let mut value = serde_json::to_value(&outcome)?;
+        if let Some(map) = value.as_object_mut() {
+            map.insert("id".into(), entry.id.clone().into());
+            map.insert("provider".into(), entry.provider.clone().into());
+            map.insert("metadata_updated".into(), updated.clone().into());
+        }
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        print_verify(&entry, &outcome, &updated, styles);
+    }
+    Ok(match outcome.status {
+        KeyVerifyStatus::Valid | KeyVerifyStatus::Unsupported => 0,
+        KeyVerifyStatus::Invalid | KeyVerifyStatus::Expired => 1,
+        // Distinct from 1: nothing was learned about the key.
+        KeyVerifyStatus::Unreachable => 2,
+    })
+}
 
 /// Write back what the issuer just told us, and report what changed.
 ///
@@ -304,6 +484,292 @@ fn print_verify(entry: &KeyEntry, outcome: &KeyVerifyOutcome, updated: &[String]
     if outcome.status == KeyVerifyStatus::Unreachable {
         println!("  the key was not tested — this is a connection problem, not a verdict");
     }
+}
+
+// ---------------------------------------------------------------------------
+// edit
+// ---------------------------------------------------------------------------
+
+/// `pb key edit` — apply a metadata patch, then read the stored entry back to
+/// report what actually landed.
+fn edit(registry: &KeyRegistry, args: EditArgs) -> Result<i32> {
+    let EditArgs { id, fields } = args;
+    let (patch, touched) = build_patch(fields)?;
+
+    // A rejected name (`pb key edit x --env cf_token`) surfaces the
+    // core's error verbatim: it already suggests the right spelling.
+    let updated = registry.update_metadata(&id, patch)?;
+    println!("updated {}", updated.id);
+    for field in touched {
+        let name = format!("{}:", field.label());
+        println!("  {name:<FIELD_COL$} {}", field.value(&updated));
+    }
+    Ok(0)
+}
+
+/// The patch a set of `pb key edit` flags describes, and the fields it touches
+/// — in the order they are reported. `Some(None)` is a deliberate clear, a
+/// missing entry is "leave it alone", and an edit that would change nothing is
+/// refused rather than written.
+///
+/// Pure, so every flag combination can be checked without a vault.
+fn build_patch(fields: EditFields) -> Result<(KeyPatch, Vec<Field>)> {
+    let EditFields {
+        provider,
+        label,
+        purpose,
+        no_purpose,
+        scopes,
+        expires,
+        no_expires,
+        endpoint,
+        no_endpoint,
+        env,
+        no_env,
+    } = fields;
+
+    let mut patch = KeyPatch::default();
+    let mut touched: Vec<Field> = Vec::new();
+
+    if let Some(provider) = provider {
+        patch.provider = Some(provider);
+        touched.push(Field::Provider);
+    }
+    if let Some(label) = label {
+        patch.label = Some(label);
+        touched.push(Field::Label);
+    }
+    if no_purpose || purpose.is_some() {
+        patch.purpose = Some(purpose);
+        touched.push(Field::Purpose);
+    }
+    if !scopes.is_empty() {
+        patch.scopes = Some(scopes);
+        touched.push(Field::Scopes);
+    }
+    if no_expires || expires.is_some() {
+        patch.expires_at = Some(expires.as_deref().map(parse_expiry).transpose()?);
+        touched.push(Field::Expires);
+    }
+    if no_endpoint || endpoint.is_some() {
+        patch.endpoint = Some(endpoint);
+        touched.push(Field::Endpoint);
+    }
+    if no_env || env.is_some() {
+        patch.env = Some(env);
+        touched.push(Field::Env);
+    }
+    if patch.is_empty() {
+        anyhow::bail!(
+            "nothing to change; pass at least one of --provider, --label, --purpose, \
+             --scopes, --expires, --endpoint, --env (or a --no-* to clear one)"
+        );
+    }
+    Ok((patch, touched))
+}
+
+/// An editable metadata field, so `pb key edit` can report what it changed by
+/// reading the *stored* entry back rather than echoing what was typed —
+/// trimming and normalization happen in the core, and the report should show
+/// what actually landed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Field {
+    Provider,
+    Label,
+    Purpose,
+    Scopes,
+    Expires,
+    Endpoint,
+    Env,
+}
+
+impl Field {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Provider => "provider",
+            Self::Label => "label",
+            Self::Purpose => "purpose",
+            Self::Scopes => "scopes",
+            Self::Expires => "expires",
+            Self::Endpoint => "endpoint",
+            Self::Env => "env",
+        }
+    }
+
+    /// This field on `entry`, as one line. A cleared field reads as a dash.
+    fn value(self, entry: &KeyEntry) -> String {
+        let or_dash = |v: Option<String>| v.unwrap_or_else(|| DASH.to_string());
+        match self {
+            Self::Provider => entry.provider.clone(),
+            Self::Label => entry.label.clone(),
+            Self::Purpose => or_dash(entry.purpose.as_deref().map(one_line)),
+            Self::Scopes => {
+                if entry.scopes.is_empty() {
+                    DASH.to_string()
+                } else {
+                    entry.scopes.join(", ")
+                }
+            }
+            Self::Expires => or_dash(entry.expires_at.map(|at| at.format("%Y-%m-%d").to_string())),
+            Self::Endpoint => or_dash(entry.endpoint.clone()),
+            Self::Env => or_dash(entry.env.clone()),
+        }
+    }
+}
+
+/// The filters a listing was narrowed by, for the "nothing matched" line. An
+/// empty answer is only useful next to the question that produced it.
+fn active_filters(expiring: Option<i64>, filter: &KeyFilter) -> Vec<String> {
+    let mut active = Vec::new();
+    if let Some(p) = &filter.provider {
+        active.push(format!("provider={p}"));
+    }
+    if let Some(e) = &filter.env {
+        active.push(format!("env={e}"));
+    }
+    if let Some(q) = &filter.query {
+        active.push(format!("grep={q}"));
+    }
+    if let Some(days) = expiring {
+        active.push(format!("expiring={days}d"));
+    }
+    active
+}
+
+// ---------------------------------------------------------------------------
+// run
+// ---------------------------------------------------------------------------
+
+/// `pb key run` — resolve every requested key, then hand the values to a child
+/// process's environment and nowhere else.
+fn run_command(
+    registry: &KeyRegistry,
+    keys: &[String],
+    aliases: &[String],
+    command: &[String],
+) -> Result<i32> {
+    let (bin, args) = command
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("nothing to run; pass a command after `--`"))?;
+    let aliases = parse_aliases(aliases)?;
+
+    // Everything is resolved before anything is spawned: a typo has to
+    // fail here, not halfway through a deploy.
+    let mut entries: Vec<KeyEntry> = Vec::new();
+    for id in keys.iter().chain(aliases.iter().map(|(_, id)| id)) {
+        if entries.iter().any(|e| &e.id == id) {
+            continue;
+        }
+        entries.push(
+            registry
+                .get(id)?
+                .ok_or_else(|| anyhow::anyhow!("no key registered as `{id}`"))?,
+        );
+    }
+    let plan = injection_plan(&entries, keys, &aliases)?;
+
+    // stderr, so a command whose stdout is being piped stays clean —
+    // and names only, never a value or a fragment of one.
+    let named: Vec<String> = plan
+        .iter()
+        .map(|(name, id)| format!("{name} ({id})"))
+        .collect();
+    eprintln!("injecting {} into `{bin}`", named.join(", "));
+
+    let mut child = std::process::Command::new(bin);
+    child.args(args);
+    // The parent environment is inherited on purpose: unlike
+    // `pb env run`, this adds a few credentials to an otherwise normal
+    // shell rather than defining the whole environment.
+    for (name, id) in &plan {
+        let secret = registry.get_secret(id)?;
+        child.env(name, &secret);
+        drop(secret);
+    }
+    let status = child
+        .status()
+        .with_context(|| format!("could not run `{bin}`"))?;
+
+    match status.code() {
+        Some(code) => Ok(code),
+        None => {
+            eprintln!("pb: `{bin}` was killed by a signal");
+            Ok(1)
+        }
+    }
+}
+
+/// `NAME=ID`, split on the first `=` so a key id containing one is still
+/// readable. The name is held to the same shape a stored one is: an alias is a
+/// variable name too, and a run is no excuse to invent a second spelling.
+fn parse_aliases(raw: &[String]) -> Result<Vec<(String, String)>> {
+    raw.iter()
+        .map(|spec| {
+            let (name, id) = spec.split_once('=').ok_or_else(|| {
+                anyhow::anyhow!(
+                    "`{spec}` is not a NAME=ID pair; write it like \
+                     --as CF_TOKEN=cloudflare-api-token"
+                )
+            })?;
+            let (name, id) = (name.trim(), id.trim());
+            validate_env_name(name)?;
+            if id.is_empty() {
+                anyhow::bail!(
+                    "`--as {spec}` names no key; write it like \
+                     --as CF_TOKEN=cloudflare-api-token"
+                );
+            }
+            Ok((name.to_string(), id.to_string()))
+        })
+        .collect()
+}
+
+/// The `(variable name, key id)` pairs a run injects, in the order they were
+/// asked for: positional ids under their recorded name, then the `--as`
+/// aliases. Pure, so the whole resolution can be tested without a keychain.
+///
+/// Two ids landing on one name is refused rather than resolved: silently
+/// letting the later one win would hand a command a credential the caller did
+/// not think they were passing.
+fn injection_plan(
+    entries: &[KeyEntry],
+    ids: &[String],
+    aliases: &[(String, String)],
+) -> Result<Vec<(String, String)>> {
+    let mut plan: Vec<(String, String)> = Vec::new();
+    let mut add = |name: String, id: String| -> Result<()> {
+        // The same injection asked for twice (positionally and by alias) is
+        // one injection, not a collision.
+        if plan.iter().any(|(n, i)| n == &name && i == &id) {
+            return Ok(());
+        }
+        if let Some((_, other)) = plan.iter().find(|(n, _)| n == &name) {
+            anyhow::bail!(
+                "`{other}` and `{id}` would both be injected as {name}; \
+                 give one of them another name with `--as OTHER_NAME={id}`"
+            );
+        }
+        plan.push((name, id));
+        Ok(())
+    };
+
+    for id in ids {
+        let entry = entries
+            .iter()
+            .find(|e| &e.id == id)
+            .ok_or_else(|| anyhow::anyhow!("no key registered as `{id}`"))?;
+        let name = entry.env.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "`{id}` has no env name; set one with `pb key edit {id} --env NAME`, \
+                 or pass --as NAME={id} for this run"
+            )
+        })?;
+        add(name, id.clone())?;
+    }
+    for (name, id) in aliases {
+        add(name.clone(), id.clone())?;
+    }
+    Ok(plan)
 }
 
 // ---------------------------------------------------------------------------
@@ -427,21 +893,29 @@ pub fn render_table(entries: &[KeyEntry], now: DateTime<Utc>, styles: &Styles) -
         "PROVIDER",
         COL_PROVIDER_MAX,
     );
+    let env_w = column_width(
+        entries
+            .iter()
+            .map(|e| e.env.as_deref().map_or(0, |v| v.chars().count())),
+        "ENV",
+        COL_ENV_MAX,
+    );
     let label_w = column_width(
         entries.iter().map(|e| e.label.chars().count()),
         "LABEL",
         COL_LABEL_MAX,
     );
-    let fixed = id_w + provider_w + label_w + COL_LAST4 + COL_EXPIRES + GAP * 5;
+    let fixed = id_w + provider_w + env_w + label_w + COL_LAST4 + COL_EXPIRES + GAP * 6;
     let purpose_w = TABLE_WIDTH.saturating_sub(fixed).max(12);
 
     let gap = " ".repeat(GAP);
     let mut out = String::new();
 
     let header = format!(
-        "{}{gap}{}{gap}{}{gap}{}{gap}{}{gap}{}",
+        "{}{gap}{}{gap}{}{gap}{}{gap}{}{gap}{}{gap}{}",
         pad("ID", id_w),
         pad("PROVIDER", provider_w),
+        pad("ENV", env_w),
         pad("LABEL", label_w),
         pad("LAST4", COL_LAST4),
         pad("EXPIRES", COL_EXPIRES),
@@ -453,6 +927,12 @@ pub fn render_table(entries: &[KeyEntry], now: DateTime<Utc>, styles: &Styles) -
     for entry in entries {
         let id = pad(&render::truncate(&entry.id, id_w), id_w);
         let provider = pad(&render::truncate(&entry.provider, provider_w), provider_w);
+        // No variable name is a fact about the key, not a warning — same
+        // treatment as a missing expiry.
+        let env = match &entry.env {
+            Some(name) => pad(&render::truncate(name, env_w), env_w),
+            None => styles.paint(dim(), &pad(DASH, env_w)),
+        };
         let label = pad(&render::truncate(&entry.label, label_w), label_w);
         let last4 = pad(&entry.last4, COL_LAST4);
 
@@ -476,8 +956,9 @@ pub fn render_table(entries: &[KeyEntry], now: DateTime<Utc>, styles: &Styles) -
             styles.paint(dim(), &purpose)
         };
 
-        let line =
-            format!("{id}{gap}{provider}{gap}{label}{gap}{last4}{gap}{expires}{gap}{purpose}");
+        let line = format!(
+            "{id}{gap}{provider}{gap}{env}{gap}{label}{gap}{last4}{gap}{expires}{gap}{purpose}"
+        );
         out.push_str(line.trim_end());
         out.push('\n');
     }
@@ -523,6 +1004,14 @@ mod tests {
             last4: "1234".into(),
             source: "cli".into(),
             endpoint: None,
+            env: None,
+        }
+    }
+
+    fn with_env(id: &str, env: Option<&str>) -> KeyEntry {
+        KeyEntry {
+            env: env.map(Into::into),
+            ..entry(id, None)
         }
     }
 
@@ -549,6 +1038,43 @@ mod tests {
         let col = lines[0].find("PROVIDER").unwrap();
         assert!(lines[1][col..].starts_with("cloudflare"));
         assert!(lines[2][col..].starts_with("cloudflare"));
+    }
+
+    #[test]
+    fn test_env_column_sits_between_provider_and_label() {
+        let entries = vec![
+            with_env("cf-deploy", Some("CLOUDFLARE_API_TOKEN")),
+            with_env("duns", None),
+        ];
+        let out = render_table(&entries, now(), &Styles::new(false));
+        let lines: Vec<&str> = out.lines().collect();
+
+        let provider_col = lines[0].find("PROVIDER").unwrap();
+        let env_col = lines[0].find("ENV").unwrap();
+        let label_col = lines[0].find("LABEL").unwrap();
+        assert!(provider_col < env_col && env_col < label_col, "{out}");
+
+        assert!(
+            lines[1][env_col..].starts_with("CLOUDFLARE_API_TOKEN"),
+            "{out}"
+        );
+        // No name is a dash in the same column, not a hole in the row.
+        assert!(lines[2][env_col..].starts_with(DASH), "{out}");
+        assert!(
+            lines[1][label_col..].starts_with("CF deploy token"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn test_a_long_env_name_is_truncated_into_its_column() {
+        let long = "A".repeat(COL_ENV_MAX + 20);
+        let out = render_table(&[with_env("k", Some(&long))], now(), &Styles::new(false));
+        assert!(!out.contains(&long), "{out}");
+        assert!(
+            out.contains(&format!("{}…", "A".repeat(COL_ENV_MAX - 1))),
+            "{out}"
+        );
     }
 
     #[test]
@@ -680,6 +1206,179 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_aliases_splits_on_the_first_equals_and_validates_the_name() {
+        let raw = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
+
+        assert_eq!(
+            parse_aliases(&raw(&["CF_TOKEN=cf-deploy", " NEON_API_KEY = neon-ci "])).unwrap(),
+            vec![
+                ("CF_TOKEN".to_string(), "cf-deploy".to_string()),
+                ("NEON_API_KEY".to_string(), "neon-ci".to_string()),
+            ]
+        );
+        // An id may contain `=`; only the first one separates.
+        assert_eq!(
+            parse_aliases(&raw(&["TOKEN=weird=id"])).unwrap(),
+            vec![("TOKEN".to_string(), "weird=id".to_string())]
+        );
+
+        let err = parse_aliases(&raw(&["CF_TOKEN"])).unwrap_err().to_string();
+        assert!(err.contains("NAME=ID"), "{err}");
+        let err = parse_aliases(&raw(&["CF_TOKEN="])).unwrap_err().to_string();
+        assert!(err.contains("names no key"), "{err}");
+        // The core owns the shape rule, and its suggestion comes through.
+        let err = parse_aliases(&raw(&["cf_token=cf-deploy"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("UPPER_SNAKE_CASE"), "{err}");
+        assert!(err.contains("`CF_TOKEN`"), "{err}");
+    }
+
+    #[test]
+    fn test_injection_plan_uses_the_recorded_name_and_lets_an_alias_override_it() {
+        let entries = vec![
+            with_env("cf-deploy", Some("CLOUDFLARE_API_TOKEN")),
+            with_env("neon-ci", Some("NEON_API_KEY")),
+        ];
+        let ids = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
+        let alias = |name: &str, id: &str| (name.to_string(), id.to_string());
+
+        assert_eq!(
+            injection_plan(&entries, &ids(&["cf-deploy", "neon-ci"]), &[]).unwrap(),
+            vec![
+                alias("CLOUDFLARE_API_TOKEN", "cf-deploy"),
+                alias("NEON_API_KEY", "neon-ci"),
+            ]
+        );
+
+        // An alias alone: no positional id needed.
+        assert_eq!(
+            injection_plan(&entries, &[], &[alias("CF_TOKEN", "cf-deploy")]).unwrap(),
+            vec![alias("CF_TOKEN", "cf-deploy")]
+        );
+
+        // The same key both ways is two injections under two names.
+        assert_eq!(
+            injection_plan(
+                &entries,
+                &ids(&["cf-deploy"]),
+                &[alias("CF_TOKEN", "cf-deploy")]
+            )
+            .unwrap(),
+            vec![
+                alias("CLOUDFLARE_API_TOKEN", "cf-deploy"),
+                alias("CF_TOKEN", "cf-deploy"),
+            ]
+        );
+
+        // ...and asking for the very same injection twice is not a collision.
+        assert_eq!(
+            injection_plan(
+                &entries,
+                &ids(&["cf-deploy"]),
+                &[alias("CLOUDFLARE_API_TOKEN", "cf-deploy")]
+            )
+            .unwrap(),
+            vec![alias("CLOUDFLARE_API_TOKEN", "cf-deploy")]
+        );
+    }
+
+    #[test]
+    fn test_injection_plan_refuses_a_key_with_no_name_and_a_collision() {
+        let entries = vec![
+            with_env("cf-deploy", Some("CLOUDFLARE_API_TOKEN")),
+            with_env("cf-r2", Some("CLOUDFLARE_API_TOKEN")),
+            with_env("duns", None),
+        ];
+        let ids = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
+
+        let err = injection_plan(&entries, &ids(&["duns"]), &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("has no env name"), "{err}");
+        assert!(err.contains("pb key edit duns --env NAME"), "{err}");
+        assert!(err.contains("--as NAME=duns"), "{err}");
+
+        // Two keys of one provider share a conventional name; the run has to
+        // say which is which rather than let the second win.
+        let err = injection_plan(&entries, &ids(&["cf-deploy", "cf-r2"]), &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cf-deploy"), "{err}");
+        assert!(err.contains("cf-r2"), "{err}");
+        assert!(err.contains("CLOUDFLARE_API_TOKEN"), "{err}");
+
+        let err = injection_plan(&entries, &ids(&["ghost"]), &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no key registered as `ghost`"), "{err}");
+    }
+
+    #[test]
+    fn test_edit_reports_a_cleared_field_as_a_dash() {
+        let mut e = entry("k", Some(now()));
+        e.env = Some("CLOUDFLARE_API_TOKEN".into());
+
+        assert_eq!(Field::Provider.value(&e), "cloudflare");
+        assert_eq!(Field::Env.value(&e), "CLOUDFLARE_API_TOKEN");
+        assert_eq!(Field::Scopes.value(&e), "workers:edit");
+        assert_eq!(Field::Expires.value(&e), "2026-01-01");
+        // A multi-line purpose is flattened, exactly as in the table.
+        assert_eq!(Field::Purpose.value(&e), "deploy from GitHub Actions");
+
+        let cleared = KeyEntry {
+            purpose: None,
+            scopes: vec![],
+            expires_at: None,
+            endpoint: None,
+            env: None,
+            ..e
+        };
+        for field in [
+            Field::Purpose,
+            Field::Scopes,
+            Field::Expires,
+            Field::Endpoint,
+            Field::Env,
+        ] {
+            assert_eq!(field.value(&cleared), DASH, "{}", field.label());
+        }
+        // Every label, plus its colon, fits the column the report pads to.
+        for field in [
+            Field::Provider,
+            Field::Label,
+            Field::Purpose,
+            Field::Scopes,
+            Field::Expires,
+            Field::Endpoint,
+            Field::Env,
+        ] {
+            assert!(field.label().len() < FIELD_COL, "{}", field.label());
+        }
+    }
+
+    #[test]
+    fn test_active_filters_names_the_question_an_empty_listing_answered() {
+        assert!(active_filters(None, &KeyFilter::default()).is_empty());
+        assert_eq!(
+            active_filters(
+                Some(30),
+                &KeyFilter {
+                    provider: Some("cloudflare".into()),
+                    env: Some("CLOUDFLARE_API_TOKEN".into()),
+                    query: Some("deploy".into()),
+                }
+            ),
+            vec![
+                "provider=cloudflare",
+                "env=CLOUDFLARE_API_TOKEN",
+                "grep=deploy",
+                "expiring=30d",
+            ]
+        );
+    }
+
+    #[test]
     fn test_parse_expiry_accepts_a_bare_date_and_rfc3339() {
         assert_eq!(
             parse_expiry("2027-01-01").unwrap(),
@@ -687,6 +1386,98 @@ mod tests {
         );
         assert!(parse_expiry("2027-01-01T12:30:00Z").is_ok());
         let err = parse_expiry("next tuesday").unwrap_err().to_string();
+        assert!(err.contains("2027-01-01"), "{err}");
+    }
+
+    /// No flags at all: every field left alone.
+    fn untouched() -> EditFields {
+        EditFields {
+            provider: None,
+            label: None,
+            purpose: None,
+            no_purpose: false,
+            scopes: Vec::new(),
+            expires: None,
+            no_expires: false,
+            endpoint: None,
+            no_endpoint: false,
+            env: None,
+            no_env: false,
+        }
+    }
+
+    #[test]
+    fn test_build_patch_sets_only_the_fields_that_were_given() {
+        let (patch, touched) = build_patch(EditFields {
+            provider: Some("cloudflare".into()),
+            scopes: vec!["workers:edit".into()],
+            expires: Some("2027-01-01".into()),
+            ..untouched()
+        })
+        .unwrap();
+
+        assert_eq!(patch.provider.as_deref(), Some("cloudflare"));
+        assert_eq!(
+            patch.scopes.as_deref(),
+            Some(&["workers:edit".to_string()][..])
+        );
+        assert_eq!(
+            patch.expires_at,
+            Some(Some(
+                DateTime::parse_from_rfc3339("2027-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            ))
+        );
+        // Untouched fields stay absent, so update_metadata leaves them alone.
+        assert!(patch.label.is_none());
+        assert!(patch.purpose.is_none());
+        assert!(patch.endpoint.is_none());
+        assert!(patch.env.is_none());
+        // Reported in the order the report prints them.
+        assert_eq!(
+            touched,
+            vec![Field::Provider, Field::Scopes, Field::Expires]
+        );
+    }
+
+    #[test]
+    fn test_build_patch_distinguishes_clearing_from_leaving_alone() {
+        let (patch, touched) = build_patch(EditFields {
+            no_purpose: true,
+            no_expires: true,
+            no_endpoint: true,
+            no_env: true,
+            ..untouched()
+        })
+        .unwrap();
+
+        // `Some(None)` is the clear; a missing entry would be "leave it".
+        assert_eq!(patch.purpose, Some(None));
+        assert_eq!(patch.expires_at, Some(None));
+        assert_eq!(patch.endpoint, Some(None));
+        assert_eq!(patch.env, Some(None));
+        assert_eq!(
+            touched,
+            vec![Field::Purpose, Field::Expires, Field::Endpoint, Field::Env]
+        );
+    }
+
+    #[test]
+    fn test_build_patch_refuses_an_edit_that_changes_nothing() {
+        let err = build_patch(untouched()).unwrap_err().to_string();
+        assert!(err.contains("nothing to change"), "{err}");
+        assert!(err.contains("--provider"), "{err}");
+    }
+
+    #[test]
+    fn test_build_patch_rejects_an_unparseable_expiry() {
+        let err = build_patch(EditFields {
+            expires: Some("next tuesday".into()),
+            ..untouched()
+        })
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("2027-01-01"), "{err}");
     }
 }

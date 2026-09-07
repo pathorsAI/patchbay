@@ -27,7 +27,7 @@
 - **Switch** — change profile/context from the panel, the CLI, or an AI — including the traps (`gcloud` ADC).
 - **Permissions** — see what your tokens can actually do (`gh` scopes today) and fix missing scopes with one hint.
 - **[MCP client management](docs/mcp-clients.md)** — every MCP server registered in Claude Code, Claude Desktop, Cursor, Codex, Windsurf and VS Code in one matrix; copy a server between clients without hand-editing four files in two formats.
-- **[Key vault](docs/key-vault.md)** — standalone API keys no CLI tracks: values in the macOS Keychain, metadata on disk, provider-aware `pb key verify`, and AI registration over MCP.
+- **[Key vault](docs/key-vault.md)** — standalone API keys no CLI tracks: values in the macOS Keychain, metadata on disk, provider-aware `pb key verify`, AI registration over MCP, and each key filed under the env-var name your code already reads (`CLOUDFLARE_API_TOKEN`) so `pb key run` — or an agent that needs it — can find and inject it without anyone reading the value.
 - **[Project env vault](docs/env-vault.md)** — a project's environment variables without a plaintext `.env`: pull from Infisical, keep hand-set local overrides that never sync back, run a command with the merged result. A project is a portable name, not a path — `pb export` carries the manifest to a new machine (or copy the one file), clone the repo, pull.
 - **[Keeping CLIs current](#keeping-clis-current)** — which tools are outdated, which were renamed out from under you, and the exact command to update each one.
 - **[Migrate](docs/migration.md)** — export to a new machine; whatever can't travel, your AI walks you through re-authing. Or `pb manifest`: the secret-free record of what you use, safe to commit, and enough for an agent to rebuild a machine from.
@@ -52,6 +52,7 @@ pb status            # the whole board in your terminal
 pb use gcloud work   # switch a profile
 pb verify gh         # actually check a token against its API
 pb key list          # your registered API keys
+pb key run cf-deploy -- wrangler deploy  # one credential into one process, never on screen
 pb env run -- bun dev  # this directory's env vars, from the Keychain, no .env file
 ```
 
@@ -141,7 +142,7 @@ table →](docs/migration.md)**
 { "mcpServers": { "patchbay": { "command": "/usr/local/bin/patchbay-mcp" } } }
 ```
 
-Your agent gets `list_connections`, `switch_profile`, `verify`, `get_permissions`, `store_key`, `plan_setup`, and friends — "switch to the work gcloud account and deploy" becomes one sentence, and a key your AI creates mid-task gets registered instead of rotting in a chat log. Where permissions are granted per resource rather than per credential, `get_permissions` takes a `scope` and `list_permission_scopes` says what the choices are — a Google account has no roles of its own, only roles on a project, so patchbay reads the IAM policy of the one you name. Reading secret values back is **off by default** (`PATCHBAY_ALLOW_SECRET_READ=1` to opt in).
+Your agent gets `list_connections`, `switch_profile`, `verify`, `get_permissions`, `store_key`, `plan_setup`, and friends — "switch to the work gcloud account and deploy" becomes one sentence, and a key your AI creates mid-task gets registered instead of rotting in a chat log. It also gets `resolve_env_vars`: hand it the variable names your code reads and it says which vault key or env-vault project holds each one, and the exact `pb key run` / `pb env run` that supplies it — so an agent that needs `CLOUDFLARE_API_TOKEN` looks in your vault instead of asking you for it or writing a placeholder, and still never sees the value. Where permissions are granted per resource rather than per credential, `get_permissions` takes a `scope` and `list_permission_scopes` says what the choices are — a Google account has no roles of its own, only roles on a project, so patchbay reads the IAM policy of the one you name. Reading secret values back is **off by default** (`PATCHBAY_ALLOW_SECRET_READ=1` to opt in).
 
 ## Showcase
 

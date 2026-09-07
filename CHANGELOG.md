@@ -5,6 +5,111 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-09-08
+
+### Added
+
+- **The vault is now something an agent looks in.** Sixty-five keys were in it,
+  and the agent working in your repo still asked *you* for
+  `CLOUDFLARE_API_TOKEN` — or wrote `<your-token-here>` and moved on, or
+  reported the variable as missing. Nothing refused it. It never looked, and
+  two things made that the rational move. A key was named only by slug
+  (`cf-gh-actions-deploy`), so the name code actually reads had no path to the
+  entry that holds it; the mapping existed as prose inside a `--purpose`
+  string, which is not an index. And an agent that did look dead-ended anyway,
+  because `get_key` is gated and there was no way to *use* a key without
+  reading it. A vault you cannot search and cannot spend gets worked around.
+
+  So keys have a second name. `KeyEntry.env` is the environment variable the
+  key is exposed as — `CLOUDFLARE_API_TOKEN`, `NEON_API_KEY` — validated as
+  UPPER_SNAKE_CASE (A–Z, digits, `_`, starting with a letter, at most 64
+  characters), which is the shape a shell and every dotenv parser accept. A
+  refusal spells the corrected name rather than restating the rule, so
+  `cf-token` comes back with "try `CF_TOKEN`" and the fix is a copy-paste. It
+  is optional on purpose: an Apple issuer id or a D-U-N-S number belongs in the
+  vault as something you would otherwise go hunting for, but it is not a
+  variable any program reads and inventing a name for it would be inventing a
+  fact. Two entries may share a name — a dev and a production
+  `LANGFUSE_SECRET_KEY` are two secrets under one identifier, which is the
+  normal shape — so nothing refuses it and a lookup returns both. A `keys.json`
+  written before the field existed parses unchanged, and the field is omitted
+  from the JSON when unset.
+
+  The convention the docs now state, because a name only helps if it is the
+  name the other end already uses: **use the name code already reads.** If the
+  repo, the CI secret or the vendor's SDK spells it `CLOUDFLARE_API_TOKEN`,
+  that is the name; patchbay's job is to be findable by what exists, not to
+  impose a taxonomy on it. Only when nothing has named it yet do you compose
+  one as `<PROVIDER>_<THING>_<KIND>` — `NEON_API_KEY`, `APPLE_ASC_ISSUER_ID`,
+  `GITHUB_APP_PRIVATE_KEY`, `R2_SECRET_ACCESS_KEY` — with the kind drawn from
+  `_API_KEY`, `_API_TOKEN`, `_SECRET`, `_SECRET_KEY`, `_PRIVATE_KEY`,
+  `_PASSWORD`, `_ID`, `_URL`. The `id` stays the lowercase slug and stays what
+  you type in a command; `env` is what everything else searches by.
+
+- **`pb key run <id>... -- <cmd>` — spend a key without reading it.** The only
+  way a value came out of the vault was `pb key copy`, which goes to the
+  clipboard: right for a human with a browser tab open, useless to a process,
+  and not something an agent should be doing at all. `run` resolves each id,
+  takes the value from the keychain, and starts the command with those
+  variables added to the environment it inherits. The value goes keychain →
+  child and touches nothing else — not stdout, not a log, not argv, not a file,
+  and not the context of whatever model asked for it. stderr names the
+  variables and the ids they came from, so you can see *what* was injected
+  without seeing what was injected. `--as NAME=<id>` covers the case where this
+  program wants a different name than the entry's, and an id with no `env` and
+  no `--as` is refused by name with the `pb key edit … --env` that fixes it,
+  because a run that silently dropped a credential fails somewhere much less
+  obvious. This is the second way a value leaves the vault, and the split is
+  deliberate: `copy` for the human, `run` for everything else.
+
+- **`pb key edit <id>` — metadata, and only metadata.** Every key registered
+  before this release has no `env` name, and a vault is worth the fraction of
+  it that is findable, so backfilling had to be one command that is obviously
+  safe to run. `edit` never opens the keychain and cannot rotate anything:
+  `--env NAME` / `--no-env`, plus `--provider`, `--label`, `--purpose`,
+  `--scopes`, `--expires`, `--endpoint`, with `--no-purpose`, `--no-expires`
+  and `--no-endpoint` to clear the nullable ones. `id`, `last4` and the
+  registration date stay uneditable — they describe the value in the keychain,
+  and editing them here would only make the registry lie about it. Rotation
+  stays `pb key add --overwrite`, where a secret is actually being handled and
+  the command should look like it.
+
+- **`pb key list` filters.** `--env NAME` answers "who holds the name my code
+  reads", `--provider P` narrows to one issuer, and `--grep TEXT` matches id,
+  label, purpose, provider and env name. The table gained an ENV column. A
+  listing you have to read in full is a listing an agent reads in full.
+
+- **MCP: `resolve_env_vars`, `update_key`, `list_keys` filters, and `env` on
+  `store_key`.** `resolve_env_vars` is the tool the two rules above hang off:
+  give it the variable names the code reads and it answers per name with `keys`
+  (exact `env` matches), `suggestions` when there are none (entries whose
+  purpose, label or id mention the name or its non-generic tokens), `projects`
+  (env-vault environments defining it), a `status` of `key` / `project_var` /
+  `both` / `suggested` / `missing`, and `use` — the exact `pb key run …` or
+  `pb env run …` that supplies it. It reads two local JSON files and returns no
+  value, which is why it is ungated, and it is the reason the answer to "I need
+  this credential" can be a command rather than a secret. `update_key` is
+  `pb key edit`'s twin over MCP — metadata only, with a `clear` list for
+  `purpose`, `expires_at`, `endpoint` and `env` — ungated for the same reason:
+  it cannot reach the keychain. Rotation stays `store_key` with `overwrite`.
+  `list_keys` takes `provider`, `env` and `query`.
+
+- **Two rules in the MCP server's instructions.** "LOOK HERE BEFORE ASKING FOR
+  A CREDENTIAL": before asking the human, writing a placeholder or calling a
+  variable missing, call `resolve_env_vars`; the answer is how to use the key
+  via `pb key run`, never the value itself. And "NAME THE VARIABLE": register
+  with `env` set, following the convention above, and backfill what lacks one
+  with `update_key`. Instructions are the only part of an MCP server a model
+  reads before deciding what to do, and every gate in this vault was already
+  strong enough — what was missing was the sentence telling it to try.
+
+### Changed
+
+- **The manifest's `KeyRecord` carries `env`.** `pb manifest` exists so a new
+  machine's agent can plan against what the old one used, and "which variable
+  is this key" is exactly the kind of thing that plan needs. It is a name, not
+  a value, so it changes nothing about what the file is safe to commit.
+
 ## [0.6.0] - 2026-08-28
 
 ### Added

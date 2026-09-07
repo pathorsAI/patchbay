@@ -128,6 +128,7 @@ export function KeysView() {
               <tr>
                 <th>id</th>
                 <th>provider</th>
+                <th>env</th>
                 <th>label</th>
                 <th>last 4</th>
                 <th>expiry</th>
@@ -141,6 +142,9 @@ export function KeysView() {
                   <tr>
                     <td className="cell-id">{k.id}</td>
                     <td className="cell-mono">{k.provider}</td>
+                    {/* The second name: what code reads this key as, and what
+                        `pb key run` injects it under. A name, never a value. */}
+                    <td className="cell-mono">{k.env ?? <span className="muted">—</span>}</td>
                     <td>{k.label}</td>
                     {/* The only thing on this page derived from a secret value. */}
                     <td className="cell-mono cell-last4">··{k.last4}</td>
@@ -168,7 +172,7 @@ export function KeysView() {
                   </tr>
                   {confirming === k.id && (
                     <tr className="confirm-row">
-                      <td colSpan={7}>
+                      <td colSpan={8}>
                         <div className="confirm">
                           <span className="confirm-why">
                             Remove <b>{k.id}</b>? This removes the entry and its keychain value; the
@@ -228,6 +232,7 @@ function AddKeyForm({
   onAdded: (row: KeyRow) => void | Promise<void>;
 }>) {
   const [id, setId] = useState("");
+  const [env, setEnv] = useState("");
   const [provider, setProvider] = useState("");
   const [label, setLabel] = useState("");
   const [secret, setSecret] = useState("");
@@ -270,6 +275,7 @@ function AddKeyForm({
             .filter(Boolean),
           expires: expires.trim() || null,
           endpoint: endpoint.trim() || null,
+          env: env.trim() || null,
           overwrite,
         },
         value,
@@ -319,6 +325,25 @@ function AddKeyForm({
             />
             <span className="muted small">
               lowercase slug — letters, digits, <code>-</code> <code>_</code> <code>.</code>
+            </span>
+          </label>
+
+          {/* Not behind the fold: this is the entry's second name, and the one
+              anything other than a human looks it up by. */}
+          <label className="field">
+            <span className="field-key">env</span>
+            <input
+              className="field-input"
+              value={env}
+              onChange={(e) => setEnv(e.target.value)}
+              placeholder="CLOUDFLARE_API_TOKEN"
+              spellCheck={false}
+              autoCapitalize="characters"
+              autoCorrect="off"
+            />
+            <span className="muted small">
+              the variable code reads it as — UPPER_SNAKE_CASE; what{" "}
+              <code>pb key run</code> injects and what an agent looks it up by
             </span>
           </label>
 

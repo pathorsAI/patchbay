@@ -653,6 +653,7 @@ mod tests {
             last4: "1234".into(),
             source: "cli".into(),
             endpoint: None,
+            env: None,
         }
     }
 

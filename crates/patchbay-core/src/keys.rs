@@ -151,6 +151,20 @@ pub struct KeyEntry {
     /// `keys.json` written before this field existed keeps parsing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// The environment variable this key is conventionally exposed as —
+    /// `CLOUDFLARE_API_TOKEN`, `NEON_API_KEY` — in the shape
+    /// [`validate_env_name`] enforces. This is the name code, CI secrets and
+    /// vendor SDKs already read, and it is what lets a consumer that needs
+    /// `CLOUDFLARE_API_TOKEN` find `cf-gh-actions-deploy` without guessing:
+    /// `pb key run` injects the value under it, and an agent resolves a
+    /// required variable to a vault entry through it.
+    ///
+    /// Optional, because a key registered before the field existed has none,
+    /// and because not every entry is a variable (an issuer id, a D-U-N-S
+    /// number). Two entries may share one name — a dev and a production key
+    /// for the same service — and a lookup returns both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<String>,
 }
 
 impl KeyEntry {
@@ -207,6 +221,8 @@ pub struct NewKey {
     pub source: String,
     /// Instance URL, for providers that have more than one address.
     pub endpoint: Option<String>,
+    /// The variable name the key is exposed as; see [`KeyEntry::env`].
+    pub env: Option<String>,
 }
 
 impl NewKey {
@@ -223,6 +239,7 @@ impl NewKey {
             expires_at: None,
             source: source.into(),
             endpoint: None,
+            env: None,
         }
     }
 
@@ -257,6 +274,13 @@ impl NewKey {
         self.endpoint = endpoint.map(|e| normalize_endpoint(&e));
         self
     }
+
+    /// The variable name, trimmed. Validated by [`KeyRegistry::add`], not
+    /// here, so a bad name is reported next to the other registration errors.
+    pub fn env(mut self, env: Option<String>) -> Self {
+        self.env = env.map(|e| e.trim().to_string()).filter(|e| !e.is_empty());
+        self
+    }
 }
 
 /// Trim trailing slashes and surrounding whitespace so an endpoint can be
@@ -275,6 +299,8 @@ pub struct KeyPatch {
     pub scopes: Option<Vec<String>>,
     pub expires_at: Option<Option<DateTime<Utc>>>,
     pub endpoint: Option<Option<String>>,
+    /// `Some(Some(name))` sets the variable name, `Some(None)` clears it.
+    pub env: Option<Option<String>>,
 }
 
 impl KeyPatch {
@@ -285,6 +311,7 @@ impl KeyPatch {
             && self.scopes.is_none()
             && self.expires_at.is_none()
             && self.endpoint.is_none()
+            && self.env.is_none()
     }
 }
 
@@ -394,6 +421,9 @@ impl KeyRegistry {
     /// date of the rotation).
     pub fn add(&self, new: NewKey, secret: &str, overwrite: bool) -> anyhow::Result<KeyEntry> {
         validate_id(&new.id)?;
+        if let Some(env) = &new.env {
+            validate_env_name(env)?;
+        }
         if secret.is_empty() {
             anyhow::bail!("refusing to register `{}` with an empty secret", new.id);
         }
@@ -420,6 +450,7 @@ impl KeyRegistry {
             last4: last4(secret),
             source: new.source,
             endpoint: new.endpoint.as_deref().map(normalize_endpoint),
+            env: new.env,
         };
 
         match existing {
@@ -479,6 +510,13 @@ impl KeyRegistry {
         }
         if let Some(endpoint) = patch.endpoint {
             entry.endpoint = endpoint.as_deref().map(normalize_endpoint);
+        }
+        if let Some(env) = patch.env {
+            let env = env.map(|e| e.trim().to_string()).filter(|e| !e.is_empty());
+            if let Some(name) = &env {
+                validate_env_name(name)?;
+            }
+            entry.env = env;
         }
         let updated = entry.clone();
         self.save(&file)?;
@@ -627,6 +665,116 @@ pub fn expiring_within_at(entries: &[KeyEntry], now: DateTime<Utc>, days: i64) -
         .collect();
     hits.sort_by_key(|k| k.expires_at);
     hits
+}
+
+/// Upper bound on a variable name. The same as an id's: long enough for any
+/// real `NEXT_PUBLIC_…` name, short enough to keep a table readable.
+const MAX_ENV_NAME_LEN: usize = 64;
+
+/// The shape of a [`KeyEntry::env`] name: `UPPER_SNAKE_CASE`, starting with a
+/// letter — `CLOUDFLARE_API_TOKEN`, not `cloudflare_api_token`, not
+/// `CF-TOKEN`, not `1PASSWORD_TOKEN`.
+///
+/// Stricter than what a POSIX shell can export (the env vault's rule, which
+/// also allows lowercase) on purpose. The point of the field is that two
+/// people — or a person and an agent — spell the same variable the same way
+/// without coordinating, and one shape is the only thing that makes that
+/// true. The error suggests the corrected spelling where there is one.
+pub fn validate_env_name(name: &str) -> anyhow::Result<()> {
+    if name.is_empty() {
+        anyhow::bail!("env name cannot be empty");
+    }
+    if name.len() > MAX_ENV_NAME_LEN {
+        anyhow::bail!("env name `{name}` is longer than {MAX_ENV_NAME_LEN} characters");
+    }
+    let suggested: String = name
+        .chars()
+        .map(|c| match c {
+            '-' | ' ' | '.' => '_',
+            c => c.to_ascii_uppercase(),
+        })
+        .collect();
+    if name.chars().any(|c| c.is_ascii_lowercase()) {
+        anyhow::bail!(
+            "env names are UPPER_SNAKE_CASE (the shape code reads them in); try `{suggested}`"
+        );
+    }
+    if let Some(bad) = name
+        .chars()
+        .find(|c| !(c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_'))
+    {
+        anyhow::bail!(
+            "env name `{name}` contains `{bad}`; use A-Z, digits and `_` only, like `{suggested}`"
+        );
+    }
+    if !name.starts_with(|c: char| c.is_ascii_uppercase()) {
+        anyhow::bail!("env name `{name}` must start with a letter, like `CLOUDFLARE_API_TOKEN`");
+    }
+    Ok(())
+}
+
+/// The questions a caller narrows a listing by. All optional, all ANDed; a
+/// default filter matches everything.
+#[derive(Debug, Clone, Default)]
+pub struct KeyFilter {
+    /// Provider, compared case-insensitively.
+    pub provider: Option<String>,
+    /// Exact variable name ([`KeyEntry::env`]), compared case-insensitively so
+    /// a caller may ask for `cloudflare_api_token` and still find the entry.
+    pub env: Option<String>,
+    /// Free text, matched case-insensitively against id, label, purpose,
+    /// provider and env name.
+    pub query: Option<String>,
+}
+
+impl KeyFilter {
+    pub fn is_empty(&self) -> bool {
+        self.provider.is_none() && self.env.is_none() && self.query.is_none()
+    }
+
+    pub fn matches(&self, entry: &KeyEntry) -> bool {
+        let eq = |want: &Option<String>, have: Option<&str>| match want {
+            None => true,
+            Some(w) => have.is_some_and(|h| h.eq_ignore_ascii_case(w.trim())),
+        };
+        if !eq(&self.provider, Some(&entry.provider)) {
+            return false;
+        }
+        if !eq(&self.env, entry.env.as_deref()) {
+            return false;
+        }
+        match self
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|q| !q.is_empty())
+        {
+            None => true,
+            Some(q) => {
+                let q = q.to_lowercase();
+                [
+                    Some(entry.id.as_str()),
+                    Some(entry.label.as_str()),
+                    Some(entry.provider.as_str()),
+                    entry.purpose.as_deref(),
+                    entry.env.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                .any(|field| field.to_lowercase().contains(&q))
+            }
+        }
+    }
+}
+
+/// The entries a filter keeps, in registry order. Pure, so the CLI, the MCP
+/// server and the panel narrow a listing by one rule.
+pub fn filter_keys(entries: &[KeyEntry], filter: &KeyFilter) -> Vec<KeyEntry> {
+    entries
+        .iter()
+        .filter(|e| filter.matches(e))
+        .cloned()
+        .collect()
 }
 
 /// Ids are lowercase slugs. Beyond keeping the board readable, this is what
@@ -963,6 +1111,7 @@ mod tests {
             last4: "0000".into(),
             source: "cli".into(),
             endpoint: None,
+            env: None,
         };
 
         let entries = vec![
@@ -1000,6 +1149,7 @@ mod tests {
             last4: "0000".into(),
             source: "cli".into(),
             endpoint: None,
+            env: None,
         };
         assert!(e.time_to_expiry(now).is_none());
         assert!(!e.is_expired(now));
@@ -1203,6 +1353,7 @@ mod tests {
             last4: "1234".into(),
             source: "cli".into(),
             endpoint: None,
+            env: None,
         };
 
         assert_eq!(with(None).expiry_state(now), KeyExpiryState::NoExpiry);
@@ -1362,5 +1513,207 @@ mod tests {
             Some("deploy from GitHub Actions in repo X")
         );
         assert_eq!(entries[0].expires_at, Some(expires));
+    }
+
+    #[test]
+    fn test_env_names_are_upper_snake_and_the_error_suggests_the_fix() {
+        assert!(validate_env_name("CLOUDFLARE_API_TOKEN").is_ok());
+        assert!(validate_env_name("NEXT_PUBLIC_GA4_ID").is_ok());
+        assert!(validate_env_name("A").is_ok());
+
+        let err = validate_env_name("cloudflare-api-token")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("UPPER_SNAKE_CASE"), "{err}");
+        assert!(err.contains("`CLOUDFLARE_API_TOKEN`"), "{err}");
+
+        let err = validate_env_name("CF-TOKEN").unwrap_err().to_string();
+        assert!(err.contains("`-`"), "{err}");
+        assert!(err.contains("`CF_TOKEN`"), "{err}");
+
+        let err = validate_env_name("_TOKEN").unwrap_err().to_string();
+        assert!(err.contains("start with a letter"), "{err}");
+        let err = validate_env_name("1PASSWORD").unwrap_err().to_string();
+        assert!(err.contains("start with a letter"), "{err}");
+
+        assert!(validate_env_name("").is_err());
+        assert!(validate_env_name(&"A".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn test_add_stores_a_valid_env_name_and_rejects_a_bad_one_before_writing() {
+        let v = vault();
+        let entry = v
+            .registry
+            .add(
+                sample("cf-api").env(Some(" CLOUDFLARE_API_TOKEN ".into())),
+                "secret-value",
+                false,
+            )
+            .unwrap();
+        assert_eq!(entry.env.as_deref(), Some("CLOUDFLARE_API_TOKEN"));
+
+        let err = v
+            .registry
+            .add(sample("bad").env(Some("bad name".into())), "x", false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("UPPER_SNAKE_CASE"), "{err}");
+        assert!(v.registry.get("bad").unwrap().is_none());
+        assert!(v.store.get("bad").unwrap().is_none());
+
+        // A blank name is no name, not an error.
+        let entry = v
+            .registry
+            .add(sample("blank").env(Some("  ".into())), "x", false)
+            .unwrap();
+        assert_eq!(entry.env, None);
+    }
+
+    #[test]
+    fn test_patch_sets_validates_and_clears_the_env_name() {
+        let v = vault();
+        v.registry.add(sample("cf-api"), "secret", false).unwrap();
+
+        let patch = KeyPatch {
+            env: Some(Some("CLOUDFLARE_API_TOKEN".into())),
+            ..Default::default()
+        };
+        assert!(!patch.is_empty());
+        let updated = v.registry.update_metadata("cf-api", patch).unwrap();
+        assert_eq!(updated.env.as_deref(), Some("CLOUDFLARE_API_TOKEN"));
+
+        let err = v
+            .registry
+            .update_metadata(
+                "cf-api",
+                KeyPatch {
+                    env: Some(Some("nope".into())),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`NOPE`"), "{err}");
+        // A refused patch leaves the previous name in place.
+        assert_eq!(
+            v.registry.get("cf-api").unwrap().unwrap().env.as_deref(),
+            Some("CLOUDFLARE_API_TOKEN")
+        );
+
+        let cleared = v
+            .registry
+            .update_metadata(
+                "cf-api",
+                KeyPatch {
+                    env: Some(None),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(cleared.env, None);
+    }
+
+    #[test]
+    fn test_an_entry_without_env_reads_back_and_writes_no_env_field() {
+        let v = vault();
+        v.registry.add(sample("cf-api"), "secret", false).unwrap();
+        let raw = std::fs::read_to_string(v.registry.path()).unwrap();
+        assert!(!raw.contains("\"env\""), "{raw}");
+        // keys.json written before the field existed parses the same way.
+        assert_eq!(v.registry.get("cf-api").unwrap().unwrap().env, None);
+    }
+
+    #[test]
+    fn test_filter_narrows_by_provider_env_and_free_text() {
+        let now = Utc::now();
+        let entry = |id: &str, provider: &str, env: Option<&str>, purpose: &str| KeyEntry {
+            id: id.into(),
+            provider: provider.into(),
+            label: id.replace('-', " "),
+            purpose: Some(purpose.into()),
+            scopes: vec![],
+            created_at: now,
+            expires_at: None,
+            last4: "0000".into(),
+            source: "cli".into(),
+            endpoint: None,
+            env: env.map(Into::into),
+        };
+        let entries = vec![
+            entry(
+                "cf-deploy",
+                "cloudflare",
+                Some("CLOUDFLARE_API_TOKEN"),
+                "deploy workers",
+            ),
+            entry(
+                "cf-r2",
+                "Cloudflare",
+                Some("R2_SECRET_ACCESS_KEY"),
+                "R2 uploads",
+            ),
+            entry(
+                "neon-ci",
+                "neon",
+                Some("NEON_API_KEY"),
+                "control plane for peregrine",
+            ),
+            entry("duns", "dnb", None, "not a secret, an index entry"),
+        ];
+        let ids = |f: KeyFilter| -> Vec<String> {
+            filter_keys(&entries, &f)
+                .into_iter()
+                .map(|e| e.id)
+                .collect()
+        };
+
+        assert!(KeyFilter::default().is_empty());
+        assert_eq!(ids(KeyFilter::default()).len(), 4);
+        assert_eq!(
+            ids(KeyFilter {
+                provider: Some("CLOUDFLARE".into()),
+                ..Default::default()
+            }),
+            vec!["cf-deploy", "cf-r2"]
+        );
+        // env is exact but case-insensitive: an agent asking in lowercase still finds it.
+        assert_eq!(
+            ids(KeyFilter {
+                env: Some("neon_api_key".into()),
+                ..Default::default()
+            }),
+            vec!["neon-ci"]
+        );
+        assert_eq!(
+            ids(KeyFilter {
+                query: Some("peregrine".into()),
+                ..Default::default()
+            }),
+            vec!["neon-ci"]
+        );
+        assert_eq!(
+            ids(KeyFilter {
+                query: Some("r2".into()),
+                ..Default::default()
+            }),
+            vec!["cf-r2"]
+        );
+        // Filters AND together.
+        assert!(ids(KeyFilter {
+            provider: Some("neon".into()),
+            query: Some("workers".into()),
+            ..Default::default()
+        })
+        .is_empty());
+        // A blank query matches everything rather than nothing.
+        assert_eq!(
+            ids(KeyFilter {
+                query: Some("  ".into()),
+                ..Default::default()
+            })
+            .len(),
+            4
+        );
     }
 }
