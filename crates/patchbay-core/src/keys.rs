@@ -743,7 +743,12 @@ impl KeyFilter {
         if !eq(&self.env, entry.env.as_deref()) {
             return false;
         }
-        match self.query.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+        match self
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|q| !q.is_empty())
+        {
             None => true,
             Some(q) => {
                 let q = q.to_lowercase();
@@ -1516,7 +1521,9 @@ mod tests {
         assert!(validate_env_name("NEXT_PUBLIC_GA4_ID").is_ok());
         assert!(validate_env_name("A").is_ok());
 
-        let err = validate_env_name("cloudflare-api-token").unwrap_err().to_string();
+        let err = validate_env_name("cloudflare-api-token")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("UPPER_SNAKE_CASE"), "{err}");
         assert!(err.contains("`CLOUDFLARE_API_TOKEN`"), "{err}");
 
@@ -1634,13 +1641,31 @@ mod tests {
             env: env.map(Into::into),
         };
         let entries = vec![
-            entry("cf-deploy", "cloudflare", Some("CLOUDFLARE_API_TOKEN"), "deploy workers"),
-            entry("cf-r2", "Cloudflare", Some("R2_SECRET_ACCESS_KEY"), "R2 uploads"),
-            entry("neon-ci", "neon", Some("NEON_API_KEY"), "control plane for peregrine"),
+            entry(
+                "cf-deploy",
+                "cloudflare",
+                Some("CLOUDFLARE_API_TOKEN"),
+                "deploy workers",
+            ),
+            entry(
+                "cf-r2",
+                "Cloudflare",
+                Some("R2_SECRET_ACCESS_KEY"),
+                "R2 uploads",
+            ),
+            entry(
+                "neon-ci",
+                "neon",
+                Some("NEON_API_KEY"),
+                "control plane for peregrine",
+            ),
             entry("duns", "dnb", None, "not a secret, an index entry"),
         ];
         let ids = |f: KeyFilter| -> Vec<String> {
-            filter_keys(&entries, &f).into_iter().map(|e| e.id).collect()
+            filter_keys(&entries, &f)
+                .into_iter()
+                .map(|e| e.id)
+                .collect()
         };
 
         assert!(KeyFilter::default().is_empty());

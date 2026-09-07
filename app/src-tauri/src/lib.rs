@@ -187,6 +187,7 @@ async fn key_add(
     scopes: Vec<String>,
     expires: Option<String>,
     endpoint: Option<String>,
+    env: Option<String>,
     secret: String,
     overwrite: bool,
 ) -> CmdResult<KeyRow> {
@@ -212,7 +213,11 @@ async fn key_add(
                 .collect(),
         )
         .expires_at(expires_at)
-        .endpoint(some_text(endpoint));
+        .endpoint(some_text(endpoint))
+        // The variable name code reads this key as. Validated by the registry,
+        // not here, so the panel shows the same corrected-name suggestion the
+        // CLI does instead of a second opinion written in TypeScript.
+        .env(some_text(env));
 
         let registry = KeyRegistry::detect()?;
         let entry = registry.add(new, &secret, overwrite)?;

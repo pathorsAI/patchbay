@@ -31,7 +31,8 @@ use serde::Deserialize;
 /// here as well as on the individual tools.
 const INSTRUCTIONS: &str = "\
 patchbay reports and switches the active login of the developer CLIs on this machine \
-(gcloud, aws, gh, kubectl, az, wrangler, rclone, infisical).
+(gcloud, aws, gh, kubectl, az, wrangler, rclone, infisical), and is the machine's vault for the \
+API keys, tokens and project environment variables no CLI tracks.
 
 Read this before using the tools.
 
@@ -84,9 +85,9 @@ like bugs from the inside, and patchbay already knows about the ones it ships.
 6. Every connection tool returns metadata about credentials. Token, secret and key values are \
 never returned by them.
 
-7. The key vault (`store_key`, `list_keys`, `get_key`, `remove_key`) is a different thing from \
-the connection tools above: it is this machine's registry for standalone API keys and tokens \
-that no CLI tracks. `store_key` is the one you should reach for unprompted — whenever you create \
+7. The key vault (`store_key`, `list_keys`, `update_key`, `resolve_env_vars`, `get_key`, \
+`remove_key`) is a different thing from the connection tools above: it is this machine's \
+registry for standalone API keys and tokens that no CLI tracks. `store_key` is the one you should reach for unprompted — whenever you create \
 or receive a long-lived API key or token during a task, register it, so the user's patchbay \
 stays the source of truth. Secrets go into the OS keychain; only the last 4 characters are \
 written to disk. Never echo a secret anywhere else.
@@ -118,7 +119,39 @@ application config, which is the failure mode this rule exists to prevent.
    Unsure? Ask which project the value is scoped to. If the answer is 'all of them' or 'it is \
 mine', it is a patchbay key.
 
-10. The MCP client tools (`list_mcp_clients`, `add_mcp_server`, `copy_mcp_server`, \
+10. LOOK HERE BEFORE ASKING FOR A CREDENTIAL. When a task needs an API key, token, database URL, \
+issuer id or any other environment variable — a command fails with 401/403, a script reads \
+`process.env.X`, a deploy wants a secret, a `.env` has a blank line — do not ask the user for the \
+value, do not write a placeholder, and do not say it is missing until you have checked this \
+machine: call `resolve_env_vars` with the variable names the task reads (or `list_keys` with \
+`env`/`query`, or `list_env_vars` for a registered project). Most credentials the user has ever \
+handled are already here, with a purpose that says what they open. The answer is never the value; \
+it is HOW TO USE IT without seeing it: `pb key run <id> -- <cmd>` injects a vault key as its \
+variable into one child process, and `pb env run` does the same for a project's whole \
+environment. Run those through the shell — the secret goes from the keychain to the child process \
+and never through the conversation. Only when nothing matches do you ask the user, and when they \
+then hand you a value, register it (`store_key`, with `env`) so the next agent does not have to \
+ask.
+
+11. NAME THE VARIABLE. Every key has an optional `env`: the environment variable it is exposed \
+as, in UPPER_SNAKE_CASE. Fill it on `store_key`, and backfill it with `update_key` the moment you \
+learn the name for an entry that lacks one (the purpose often says: 'same value as GitHub secret \
+NEON_API_KEY'). The rules:
+   - Use the name code already reads. If the repo, the CI secret or the vendor SDK spells it \
+`CLOUDFLARE_API_TOKEN`, that is the name — not a synonym, not a nicer one.
+   - Otherwise `<PROVIDER>_<THING>_<KIND>`: the issuer first, what it is, then the kind of \
+credential — `CLOUDFLARE_API_TOKEN`, `NEON_API_KEY`, `APPLE_ASC_ISSUER_ID`, \
+`GITHUB_APP_PRIVATE_KEY`, `LANGFUSE_SECRET_KEY`, `R2_SECRET_ACCESS_KEY`. Kinds: `_API_KEY`, \
+`_API_TOKEN`, `_SECRET`, `_SECRET_KEY`, `_PRIVATE_KEY`, `_PASSWORD`, `_ID`, `_URL` (a \
+`DATABASE_URL` is a credential too).
+   - Letters, digits and `_` only; starts with a letter; at most 64 characters. `cf-token`, \
+`cloudflareToken` and `CF TOKEN` are refused, and the refusal spells the corrected name.
+   - Two keys may share a name (a dev and a production `LANGFUSE_SECRET_KEY`); the id and purpose \
+tell them apart, and `resolve_env_vars` returns both so you pick by purpose, never by guessing.
+   - The `id` stays the lowercase slug it always was (`<provider>-<thing>[-<scope>]`); `env` is \
+the second name for the same entry, and it is the one code searches by.
+
+12. The MCP client tools (`list_mcp_clients`, `add_mcp_server`, `copy_mcp_server`, \
 `remove_mcp_server`) are a third thing again: they read and edit the config files in which the AI \
 clients on this machine — Claude Code, Claude Desktop, Cursor, Codex, Windsurf, VS Code — register \
 their MCP servers. `list_mcp_clients` is cheap and safe. The other three modify another tool's \
@@ -127,7 +160,7 @@ is needed. Confirm with the user before removing anything. Never write a secret 
 `env` or `headers` through these tools: those land in a plain-text config file. Reference an \
 environment variable name, or register the secret with `store_key`, instead.
 
-11. `plan_setup` and `mark_setup_done` are the fourth thing again: the checklist for finishing a \
+13. `plan_setup` and `mark_setup_done` are the fourth thing again: the checklist for finishing a \
 MOVE to a new machine, after `pb export` / `pb import` have carried whatever could be carried. \
 Work the list one item at a time; run only the items whose `auto` is true; hand every \
 `needs_browser` item to the human with the exact command rather than trying to drive a browser \
@@ -135,7 +168,7 @@ login yourself; and re-check with `mark_setup_done` after each one, because patc
 tool instead of believing what you report. Stop when `complete` is true, and do not invent extra \
 setup work.
 
-12. The project env vault (`list_env_projects`, `list_env_vars`, `pull_env`, `set_env_var`) is a \
+14. The project env vault (`list_env_projects`, `list_env_vars`, `pull_env`, `set_env_var`) is a \
 fifth thing: the environment variables one PROJECT needs, per environment, in two \
 layers — `synced` (a local mirror of that project's remote secret manager, refreshed wholesale \
 only by `pull_env`) and `local` (set on this machine, never pushed anywhere, and it WINS over a \
@@ -618,5 +651,37 @@ impl ServerHandler for PatchbayServer {
     /// still send `2024-11-05` can connect.
     fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
         std::borrow::Cow::Borrowed(ProtocolVersion::KNOWN_VERSIONS)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_the_instructions_teach_the_lookup_before_the_ask() {
+        // The instructions are the only thing an agent reads before it has
+        // called anything, so the rule that stops it inventing a placeholder
+        // for a credential this machine already holds has to survive edits.
+        assert!(INSTRUCTIONS.contains("LOOK HERE BEFORE ASKING FOR A CREDENTIAL"));
+        assert!(INSTRUCTIONS.contains("NAME THE VARIABLE"));
+        assert!(INSTRUCTIONS.contains("<PROVIDER>_<THING>_<KIND>"));
+        assert!(INSTRUCTIONS.contains("pb key run"));
+        assert!(INSTRUCTIONS.contains("resolve_env_vars"));
+        assert!(INSTRUCTIONS.contains("update_key"));
+    }
+
+    #[test]
+    fn test_the_rules_are_numbered_once_each() {
+        // Two rules were inserted after rule 9, which renumbered everything
+        // after them; a duplicate number is the failure that produces.
+        for n in 1..=14 {
+            let marker = format!("\n{n}. ");
+            assert_eq!(
+                INSTRUCTIONS.matches(&marker).count(),
+                1,
+                "rule {n} does not appear exactly once"
+            );
+        }
     }
 }

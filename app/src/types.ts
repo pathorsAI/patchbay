@@ -297,6 +297,16 @@ export interface KeyRow {
   last4: string;
   /** Who registered it: `"cli"`, `"mcp:<client>"`, `"gui"`. */
   source: string;
+  /**
+   * The environment variable this key is exposed as — `CLOUDFLARE_API_TOKEN`.
+   * A name, never a value: it is the second name for the entry, the one code
+   * and CI already spell, and the one `pb key run` injects the secret under.
+   * `null` for entries that are not variables (an issuer id, a D-U-N-S number)
+   * and for anything registered before the field existed. Core omits the field
+   * entirely when it is unset rather than writing `null`, so read it with `??`
+   * — every consumer here treats absent and null the same way.
+   */
+  env: string | null;
   expiry_state: KeyExpiryState;
 }
 
@@ -317,6 +327,9 @@ export interface NewKeyInput {
   scopes: string[];
   expires: string | null;
   endpoint: string | null;
+  /** UPPER_SNAKE_CASE, or null. Core validates and its refusal spells the
+   *  corrected name, so the panel does not pre-empt it. */
+  env: string | null;
   /** Replace an existing entry under this id — a rotation, not an accident. */
   overwrite: boolean;
 }

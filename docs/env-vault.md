@@ -305,6 +305,21 @@ inside single quotes is valid shell, but it would split the variable across two
 lines and every line-based reader of a `.env` file would then read it wrong.
 Output from `pb env export` parses back through `pb env import` unchanged.
 
+Two commands read values *here*. The [key vault](key-vault.md) has its own, and
+the distinction is which question you are asking. `pb env run` is for a
+project's whole environment — everything this directory needs, merged across
+the synced and local layers. `pb key run <id>... -- <cmd>` is for one credential
+of yours that belongs to no project: the Cloudflare token a deploy script wants,
+the Neon key a one-off migration needs. Same guarantee on both — the values go
+into one child process and nowhere else.
+
+Which side holds a given name is not something you should have to remember, and
+an agent has no way to know at all. The MCP tool `resolve_env_vars` answers it:
+give it the variable names the code reads and it says, per name, which vault
+entries carry that `env`, which env-vault environments define it, and the exact
+`pb key run` or `pb env run` that supplies it. Names and commands only — it
+returns no value, which is why it needs no gate.
+
 ### Coming from a .env file
 
 ```sh
