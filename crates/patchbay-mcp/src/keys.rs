@@ -425,6 +425,7 @@ mod tests {
             last4: "1234".into(),
             source: "mcp:test".into(),
             endpoint: None,
+            env: None,
         };
         let state = |e: KeyEntry| {
             describe(&e, now).unwrap()["expiry_state"]
@@ -462,6 +463,7 @@ mod tests {
             last4: "1234".into(),
             source: "mcp:test".into(),
             endpoint: None,
+            env: None,
         };
         assert_eq!(
             describe(&entry("cloudflare"), now).unwrap()["linked_tool"],
@@ -532,6 +534,7 @@ mod tests {
             last4: "1234".into(),
             source: "mcp:test".into(),
             endpoint: None,
+            env: None,
         };
         let value = describe(&entry, now).unwrap();
         let map = value.as_object().unwrap();

@@ -415,6 +415,7 @@ impl Exporter<'_> {
                 purpose: entry.purpose,
                 scopes: entry.scopes,
                 expires_at: entry.expires_at,
+                env: entry.env,
                 last4: entry.last4,
                 included,
             });

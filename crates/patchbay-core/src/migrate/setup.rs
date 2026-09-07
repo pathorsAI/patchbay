@@ -257,6 +257,7 @@ mod tests {
                 purpose: None,
                 scopes: vec![],
                 expires_at: None,
+                env: None,
                 last4: "9876".into(),
                 included: false,
             }],

@@ -154,6 +154,12 @@ pub struct KeyRecord {
     pub scopes: Vec<String>,
     #[serde(default)]
     pub expires_at: Option<DateTime<Utc>>,
+    /// The variable name the key is exposed as (`CLOUDFLARE_API_TOKEN`), when
+    /// the vault knows it. A name, not a value — it belongs in the readable
+    /// half, and it is what lets a new machine's setup say which variable each
+    /// missing key was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<String>,
     /// Last 4 characters, exactly as the vault stores them.
     pub last4: String,
     pub included: bool,
@@ -344,6 +350,7 @@ mod tests {
                 purpose: Some("deploy from CI".into()),
                 scopes: vec!["workers:edit".into()],
                 expires_at: None,
+                env: None,
                 last4: "9876".into(),
                 included: false,
             }],
