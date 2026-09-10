@@ -562,13 +562,34 @@ fn file_name(path: &std::path::Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+/// An import report is a run of independent sections, so this is a run of
+/// independent printers. Nothing passes between them except the number of keys
+/// the keychain refused, which the section that prints the keys is the only one
+/// in a position to count and so is the one that returns it — the alternative,
+/// a counter declared up here and mutated further down, is a variable whose
+/// value depends on how far the reader has got.
 fn print_import(report: &import::ImportReport, styles: &Styles) {
+    print_dry_run_banner(report, styles);
+    print_file_results(report);
+    let keys_refused = print_key_results(report);
+    print_mcp_results(report);
+    print_env_project_results(report);
+    println!();
+    print_refused_key_warning(keys_refused, report.keys.len(), styles);
+    print_notes(report, styles);
+    print_remaining_plan(report, styles);
+}
+
+fn print_dry_run_banner(report: &import::ImportReport, styles: &Styles) {
     if report.dry_run {
         println!(
             "{}\n",
             styles.paint(warn_style(), "DRY RUN — nothing was written")
         );
     }
+}
+
+fn print_file_results(report: &import::ImportReport) {
     for file in &report.files {
         println!("  {:<10} {}", file.outcome.label(), file.path.display());
         if let import::FileOutcome::Replaced { backup: Some(at) } = &file.outcome {
@@ -578,10 +599,15 @@ fn print_import(report: &import::ImportReport, styles: &Styles) {
             println!("             {reason}");
         }
     }
-    // A key carries its reason the same way a file does. `restore_keys` puts
-    // the keystore's error in there and this loop used to drop it, which turns
-    // "every secret in the bundle was refused" into a column of bare `skip`
-    // and leaves the one fact that explains it unprinted.
+}
+
+/// Returns how many key values the keystore refused, for the warning below.
+///
+/// A key carries its reason the same way a file does. `restore_keys` puts
+/// the keystore's error in there and this loop used to drop it, which turns
+/// "every secret in the bundle was refused" into a column of bare `skip`
+/// and leaves the one fact that explains it unprinted.
+fn print_key_results(report: &import::ImportReport) -> usize {
     let mut keys_refused = 0usize;
     for key in &report.keys {
         println!("  {:<10} key {}", key.outcome.label(), key.id);
@@ -590,6 +616,10 @@ fn print_import(report: &import::ImportReport, styles: &Styles) {
             keys_refused += 1;
         }
     }
+    keys_refused
+}
+
+fn print_mcp_results(report: &import::ImportReport) {
     for server in &report.mcp {
         println!(
             "  {:<10} mcp {}/{}",
@@ -598,6 +628,9 @@ fn print_import(report: &import::ImportReport, styles: &Styles) {
             server.name
         );
     }
+}
+
+fn print_env_project_results(report: &import::ImportReport) {
     for project in &report.env_projects {
         println!(
             "  {:<10} env project {}",
@@ -608,33 +641,39 @@ fn print_import(report: &import::ImportReport, styles: &Styles) {
             println!("             {reason}");
         }
     }
-    println!();
-    // The file half of an import can succeed while every secret in it is
-    // refused, and per-key lines scroll away. A keychain that will not take a
-    // write is nearly always a session without a desktop login — over ssh, in
-    // a cron job — which is a property of how the command was started and not
-    // of the bundle, so it says how to start it differently.
+}
+
+/// The file half of an import can succeed while every secret in it is
+/// refused, and per-key lines scroll away. A keychain that will not take a
+/// write is nearly always a session without a desktop login — over ssh, in
+/// a cron job — which is a property of how the command was started and not
+/// of the bundle, so it says how to start it differently.
+fn print_refused_key_warning(keys_refused: usize, keys_total: usize, styles: &Styles) {
     if keys_refused > 0 {
         println!(
             "{}",
             styles.paint(
                 warn_style(),
                 &format!(
-                    "! {keys_refused} of {} key value(s) never reached the keychain — the bundle \
-                     still holds them, so nothing is lost, but the vault on this machine is \
-                     incomplete. On macOS a keychain refuses every write from a session with no \
-                     desktop login (ssh, cron): re-run this import from a Terminal in your own \
-                     desktop session, and the file half above is idempotent — it will report \
-                     `unchanged` rather than write anything twice.",
-                    report.keys.len()
+                    "! {keys_refused} of {keys_total} key value(s) never reached the keychain — \
+                     the bundle still holds them, so nothing is lost, but the vault on this \
+                     machine is incomplete. On macOS a keychain refuses every write from a \
+                     session with no desktop login (ssh, cron): re-run this import from a \
+                     Terminal in your own desktop session, and the file half above is idempotent \
+                     — it will report `unchanged` rather than write anything twice."
                 )
             )
         );
     }
+}
+
+fn print_notes(report: &import::ImportReport, styles: &Styles) {
     for note in &report.notes {
         println!("{}", styles.paint(warn_style(), &format!("! {note}")));
     }
+}
 
+fn print_remaining_plan(report: &import::ImportReport, styles: &Styles) {
     let open: Vec<&SetupItem> = report.open_items().collect();
     if open.is_empty() {
         println!("\nnothing left to do.");

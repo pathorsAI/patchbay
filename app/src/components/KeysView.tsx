@@ -20,7 +20,7 @@ import { KEY_EXPIRY_LABEL, KEY_EXPIRY_LEVEL, type KeyRow } from "../types";
  * so the rule was protecting nothing here and cost the panel the one action a
  * key vault is for.
  */
-export function KeysView({ reload }: { reload: number }) {
+export function KeysView({ reload }: Readonly<{ reload: number }>) {
   const [rows, setRows] = useState<KeyRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);

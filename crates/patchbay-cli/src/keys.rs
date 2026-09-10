@@ -405,17 +405,7 @@ fn verify(registry: &KeyRegistry, args: VerifyArgs, styles: &Styles) -> Result<i
         no_update,
     } = args;
 
-    let entries: Vec<KeyEntry> = if all {
-        registry.list()?
-    } else {
-        ids.iter()
-            .map(|id| {
-                registry
-                    .get(id)?
-                    .ok_or_else(|| anyhow::anyhow!("no key registered as `{id}`"))
-            })
-            .collect::<Result<_>>()?
-    };
+    let entries = verify_targets(registry, &ids, all)?;
     if entries.is_empty() {
         // Only reachable through `--all`. An id nobody registered is an error;
         // an empty vault is not.
@@ -423,67 +413,127 @@ fn verify(registry: &KeyRegistry, args: VerifyArgs, styles: &Styles) -> Result<i
         return Ok(0);
     }
 
-    // Each secret is read inside the closure and dropped there, so even a sweep
-    // of the whole vault never holds more than VERIFY_THREADS of them at once,
-    // and none of them outlives its own request.
-    let outcomes = run_bounded(&entries, VERIFY_THREADS, |entry| {
-        let secret = registry.get_secret(&entry.id)?;
-        let outcome = verify_key(entry, &secret);
-        drop(secret);
-        Ok(outcome)
-    });
-    // A value patchbay registered but cannot read back is a broken vault, not a
-    // verdict about a key, so it stops the sweep instead of being filed as one.
-    let outcomes = outcomes.into_iter().collect::<Result<Vec<_>>>()?;
-
-    // Write-backs stay on this thread: they rewrite one metadata file, and
-    // eight threads doing that would be eight chances to lose an entry.
-    let mut updated: Vec<Vec<String>> = Vec::new();
-    for (entry, outcome) in entries.iter().zip(&outcomes) {
-        updated.push(if no_update {
-            Vec::new()
-        } else {
-            absorb(registry, entry, outcome)?
-        });
-    }
+    let outcomes = verify_outcomes(registry, &entries)?;
+    let updated = absorb_all(registry, &entries, &outcomes, no_update)?;
 
     // One key asked about by name keeps the answer it has always had: a full
     // block, and a bare object under `--json` that existing readers can still
     // index into. `--all` is a sweep and always answers as a list.
     let sweep = all || entries.len() > 1;
     if json {
-        let mut values = Vec::new();
-        for ((entry, outcome), updated) in entries.iter().zip(&outcomes).zip(&updated) {
-            values.push(verify_json(entry, outcome, updated)?);
-        }
-        let value = if sweep {
-            serde_json::Value::Array(values)
-        } else {
-            values.remove(0)
-        };
-        println!("{}", serde_json::to_string_pretty(&value)?);
+        print_verify_json(&entries, &outcomes, &updated, sweep)?;
     } else if sweep {
-        let id_w = entries
-            .iter()
-            .map(|e| e.id.chars().count())
-            .max()
-            .unwrap_or_default();
-        for ((entry, outcome), updated) in entries.iter().zip(&outcomes).zip(&updated) {
-            println!("{}", verify_line(entry, outcome, id_w, styles));
-            // The one thing a sweep must not do quietly. Rare, because it only
-            // fires when the issuer knows something the registry did not.
-            if !updated.is_empty() {
-                println!(
-                    "  updated the registry from the provider: {}",
-                    updated.join(", ")
-                );
-            }
-        }
-        println!("{}", verify_summary(&outcomes));
+        print_verify_sweep(&entries, &outcomes, &updated, styles);
     } else {
         print_verify(&entries[0], &outcomes[0], &updated[0], styles);
     }
     Ok(verify_exit_code(&outcomes))
+}
+
+/// The keys a run is about: everything registered under `--all`, otherwise the
+/// ones named on the command line.
+///
+/// A named id nobody registered stops the run here rather than being filed as a
+/// verdict, because it is a question patchbay cannot answer, not an answer.
+fn verify_targets(registry: &KeyRegistry, ids: &[String], all: bool) -> Result<Vec<KeyEntry>> {
+    if all {
+        return registry.list();
+    }
+    ids.iter()
+        .map(|id| {
+            registry
+                .get(id)?
+                .ok_or_else(|| anyhow::anyhow!("no key registered as `{id}`"))
+        })
+        .collect()
+}
+
+/// Ask every issuer, a bounded number of them at a time.
+///
+/// Each secret is read inside the closure and dropped there, so even a sweep of
+/// the whole vault never holds more than VERIFY_THREADS of them at once, and
+/// none of them outlives its own request.
+///
+/// A value patchbay registered but cannot read back is a broken vault, not a
+/// verdict about a key, so it stops the sweep instead of being filed as one.
+fn verify_outcomes(registry: &KeyRegistry, entries: &[KeyEntry]) -> Result<Vec<KeyVerifyOutcome>> {
+    run_bounded(entries, VERIFY_THREADS, |entry| {
+        let secret = registry.get_secret(&entry.id)?;
+        let outcome = verify_key(entry, &secret);
+        drop(secret);
+        Ok(outcome)
+    })
+    .into_iter()
+    .collect()
+}
+
+/// What [`absorb`] wrote back for each key, in step with `entries`. `--no-update`
+/// is a report-only run, so nothing is written and every key reports nothing.
+///
+/// Write-backs stay on this thread: they rewrite one metadata file, and eight
+/// threads doing that would be eight chances to lose an entry.
+fn absorb_all(
+    registry: &KeyRegistry,
+    entries: &[KeyEntry],
+    outcomes: &[KeyVerifyOutcome],
+    no_update: bool,
+) -> Result<Vec<Vec<String>>> {
+    let mut updated: Vec<Vec<String>> = Vec::new();
+    for (entry, outcome) in entries.iter().zip(outcomes) {
+        updated.push(if no_update {
+            Vec::new()
+        } else {
+            absorb(registry, entry, outcome)?
+        });
+    }
+    Ok(updated)
+}
+
+/// The verdicts as `--json`: a list for a sweep, the bare object for the one key
+/// that was asked about by name.
+fn print_verify_json(
+    entries: &[KeyEntry],
+    outcomes: &[KeyVerifyOutcome],
+    updated: &[Vec<String>],
+    sweep: bool,
+) -> Result<()> {
+    let mut values = Vec::new();
+    for ((entry, outcome), updated) in entries.iter().zip(outcomes).zip(updated) {
+        values.push(verify_json(entry, outcome, updated)?);
+    }
+    let value = if sweep {
+        serde_json::Value::Array(values)
+    } else {
+        values.remove(0)
+    };
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+/// A sweep: one line per key, then the tally.
+fn print_verify_sweep(
+    entries: &[KeyEntry],
+    outcomes: &[KeyVerifyOutcome],
+    updated: &[Vec<String>],
+    styles: &Styles,
+) {
+    let id_w = entries
+        .iter()
+        .map(|e| e.id.chars().count())
+        .max()
+        .unwrap_or_default();
+    for ((entry, outcome), updated) in entries.iter().zip(outcomes).zip(updated) {
+        println!("{}", verify_line(entry, outcome, id_w, styles));
+        // The one thing a sweep must not do quietly. Rare, because it only
+        // fires when the issuer knows something the registry did not.
+        if !updated.is_empty() {
+            println!(
+                "  updated the registry from the provider: {}",
+                updated.join(", ")
+            );
+        }
+    }
+    println!("{}", verify_summary(outcomes));
 }
 
 /// Three answers, because a script gating on this needs three.

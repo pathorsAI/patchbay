@@ -34,7 +34,7 @@ type Open = { mode: "add" } | { mode: "edit"; name: string };
  * edit that client's copy, copy it to the clients that are missing it, or take
  * it out. `pb mcp add/copy/rm` still does the same work from a terminal.
  */
-export function McpView({ reload }: { reload: number }) {
+export function McpView({ reload }: Readonly<{ reload: number }>) {
   const [clients, setClients] = useState<McpClient[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [open, setOpen] = useState<Open | null>(null);
