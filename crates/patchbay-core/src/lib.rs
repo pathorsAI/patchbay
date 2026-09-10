@@ -78,4 +78,4 @@ pub use types::{
     ActiveConcept, ConnectionState, Expiry, KeyRef, Note, NoteKind, PermissionScope,
     PermissionsReport, Profile, SwitchOutcome, ToolCategory, ToolStatus, VerifyOutcome,
 };
-pub use versions::{CheckOptions, CheckReport, Source, VersionCache, VersionInfo};
+pub use versions::{run_bounded, CheckOptions, CheckReport, Source, VersionCache, VersionInfo};

@@ -203,6 +203,30 @@ export const KEY_EXPIRY_LEVEL: Record<KeyExpiryState, string> = {
   no_expiry: "unknown",
 };
 
+/** Mirrors `patchbay_core::KeyVerifyStatus` — what the *issuer* said, as
+ *  opposed to what the registry recorded. There is no label map because the
+ *  status strings are already the labels core prints. */
+export type KeyVerifyStatus =
+  | "valid"
+  | "invalid"
+  | "expired"
+  | "inconclusive"
+  | "unsupported"
+  | "unreachable";
+
+/** The chip class each verify verdict draws with. `inconclusive`,
+ *  `unsupported` and `unreachable` share the plainest one on purpose: they are
+ *  patchbay failing to get an answer, and drawing them as warnings would put a
+ *  working key on the same footing as a revoked one. */
+export const KEY_VERIFY_LEVEL: Record<KeyVerifyStatus, string> = {
+  valid: "ok",
+  invalid: "expired",
+  expired: "expired",
+  inconclusive: "unknown",
+  unsupported: "unknown",
+  unreachable: "unknown",
+};
+
 /**
  * A vault key as it rides along on a tool's status — metadata only. There is no
  * secret value in this shape and there must never be one: the vault's values

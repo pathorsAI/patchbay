@@ -1522,8 +1522,14 @@ fn lookup_latest(
 /// Run `f` over `items` on at most `limit` scoped threads, preserving order.
 ///
 /// Scoped threads rather than a pool: everything borrowed here lives on the
-/// stack of the caller, and the work is a fixed, small batch.
-fn run_bounded<T: Sync, R: Send>(items: &[T], limit: usize, f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+/// stack of the caller, and the work is a fixed, small batch. Public because
+/// the version check is not the only sweep patchbay makes over a list of
+/// network calls, and a second bounded runner would be a second set of bugs.
+pub fn run_bounded<T: Sync, R: Send>(
+    items: &[T],
+    limit: usize,
+    f: impl Fn(&T) -> R + Sync,
+) -> Vec<R> {
     if items.is_empty() {
         return Vec::new();
     }
