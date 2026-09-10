@@ -2662,7 +2662,7 @@ mod tests {
     }
 
     #[test]
-    fn test_github_rate_limiting_stops_after_the_first_hit_instead_of_spamming() {
+    fn test_a_spent_github_rate_limit_is_reported_on_every_tool_and_never_retried() {
         let dir = tempfile::tempdir().unwrap();
         // Three GitHub-sourced tools, all installed somewhere unclassifiable so
         // they fall through to the GitHub route.
@@ -2697,9 +2697,17 @@ mod tests {
             &deps(&runner, &brew, &http, &bins),
         );
 
+        // Three GitHub tools, so three requests is the ceiling: what this
+        // asserts is that nothing retries a spent limit. It cannot assert
+        // fewer. The gate is read when a lookup *starts* and the run dispatches
+        // up to four at once, so how many requests a spent limit costs depends
+        // on how many were already in flight — which made the old `< 3` here
+        // fail 15 times in 40 local runs and go red on CI once the timing
+        // shifted. The guarantee the code does make has its own test below.
         assert!(
-            http.call_count() < 3,
-            "a spent rate limit must stop the run's other GitHub lookups, not be hit three times"
+            http.call_count() <= 3,
+            "no tool may ask GitHub twice; got {} calls for three tools",
+            http.call_count()
         );
         for entry in &report.entries {
             assert_eq!(entry.latest, None);
@@ -2710,6 +2718,57 @@ mod tests {
                 entry.tool
             );
         }
+    }
+
+    /// The promise in `lookup_latest`'s GitHub arm — one spent limit stops the
+    /// rest — is about lookups that have not started yet, and that is the half
+    /// worth pinning down: it is deterministic, and it is what keeps a second
+    /// `pb check-updates` from spending a budget that is already gone.
+    #[test]
+    fn test_a_github_lookup_that_starts_after_the_rate_limit_was_seen_never_asks() {
+        let http = StubHttp::responding(
+            HttpResponse::new(403, r#"{"message":"API rate limit exceeded"}"#)
+                .with_header("x-ratelimit-remaining", "0"),
+        );
+        let calls = AtomicUsize::new(0);
+        let rate_limited = Mutex::new(false);
+        let spec = spec_for("doctl").expect("doctl is a GitHub-sourced tool");
+        let started = Instant::now();
+
+        let first = lookup_latest(
+            spec,
+            None,
+            Source::Github,
+            &http,
+            &calls,
+            &rate_limited,
+            started,
+        );
+        assert!(first.is_err(), "a 403 with no remaining quota is an error");
+        assert!(
+            *rate_limited.lock().unwrap(),
+            "the first rate-limited answer has to arm the gate"
+        );
+        assert_eq!(http.call_count(), 1);
+
+        let second = lookup_latest(
+            spec,
+            None,
+            Source::Github,
+            &http,
+            &calls,
+            &rate_limited,
+            started,
+        );
+        assert!(
+            second.unwrap_err().contains("skipped"),
+            "the second lookup must say it was skipped, not invent a failure"
+        );
+        assert_eq!(
+            http.call_count(),
+            1,
+            "a lookup starting after the limit was seen must not reach the network"
+        );
     }
 
     #[test]
