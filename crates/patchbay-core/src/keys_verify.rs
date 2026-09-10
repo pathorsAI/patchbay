@@ -6,9 +6,9 @@
 //! updates itself from it.
 //!
 //! **Secret handling.** The value is pulled from the keystore, put in exactly
-//! one place — the `Authorization` header of one outbound request — and
-//! dropped. It is never in a URL, a query string, a log line, an error, or the
-//! returned outcome. [`KeyVerifyOutcome`] carries a verdict and nothing else,
+//! one place — the `Authorization` header of the outbound request, or of the
+//! second one where a provider needs asking twice — and dropped. It is never
+//! in a URL, a query string, a log line, an error, or the returned outcome. [`KeyVerifyOutcome`] carries a verdict and nothing else,
 //! which is why the MCP `verify_key` tool is *not* gated behind
 //! `PATCHBAY_ALLOW_SECRET_READ`: there is nothing in it to leak.
 //!
@@ -48,6 +48,10 @@ pub enum KeyVerifyStatus {
     Invalid,
     /// The issuer knows the key but its lifetime is over.
     Expired,
+    /// The provider answered, and its answer does not separate a dead key from
+    /// a live one whose permissions are too narrow to prove it. Every check
+    /// patchbay could make came back the same for both.
+    Inconclusive,
     /// patchbay has no verification path for this provider.
     Unsupported,
     /// The provider could not be reached. Says nothing about the key.
@@ -55,9 +59,9 @@ pub enum KeyVerifyStatus {
 }
 
 impl KeyVerifyStatus {
-    /// Whether this verdict is bad news about the key itself. `Unsupported` and
-    /// `Unreachable` are not: they are patchbay failing to answer, not the key
-    /// failing to work.
+    /// Whether this verdict is bad news about the key itself. `Unsupported`,
+    /// `Inconclusive` and `Unreachable` are not: they are patchbay failing to
+    /// answer, not the key failing to work.
     pub fn is_bad_news(&self) -> bool {
         matches!(self, Self::Invalid | Self::Expired)
     }
@@ -67,6 +71,7 @@ impl KeyVerifyStatus {
             Self::Valid => "valid",
             Self::Invalid => "invalid",
             Self::Expired => "expired",
+            Self::Inconclusive => "inconclusive",
             Self::Unsupported => "unsupported",
             Self::Unreachable => "unreachable",
         }
@@ -211,6 +216,7 @@ type SeenRequest = (String, Vec<(String, String)>);
 #[derive(Debug, Default)]
 pub struct StubHttp {
     response: Option<HttpResponse>,
+    queue: std::sync::Mutex<std::collections::VecDeque<HttpResponse>>,
     failure: Option<String>,
     seen: std::sync::Mutex<Vec<SeenRequest>>,
 }
@@ -219,6 +225,17 @@ impl StubHttp {
     pub fn responding(response: HttpResponse) -> Self {
         Self {
             response: Some(response),
+            ..Self::default()
+        }
+    }
+
+    /// Answer each call from a queue, in order. For the verifiers that ask a
+    /// second question when the first answer is not a verdict: the responses
+    /// have to differ per call, and by URL is not enough — the same URL can be
+    /// asked twice.
+    pub fn responding_in_turn(responses: Vec<HttpResponse>) -> Self {
+        Self {
+            queue: std::sync::Mutex::new(responses.into()),
             ..Self::default()
         }
     }
@@ -233,6 +250,16 @@ impl StubHttp {
     /// The last URL requested.
     pub fn last_url(&self) -> Option<String> {
         self.seen.lock().unwrap().last().map(|(u, _)| u.clone())
+    }
+
+    /// Every URL requested, in order.
+    pub fn urls(&self) -> Vec<String> {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(u, _)| u.clone())
+            .collect()
     }
 
     /// The last request's headers.
@@ -259,6 +286,9 @@ impl HttpClient for StubHttp {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
         ));
+        if let Some(response) = self.queue.lock().unwrap().pop_front() {
+            return Ok(response);
+        }
         match (&self.failure, &self.response) {
             (Some(detail), _) => Err(detail.clone()),
             (None, Some(response)) => Ok(response.clone()),
@@ -317,6 +347,11 @@ fn normalize_provider(provider: &str) -> Option<Provider> {
 
 const CLOUDFLARE_VERIFY: &str = "https://api.cloudflare.com/client/v4/user/tokens/verify";
 
+/// The second question, asked when the first one refuses to answer. One page of
+/// one account is the smallest authenticated read on the API, and the point is
+/// the HTTP status, not the list.
+const CLOUDFLARE_ACCOUNTS: &str = "https://api.cloudflare.com/client/v4/accounts?per_page=1";
+
 #[derive(Debug, Deserialize)]
 struct CfEnvelope {
     #[serde(default)]
@@ -341,6 +376,14 @@ struct CfResult {
 struct CfMessage {
     #[serde(default)]
     message: String,
+}
+
+/// The envelope reduced to its verdict flag, for the calls where the payload
+/// shape is beside the point.
+#[derive(Debug, Deserialize)]
+struct CfSuccess {
+    #[serde(default)]
+    success: bool,
 }
 
 fn cloudflare(secret: &str, http: &dyn HttpClient) -> KeyVerifyOutcome {
@@ -393,9 +436,10 @@ fn cloudflare(secret: &str, http: &dyn HttpClient) -> KeyVerifyOutcome {
     let detail = first(&envelope.errors)
         .unwrap_or_else(|| format!("Cloudflare rejected the token (HTTP {})", response.status));
     match response.status {
-        // 400 and 401 are both how Cloudflare says "no": a bad token is a
-        // malformed request to it.
-        400 | 401 | 403 => KeyVerifyOutcome::new(KeyVerifyStatus::Invalid, detail),
+        // 400 and 401 are both how Cloudflare says "no" — a bad token is a
+        // malformed request to it — but "no" here is not the same as "dead":
+        // the endpoint only speaks for user-owned tokens, so ask again.
+        400 | 401 | 403 => cloudflare_scoped(secret, http, &detail),
         429 => KeyVerifyOutcome::new(
             KeyVerifyStatus::Unreachable,
             format!("Cloudflare rate-limited the check ({detail}); try again shortly"),
@@ -406,6 +450,72 @@ fn cloudflare(secret: &str, http: &dyn HttpClient) -> KeyVerifyOutcome {
         ),
         _ => KeyVerifyOutcome::new(KeyVerifyStatus::Invalid, detail),
     }
+}
+
+/// Re-ask the question a token-verify rejection cannot answer.
+///
+/// `/user/tokens/verify` only speaks for tokens owned by a *user*. Hand it an
+/// account-owned or scoped token — which is what the Cloudflare dashboard
+/// mostly issues now, and what an R2 or Workers token is — and it returns
+/// `success: false` with error 1000 "Invalid API Token" while the token is
+/// happily deploying in production. Byte for byte the same body a revoked token
+/// gets, so the first answer has to be re-asked as something a scoped token can
+/// answer: can it read anything at all?
+///
+/// A 200 is proof of life. Anything else leaves the two cases genuinely
+/// indistinguishable — a token scoped to, say, R2 alone cannot list accounts
+/// either — and `Inconclusive` says that instead of picking the answer that
+/// gets a working key rotated.
+fn cloudflare_scoped(secret: &str, http: &dyn HttpClient, rejection: &str) -> KeyVerifyOutcome {
+    let bearer = format!("Bearer {secret}");
+    let response = match http.get(
+        CLOUDFLARE_ACCOUNTS,
+        &[("Authorization", &bearer), ("Accept", "application/json")],
+    ) {
+        Ok(response) => response,
+        Err(detail) => return unreachable_outcome("Cloudflare", &detail),
+    };
+
+    match response.status {
+        // Cloudflare wraps every answer of its own; a 200 carrying anything
+        // else came from something in the path, not from the API, and proves
+        // nothing about the token.
+        200 if cloudflare_succeeded(&response.body) => KeyVerifyOutcome::new(
+            KeyVerifyStatus::Valid,
+            "confirmed by listing accounts with it — Cloudflare's token-verify endpoint \
+             only answers for user-owned tokens, and this one is account-owned or scoped"
+                .to_string(),
+        ),
+        200 => KeyVerifyOutcome::new(
+            KeyVerifyStatus::Unreachable,
+            "Cloudflare answered HTTP 200 with something that is not its own JSON envelope"
+                .to_string(),
+        ),
+        429 => KeyVerifyOutcome::new(
+            KeyVerifyStatus::Unreachable,
+            format!("Cloudflare rate-limited the check ({rejection}); try again shortly"),
+        ),
+        500..=599 => KeyVerifyOutcome::new(
+            KeyVerifyStatus::Unreachable,
+            format!("Cloudflare returned HTTP {} ({rejection})", response.status),
+        ),
+        _ => KeyVerifyOutcome::new(
+            KeyVerifyStatus::Inconclusive,
+            format!(
+                "Cloudflare said `{rejection}` to both checks patchbay can make, and a token \
+                 scoped to one product answers exactly like a revoked one. Open the token in \
+                 the dashboard, or run the command that uses it — patchbay cannot tell these \
+                 two apart from here"
+            ),
+        ),
+    }
+}
+
+/// Whether a body is Cloudflare's own envelope reporting success. Read through
+/// its own struct because `result` is a list here and an object on the verify
+/// endpoint, and only the flag matters.
+fn cloudflare_succeeded(body: &str) -> bool {
+    serde_json::from_str::<CfSuccess>(body).is_ok_and(|envelope| envelope.success)
 }
 
 // ---------------------------------------------------------------------------
@@ -427,6 +537,21 @@ struct GhError {
 }
 
 fn github(secret: &str, http: &dyn HttpClient) -> KeyVerifyOutcome {
+    // A GitHub App's private key is a PEM, not a bearer token: `/user` can only
+    // ever answer "Bad credentials" to it, which reads as a dead key when the
+    // key is fine. There is no request worth spending here — verifying an App
+    // means signing a JWT with this PEM and presenting it as the app, and the
+    // registry has no app id to sign for.
+    if is_pem(secret) {
+        return KeyVerifyOutcome::new(
+            KeyVerifyStatus::Unsupported,
+            "this is a PEM private key, not a token GitHub's API will authenticate. A GitHub \
+             App key is verified by minting a JWT with it, which needs the app id patchbay \
+             does not have — so patchbay has no way to ask. Check it under the App's settings."
+                .to_string(),
+        );
+    }
+
     let bearer = format!("Bearer {secret}");
     let response = match http.get(
         GITHUB_USER,
@@ -489,6 +614,15 @@ fn github(secret: &str, http: &dyn HttpClient) -> KeyVerifyOutcome {
             format!("GitHub returned an unexpected HTTP {status}"),
         ),
     }
+}
+
+/// Whether a value is PEM armour rather than a token.
+///
+/// Shape only — the value is read, never reported. RFC 7468 armour always opens
+/// with `-----BEGIN`, and no issuer hands out a token that starts that way, so
+/// there is nothing to be clever about here.
+fn is_pem(secret: &str) -> bool {
+    secret.trim_start().starts_with("-----BEGIN")
 }
 
 /// `"repo, workflow, read:org"` -> three scopes. An empty header is an empty
@@ -674,10 +808,19 @@ mod tests {
       "messages": [{ "code": 10000, "message": "This API Token is valid and active" }]
     }"#;
 
-    /// What a wrong token really gets back: HTTP 400, success false.
+    /// What a wrong token really gets back: HTTP 400, success false. Also,
+    /// exactly, what a live account-owned token gets back from `/user/tokens/
+    /// verify` — which is the whole reason the fallback exists.
     const CF_BAD: &str = r#"{
       "result": null, "success": false,
       "errors": [{ "code": 1000, "message": "Invalid API Token" }], "messages": []
+    }"#;
+
+    /// One page of one account, trimmed. Only `success` is read.
+    const CF_ACCOUNTS: &str = r#"{
+      "result": [{ "id": "01a7362d577a6c3019a474fd6f485823", "name": "Pathors" }],
+      "success": true, "errors": [], "messages": [],
+      "result_info": { "page": 1, "per_page": 1, "count": 1, "total_count": 1 }
     }"#;
 
     #[test]
@@ -694,6 +837,11 @@ mod tests {
         assert!(
             out.scopes.is_empty(),
             "the verify endpoint lists no policies"
+        );
+        assert_eq!(
+            http.call_count(),
+            1,
+            "a definitive answer must not be second-guessed"
         );
     }
 
@@ -714,12 +862,93 @@ mod tests {
     }
 
     #[test]
-    fn test_cloudflare_rejected_token_is_invalid_with_the_providers_own_message() {
-        let http = StubHttp::responding(HttpResponse::new(400, CF_BAD));
+    fn test_cloudflare_account_scoped_token_rejected_by_verify_is_valid_if_it_can_list_accounts() {
+        // Observed on real keys: an R2 token and an account API token, both in
+        // daily use, both told "Invalid API Token" by /user/tokens/verify.
+        let http = StubHttp::responding_in_turn(vec![
+            HttpResponse::new(400, CF_BAD),
+            HttpResponse::new(200, CF_ACCOUNTS),
+        ]);
+        let out = verify_key_with(&entry("cloudflare"), "cf-secret", &http);
+
+        assert_eq!(out.status, KeyVerifyStatus::Valid);
+        assert!(!out.status.is_bad_news());
+        assert!(
+            out.detail.contains("user-owned"),
+            "the detail has to explain why the first check said otherwise: {}",
+            out.detail
+        );
+        assert_eq!(http.urls(), vec![CLOUDFLARE_VERIFY, CLOUDFLARE_ACCOUNTS]);
+        // Same secret, same one place, on the second request too.
+        let headers = http.last_headers();
+        let auth = headers.iter().find(|(k, _)| k == "Authorization").unwrap();
+        assert_eq!(auth.1, "Bearer cf-secret");
+        assert!(!http.last_url().unwrap().contains("cf-secret"));
+    }
+
+    #[test]
+    fn test_cloudflare_rejected_by_both_checks_is_inconclusive_because_a_revoked_token_and_a_narrowly_scoped_one_are_the_same_response(
+    ) {
+        // Deliberately undecidable: this is the response a revoked token gets
+        // AND the response a live R2-only token gets. Calling it `invalid`
+        // would tell someone to rotate a key that is working.
+        let http = StubHttp::responding_in_turn(vec![
+            HttpResponse::new(400, CF_BAD),
+            HttpResponse::new(403, CF_BAD),
+        ]);
         let out = verify_key_with(&entry("cloudflare"), "nope", &http);
-        assert_eq!(out.status, KeyVerifyStatus::Invalid);
-        assert_eq!(out.detail, "Invalid API Token");
-        assert!(out.status.is_bad_news());
+
+        assert_eq!(out.status, KeyVerifyStatus::Inconclusive);
+        assert!(!out.status.is_bad_news());
+        assert_eq!(out.status.label(), "inconclusive");
+        assert!(
+            out.detail.contains("cannot tell these two apart"),
+            "{}",
+            out.detail
+        );
+        assert_eq!(http.call_count(), 2);
+    }
+
+    #[test]
+    fn test_cloudflare_a_rate_limited_fallback_is_unreachable_not_a_verdict() {
+        let http = StubHttp::responding_in_turn(vec![
+            HttpResponse::new(401, CF_BAD),
+            HttpResponse::new(429, "{}"),
+        ]);
+        let out = verify_key_with(&entry("cloudflare"), "s", &http);
+        assert_eq!(out.status, KeyVerifyStatus::Unreachable);
+        assert!(!out.status.is_bad_news());
+    }
+
+    #[test]
+    fn test_cloudflare_a_200_from_the_fallback_still_has_to_be_cloudflares_own_json() {
+        // A captive portal or a proxy answering 200 with HTML proves nothing;
+        // reading it as success would report a dead token as live.
+        let http = StubHttp::responding_in_turn(vec![
+            HttpResponse::new(400, CF_BAD),
+            HttpResponse::new(200, "<html>proxy says hello</html>"),
+        ]);
+        let out = verify_key_with(&entry("cloudflare"), "s", &http);
+        assert_eq!(out.status, KeyVerifyStatus::Unreachable);
+        assert!(!out.status.is_bad_news());
+    }
+
+    #[test]
+    fn test_cloudflare_reports_a_user_owned_tokens_own_status_without_a_fallback() {
+        // The token's own reported status is definitive in both directions;
+        // only a rejection is ambiguous.
+        for (body, expected) in [
+            (CF_ACTIVE, KeyVerifyStatus::Valid),
+            (
+                r#"{"result":{"status":"disabled"},"success":true,"errors":[],"messages":[]}"#,
+                KeyVerifyStatus::Invalid,
+            ),
+        ] {
+            let http = StubHttp::responding(HttpResponse::new(200, body));
+            let out = verify_key_with(&entry("cloudflare"), "s", &http);
+            assert_eq!(out.status, expected);
+            assert_eq!(http.call_count(), 1);
+        }
     }
 
     #[test]
@@ -811,6 +1040,34 @@ mod tests {
         assert_eq!(out.status, KeyVerifyStatus::Valid);
         assert!(out.scopes.is_empty());
         assert_eq!(out.expires_at, None);
+    }
+
+    #[test]
+    fn test_github_app_private_key_is_unsupported_and_never_asks() {
+        // Observed on a real key: a GitHub App's PEM registered under
+        // `github`, reported `invalid` — "Bad credentials" — while the App was
+        // signing CI tokens all day. `/user` has no answer for a PEM, so the
+        // request is not worth making.
+        let http = StubHttp::failing("should not be called");
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEow…\n-----END RSA PRIVATE KEY-----\n";
+        let out = verify_key_with(&entry("github"), pem, &http);
+
+        assert_eq!(out.status, KeyVerifyStatus::Unsupported);
+        assert!(!out.status.is_bad_news());
+        assert!(out.detail.contains("JWT"), "{}", out.detail);
+        assert_eq!(http.call_count(), 0, "a PEM must not reach the network");
+        assert!(!serde_json::to_string(&out).unwrap().contains("MIIEow"));
+
+        // Leading whitespace from a heredoc or a copy-paste does not disguise
+        // it, and an ordinary token still takes the request path.
+        let out = verify_key_with(&entry("gh"), &format!("\n  {pem}"), &http);
+        assert_eq!(out.status, KeyVerifyStatus::Unsupported);
+        assert_eq!(http.call_count(), 0);
+
+        let http = StubHttp::responding(HttpResponse::new(200, r#"{"login":"octocat"}"#));
+        let out = verify_key_with(&entry("github"), "ghp_ordinary_token", &http);
+        assert_eq!(out.status, KeyVerifyStatus::Valid);
+        assert_eq!(http.call_count(), 1);
     }
 
     #[test]
@@ -1081,6 +1338,8 @@ mod tests {
         assert!(!KeyVerifyStatus::Valid.is_bad_news());
         assert!(!KeyVerifyStatus::Unsupported.is_bad_news());
         assert!(!KeyVerifyStatus::Unreachable.is_bad_news());
+        assert!(!KeyVerifyStatus::Inconclusive.is_bad_news());
         assert_eq!(KeyVerifyStatus::Unreachable.label(), "unreachable");
+        assert_eq!(KeyVerifyStatus::Inconclusive.label(), "inconclusive");
     }
 }

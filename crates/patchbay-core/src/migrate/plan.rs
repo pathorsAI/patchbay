@@ -20,7 +20,7 @@
 //! does with no arguments.
 
 use super::manifest::{Manifest, SetupItem, SetupStatus, ToolRecord};
-use super::policy::{policy_for, Portability};
+use super::policy::{policy_for, Portability, ToolPolicy};
 use crate::envs::EnvRegistry;
 use crate::keys::KeyRegistry;
 use crate::mcp_clients::McpClientRegistry;
@@ -40,13 +40,12 @@ pub fn plan(
     envs: &EnvRegistry,
     manifest: Option<&Manifest>,
 ) -> Vec<SetupItem> {
-    let _ = paths;
     let mut items = Vec::new();
     let statuses = registry.status_all();
 
     for status in &statuses {
         let expected = manifest.and_then(|m| m.tool(&status.tool));
-        items.extend(tool_items(status, expected));
+        items.extend(tool_items(paths, status, expected));
     }
     items.extend(key_items(vault, manifest));
     items.extend(mcp_items(clients, manifest));
@@ -85,7 +84,11 @@ fn source_had_something(expected: Option<&ToolRecord>, status: &ToolStatus) -> b
     }
 }
 
-fn tool_items(status: &ToolStatus, expected: Option<&ToolRecord>) -> Vec<SetupItem> {
+/// The questions this machine still owes an answer to for one tool, in the
+/// order a person would work them: get the CLI, log in, then be the right
+/// person. Each one is a separate builder because each has its own reason to
+/// exist, and the reasons are what the items carry.
+fn tool_items(paths: &Paths, status: &ToolStatus, expected: Option<&ToolRecord>) -> Vec<SetupItem> {
     let Some(policy) = policy_for(&status.tool) else {
         return Vec::new();
     };
@@ -93,42 +96,89 @@ fn tool_items(status: &ToolStatus, expected: Option<&ToolRecord>) -> Vec<SetupIt
         return Vec::new();
     }
 
-    let mut items = Vec::new();
     let state = status.connection_state();
+    let mut items = Vec::new();
+    items.extend(install_item(policy, status, state));
+    items.push(login_item(paths, policy, status, expected, state));
+    items.extend(switch_item(status, expected, state));
+    items
+}
 
-    // 1. Is the CLI even here? Nothing else about this tool can be checked
-    //    until it is, so this item comes first and the login item goes
-    //    `Unknown` behind it rather than claiming a verdict it cannot have.
-    if state == ConnectionState::NotInstalled {
-        items.push(
-            SetupItem::new(
-                format!("install:{}", status.tool),
-                &status.tool,
-                format!("`{}` is not installed on this machine", status.tool),
-            )
-            .command(policy.install, false),
-        );
+/// 1. Is the CLI even here? Nothing else about this tool can be checked until
+///    it is, so this item comes first and the login item goes `Unknown` behind
+///    it rather than claiming a verdict it cannot have.
+fn install_item(
+    policy: &ToolPolicy,
+    status: &ToolStatus,
+    state: ConnectionState,
+) -> Option<SetupItem> {
+    if state != ConnectionState::NotInstalled {
+        return None;
     }
+    Some(
+        SetupItem::new(
+            format!("install:{}", status.tool),
+            &status.tool,
+            format!("`{}` is not installed on this machine", status.tool),
+        )
+        .command(policy.install, false),
+    )
+}
 
-    // 2. Is it logged in?
-    //
-    // Two deliberate departures from the status board here, both because a
-    // checklist is a different thing from a warning light:
-    //
-    //  * `Attention` is Open only when the credential has ACTUALLY expired. The
-    //    board is right to flag a gcloud access token with 40 minutes left —
-    //    but gcloud refreshes that itself, and a setup list that can never
-    //    reach zero is a setup list people stop working.
-    //  * a `concurrent` tool with profiles is Done. docker, rclone, ssh and npm
-    //    have no active profile by design, so `Disconnected` there means
-    //    "healthy", not "logged out".
+/// 2. Is it logged in?
+///
+/// Always an item, even when the answer is yes: a checklist people can watch
+/// shrink is the point, so a closed question stays on the list as `Done`.
+fn login_item(
+    paths: &Paths,
+    policy: &ToolPolicy,
+    status: &ToolStatus,
+    expected: Option<&ToolRecord>,
+    state: ConnectionState,
+) -> SetupItem {
+    let (login_status, what) = login_verdict(policy, status, state);
+    let mut login = SetupItem::new(format!("tool:{}", status.tool), &status.tool, what)
+        .command(policy.fix, policy.needs_browser)
+        .status(login_status);
+    // Why the copy could not have brought this login with it: a keychain-held
+    // or device-identifying credential has to be re-made here, and the user
+    // deserves that reason next to the command.
+    if !matches!(policy.portability, Portability::Portable { .. }) {
+        login = login.detail(policy.portability.reason());
+    }
+    if let Some(record) = expected {
+        login = source_history(login, record);
+    }
+    if status.tool == "kubectl" && login_status == SetupStatus::Open {
+        login = kubeconfig_fix(paths, login);
+    }
+    login
+}
+
+/// The login verdict and the sentence that explains it.
+///
+/// Two deliberate departures from the status board here, both because a
+/// checklist is a different thing from a warning light:
+///
+///  * `Attention` is Open only when the credential has ACTUALLY expired. The
+///    board is right to flag a gcloud access token with 40 minutes left —
+///    but gcloud refreshes that itself, and a setup list that can never
+///    reach zero is a setup list people stop working.
+///  * a `concurrent` tool with profiles is Done. docker, rclone, ssh and npm
+///    have no active profile by design, so `Disconnected` there means
+///    "healthy", not "logged out".
+fn login_verdict(
+    policy: &ToolPolicy,
+    status: &ToolStatus,
+    state: ConnectionState,
+) -> (SetupStatus, String) {
     let now = chrono::Utc::now();
     let expired = status
         .active_expiry()
         .or_else(|| status.soonest_expiry())
         .is_some_and(|at| at <= now);
 
-    let (login_status, what) = match state {
+    match state {
         ConnectionState::Connected => {
             (SetupStatus::Done, format!("`{}` is logged in", status.tool))
         }
@@ -162,50 +212,112 @@ fn tool_items(status: &ToolStatus, expected: Option<&ToolRecord>) -> Vec<SetupIt
                 status.tool
             ),
         ),
-    };
-    let mut login = SetupItem::new(format!("tool:{}", status.tool), &status.tool, what)
-        .command(policy.fix, policy.needs_browser)
-        .status(login_status);
-    if !matches!(policy.portability, Portability::Portable { .. }) {
-        login = login.detail(policy.portability.reason());
     }
-    if let Some(record) = expected {
-        if let Some(active) = &record.active {
-            login = login.detail(format!("the old machine was `{active}` here"));
-        }
-        if !record.scopes.is_empty() {
-            login = login.detail(format!(
-                "it had these scopes, which the new login has to match: {}",
-                record.scopes.join(", ")
-            ));
-        }
-    }
-    items.push(login);
+}
 
-    // 3. Logged in, but as somebody else. patchbay can fix this one itself.
-    if state != ConnectionState::NotInstalled {
-        if let Some(record) = expected {
-            if let (Some(want), here) = (record.active.as_ref(), status.active.as_ref()) {
-                let known = status.profiles.iter().any(|p| &p.id == want);
-                if here != Some(want) && known {
-                    items.push(
-                        SetupItem::new(
-                            format!("switch:{}", status.tool),
-                            &status.tool,
-                            format!(
-                                "`{}` is on `{}`; the old machine was on `{want}`",
-                                status.tool,
-                                here.map(String::as_str).unwrap_or("nothing")
-                            ),
-                        )
-                        .command(format!("pb use {} {want}", status.tool), false)
-                        .auto(true),
-                    );
-                }
-            }
-        }
+/// What the old machine had here, so the new login can be made to match rather
+/// than guessed at.
+fn source_history(mut login: SetupItem, record: &ToolRecord) -> SetupItem {
+    if let Some(active) = &record.active {
+        login = login.detail(format!("the old machine was `{active}` here"));
     }
-    items
+    if !record.scopes.is_empty() {
+        login = login.detail(format!(
+            "it had these scopes, which the new login has to match: {}",
+            record.scopes.join(", ")
+        ));
+    }
+    login
+}
+
+/// 3. Logged in, but as somebody else. patchbay can fix this one itself, so
+///    this is the rare `auto` item.
+///
+/// Only when the wanted profile is already known here — switching to a profile
+/// this machine has never seen is a login, not a switch.
+fn switch_item(
+    status: &ToolStatus,
+    expected: Option<&ToolRecord>,
+    state: ConnectionState,
+) -> Option<SetupItem> {
+    if state == ConnectionState::NotInstalled {
+        return None;
+    }
+    let want = expected?.active.as_ref()?;
+    let here = status.active.as_ref();
+    let known = status.profiles.iter().any(|p| &p.id == want);
+    if here == Some(want) || !known {
+        return None;
+    }
+    Some(
+        SetupItem::new(
+            format!("switch:{}", status.tool),
+            &status.tool,
+            format!(
+                "`{}` is on `{}`; the old machine was on `{want}`",
+                status.tool,
+                here.map(String::as_str).unwrap_or("nothing")
+            ),
+        )
+        .command(format!("pb use {} {want}", status.tool), false)
+        .auto(true),
+    )
+}
+
+/// Replace kubectl's login command with the `KUBECONFIG` line the files on this
+/// machine actually need — the one gap an import *creates*.
+///
+/// Several kubeconfigs land in one directory and kubectl merges only what the
+/// variable names, so the fix is a shell line rather than a login. The import
+/// says so in its own output, but that has scrolled away by the time anybody
+/// runs `pb plan`, which used to offer `kubectl config get-contexts` — a
+/// command that shows the problem again rather than fixing it.
+///
+/// Nothing has to be persisted for this: the files themselves are the record,
+/// so the line is re-derived from the directory every time.
+fn kubeconfig_fix(paths: &Paths, item: SetupItem) -> SetupItem {
+    let unmerged = unmerged_kubeconfigs(paths);
+    if unmerged.is_empty() {
+        return item;
+    }
+    let dir = super::policy::Location::KubeConfigs.destination(paths, "");
+    let list: Vec<String> = unmerged.iter().map(|p| p.display().to_string()).collect();
+    item.command(format!("export KUBECONFIG={}", list.join(":")), false)
+        .detail(format!(
+            "{} kubeconfig(s) are already in {} — an import puts them there — but KUBECONFIG \
+             names none of them, and kubectl merges only the files it names",
+            unmerged.len(),
+            dir.display()
+        ))
+}
+
+/// Kubeconfigs in the directory an import restores them into that
+/// `KUBECONFIG` does not name.
+///
+/// The `.yaml`/`.yml` test is the one the kubectl probe already applies when it
+/// scans a config *directory*. Everything else in `~/.kube` — `cache/`,
+/// `http-cache/`, a `.patchbay-bak` this import wrote — is not a kubeconfig,
+/// and a `KUBECONFIG` line naming one of those is worse than none.
+fn unmerged_kubeconfigs(paths: &Paths) -> Vec<std::path::PathBuf> {
+    let named = paths.kube_configs();
+    let dir = super::policy::Location::KubeConfigs.destination(paths, "");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<std::path::PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .filter(|path| {
+            matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("yaml") | Some("yml")
+            )
+        })
+        .filter(|path| !named.contains(path))
+        .collect();
+    found.sort();
+    found
 }
 
 // ---------------------------------------------------------------------------
@@ -851,6 +963,89 @@ mod tests {
             "tool:invented",
         )
         .is_none());
+    }
+
+    /// The state the real move ended in: kubectl installed, several
+    /// kubeconfigs sitting where the import put them, and `KUBECONFIG`
+    /// naming none of them.
+    fn machine_with_loose_kubeconfigs() -> (tempfile::TempDir, Paths) {
+        let dir = tempfile::tempdir().unwrap();
+        let kube = dir.path().join(".kube");
+        fs::create_dir_all(kube.join("cache")).unwrap();
+        for name in ["prod.yaml", "staging.yaml"] {
+            fs::write(kube.join(name), "apiVersion: v1\nclusters: []\n").unwrap();
+        }
+        // Neither of these is a kubeconfig, and neither may reach the line.
+        fs::write(kube.join("config.patchbay-bak"), "apiVersion: v1\n").unwrap();
+        fs::write(kube.join("http-cache.json"), "{}").unwrap();
+
+        // `has_binary` is true under a scripted exec, which is what makes
+        // kubectl read as installed with nothing logged in.
+        let paths = Paths::for_test(dir.path())
+            .with_exec(std::sync::Arc::new(crate::util::FakeExec::new()));
+        (dir, paths)
+    }
+
+    fn plan_for(paths: &Paths) -> Vec<SetupItem> {
+        let registry = Registry::all(paths.clone());
+        let vault = KeyRegistry::new(
+            paths.home().join("keys.json"),
+            Box::new(MemoryKeystore::new()),
+        );
+        let clients = McpClientRegistry::with_paths(paths.clone());
+        let envs = EnvRegistry::new(
+            paths.home().join("projects.json"),
+            paths.home().join("attachments.json"),
+            Box::new(MemoryKeystore::new()),
+        );
+        plan(paths, &registry, &vault, &clients, &envs, None)
+    }
+
+    #[test]
+    fn test_the_kubectl_item_carries_the_kubeconfig_line_an_import_needs() {
+        let (dir, paths) = machine_with_loose_kubeconfigs();
+        let items = plan_for(&paths);
+        let kubectl = item(&items, "tool:kubectl");
+        assert!(kubectl.is_open(), "{kubectl:?}");
+
+        // The fix, not another look at the problem.
+        assert!(
+            kubectl.command.starts_with("export KUBECONFIG="),
+            "{kubectl:?}"
+        );
+        let kube = dir.path().join(".kube");
+        assert_eq!(
+            kubectl.command,
+            format!(
+                "export KUBECONFIG={}:{}",
+                kube.join("prod.yaml").display(),
+                kube.join("staging.yaml").display()
+            )
+        );
+        assert!(
+            kubectl.detail.iter().any(|d| d.contains("merges only")),
+            "{kubectl:?}"
+        );
+    }
+
+    #[test]
+    fn test_kubeconfigs_the_variable_already_names_change_nothing() {
+        let (dir, _) = machine_with_loose_kubeconfigs();
+        let kube = dir.path().join(".kube");
+        let list = format!(
+            "{}:{}",
+            kube.join("prod.yaml").display(),
+            kube.join("staging.yaml").display()
+        );
+        // Same files, this time merged: there is no gap to describe, so the
+        // item goes back to the policy's own command.
+        let paths = Paths::for_test(dir.path())
+            .with_exec(std::sync::Arc::new(crate::util::FakeExec::new()))
+            .with_env("KUBECONFIG", &list);
+        let items = plan_for(&paths);
+        let kubectl = item(&items, "tool:kubectl");
+        assert_eq!(kubectl.command, "kubectl config get-contexts");
+        assert!(kubectl.detail.is_empty(), "{kubectl:?}");
     }
 
     #[test]

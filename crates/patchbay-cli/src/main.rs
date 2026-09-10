@@ -123,6 +123,13 @@ enum Command {
         /// Write into a cloud-sync folder anyway.
         #[arg(long)]
         force: bool,
+        /// Take the passphrase from this file's first line (mode 0600 only),
+        /// not from a prompt. Never as an argument: argv is visible to `ps`.
+        #[arg(long, value_name = "PATH", conflicts_with = "passphrase_fd")]
+        passphrase_file: Option<std::path::PathBuf>,
+        /// Take the passphrase from an already-open descriptor's first line.
+        #[arg(long, value_name = "N", conflicts_with = "passphrase_file")]
+        passphrase_fd: Option<i32>,
         #[arg(long)]
         json: bool,
     },
@@ -138,6 +145,17 @@ enum Command {
         /// Print the plan and write nothing.
         #[arg(long)]
         dry_run: bool,
+        /// Restore the key vault half only, skipping files, MCP servers and env
+        /// projects. The file half is idempotent anyway.
+        #[arg(long)]
+        keys_only: bool,
+        /// Take the passphrase from this file's first line (mode 0600 only),
+        /// not from a prompt. Never as an argument: argv is visible to `ps`.
+        #[arg(long, value_name = "PATH", conflicts_with = "passphrase_fd")]
+        passphrase_file: Option<std::path::PathBuf>,
+        /// Take the passphrase from an already-open descriptor's first line.
+        #[arg(long, value_name = "N", conflicts_with = "passphrase_file")]
+        passphrase_fd: Option<i32>,
         #[arg(long)]
         json: bool,
     },
@@ -297,12 +315,16 @@ fn run() -> Result<i32> {
             out,
             keys,
             force,
+            passphrase_file,
+            passphrase_fd,
             json,
         } => migrate::run(
             migrate::Command::Export {
                 out,
                 keys,
                 force,
+                passphrase_file,
+                passphrase_fd,
                 json,
             },
             &styles(),
@@ -311,11 +333,17 @@ fn run() -> Result<i32> {
         Command::Import {
             bundle,
             dry_run,
+            keys_only,
+            passphrase_file,
+            passphrase_fd,
             json,
         } => migrate::run(
             migrate::Command::Import {
                 bundle,
                 dry_run,
+                keys_only,
+                passphrase_file,
+                passphrase_fd,
                 json,
             },
             &styles(),

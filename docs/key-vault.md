@@ -27,6 +27,8 @@ pb key edit cf-gh-actions-deploy --env CLOUDFLARE_API_TOKEN  # metadata only
 pb key copy cf-gh-actions-deploy    # to the clipboard, never to your terminal
 pb key run  cf-gh-actions-deploy -- wrangler deploy  # into a child process
 pb key verify cf-gh-actions-deploy  # ask Cloudflare whether it still works
+pb key verify cf-api gh-pat neon-api-key   # several issuers, at once
+pb key verify --all                 # sweep the whole vault
 pb key rm  cf-gh-actions-deploy     # metadata and Keychain item, both
 ```
 
@@ -166,10 +168,23 @@ back into the registry, so the vault converges on the truth instead of drifting
 from it. Every other provider answers `unsupported`, which is a normal answer
 and not a failure.
 
+Ask about several keys, or about all of them. A sweep is one line per key and a
+tally, and it runs the checks eight at a time rather than sixty round trips end
+to end:
+
+```console
+$ pb key verify --all
+cf-r2-token-sonarqube-backups  valid         confirmed by listing accounts with it — Cloudflar…
+gh-pat-release                 valid         GitHub accepts it as YJack0000
+neon-api-key                   unsupported   patchbay cannot verify `neon` keys yet — it knows…
+openai-personal                unsupported   patchbay cannot verify `openai` keys yet — it know…
+checked 4 keys: 2 unsupported, 2 valid
+```
+
 | `--provider` | What patchbay asks | What comes back |
 |---|---|---|
-| `cloudflare` (`cf`) | `GET /client/v4/user/tokens/verify` | The token's own status — `active`, `expired` or `disabled` — plus `expires_on` when the token has one, and Cloudflare's own message. The endpoint reports liveness, not policies, so scopes stay empty: an account API token's *reach* is not something this call will tell you, which is exactly why it is worth registering next to `wrangler`. |
-| `github` (`gh`) | `GET /user` | The login it authenticates as, the classic-PAT scope list from `X-OAuth-Scopes`, and the expiry from `github-authentication-token-expiration`. A fine-grained PAT sends an empty scope header — that is a real answer, not a missing one; its permissions are per-repository and not enumerable here. |
+| `cloudflare` (`cf`) | `GET /client/v4/user/tokens/verify`, then `GET /client/v4/accounts?per_page=1` if that rejects it | The token's own status — `active`, `expired` or `disabled` — plus `expires_on` when the token has one, and Cloudflare's own message. The endpoint reports liveness, not policies, so scopes stay empty: an account API token's *reach* is not something this call will tell you, which is exactly why it is worth registering next to `wrangler`. |
+| `github` (`gh`) | `GET /user`, unless the value is a PEM | The login it authenticates as, the classic-PAT scope list from `X-OAuth-Scopes`, and the expiry from `github-authentication-token-expiration`. A fine-grained PAT sends an empty scope header — that is a real answer, not a missing one; its permissions are per-repository and not enumerable here. A GitHub **App private key** is a PEM rather than a bearer token, so it answers `unsupported` without a request: verifying an App means minting a JWT with the key, which needs an app id the registry does not hold. `/user` would say "Bad credentials" to a perfectly good App key, which is why patchbay does not ask. |
 | `grafana` | `GET {endpoint}/api/org` | The org the token belongs to. **Needs `--endpoint`** — a Grafana token is only meaningful against the instance that issued it, and there is no one address to ask. Service-account tokens carry a role rather than a scope list, so scopes stay empty. |
 
 ```sh
@@ -183,11 +198,28 @@ URL and Grafana Cloud answers `/api/org` with its single-page app — HTML, HTTP
 200 — which patchbay reports as `unreachable` rather than reading a dead token
 as live.
 
+Cloudflare's token-verify endpoint only speaks for tokens owned by a *user*.
+Hand it an account-owned or scoped token — an R2 token, a Workers token, most
+of what the dashboard issues now — and it answers `success: false`, error 1000,
+"Invalid API Token", while the token is deploying in production. That is why
+patchbay asks a second question when the first one says no: can the token read
+one page of one account? A `200` there is proof of life, and the verdict says
+where it came from. If that is rejected too, the answer is `inconclusive` —
+because a token scoped to R2 alone cannot list accounts either, and the two
+cases are the same HTTP response. patchbay will not turn that into advice to
+rotate a key.
+
 The verdicts are deliberately more than a boolean. `unreachable` (DNS, timeout,
-rate limit, 5xx) means patchbay could not ask; it says **nothing** about the
-key, and it never overwrites what you already had. Exit codes follow: `0`
-verified or unsupported, `1` the provider says the key is dead, `2` the provider
-could not be reached.
+rate limit, 5xx), `inconclusive` and `unsupported` all mean patchbay could not
+get an answer; none of them says **anything** about the key, and none of them
+overwrites what you already had.
+
+Exit codes keep the same three-way split, over however many keys were asked
+about: `1` a provider says one of them is dead, `2` nothing is dead but a
+provider could not be reached, `0` everything else — `inconclusive` and
+`unsupported` included, because neither is a fact about a key. `1` outranks
+`2`: a sweep that found a revoked token and then lost the wifi still found a
+revoked token.
 
 Agents get the same check over MCP as `verify_key`, and it is **not** gated
 behind `PATCHBAY_ALLOW_SECRET_READ` — a verdict carries nothing to leak.

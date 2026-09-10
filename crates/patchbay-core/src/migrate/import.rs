@@ -9,6 +9,15 @@
 //! directory, so there is no window in which every credential on the machine
 //! sits unencrypted in `/tmp` waiting for a crash to leave it there.
 //!
+//! # Nothing is written before the keychain has answered
+//!
+//! A bundle carrying key values is refused outright when the keystore will not
+//! take a write ([`Importer::preflight_keystore`]). The ordering is the point:
+//! the keychain half runs after the file half, and a macOS keychain refuses
+//! *every* write from a session with no desktop login, so without the
+//! preflight an import over ssh copies every credential file and then drops
+//! every secret — a half-migrated machine that exited 0.
+//!
 //! # Never clobber silently
 //!
 //! Every destination that already exists is copied to `<path>.patchbay-bak`
@@ -47,6 +56,10 @@ use crate::util::{backup, backup_path};
 pub struct ImportOptions {
     /// Print the plan, change nothing.
     pub dry_run: bool,
+    /// Restore the key vault half only — no files, no MCP registrations, no
+    /// env projects. What finishes a move whose keychain writes were refused
+    /// while its files landed.
+    pub keys_only: bool,
 }
 
 /// What happened, or would happen, to one destination.
@@ -134,6 +147,17 @@ impl ImportReport {
     pub fn open_items(&self) -> impl Iterator<Item = &SetupItem> {
         self.remaining.iter().filter(|i| i.is_open())
     }
+
+    /// Key values the keystore would not take. Anything above zero means the
+    /// vault half of this machine is incomplete however well the file half
+    /// went, which is why the CLI exits non-zero on it: `pb import && ./deploy`
+    /// must not run against a machine whose secrets never arrived.
+    pub fn keys_refused(&self) -> usize {
+        self.keys
+            .iter()
+            .filter(|k| matches!(k.outcome, FileOutcome::Skipped { .. }))
+            .count()
+    }
 }
 
 /// Everything an import writes to.
@@ -157,10 +181,21 @@ impl Importer<'_> {
             notes: Vec::new(),
         };
 
-        self.restore_files(payload, options, &mut report)?;
-        self.restore_keys(payload, options, &mut report);
-        self.restore_mcp(payload, options, &mut report);
-        self.restore_env_projects(payload, options, &mut report);
+        self.preflight_keystore(payload, options, &mut report)?;
+
+        if options.keys_only {
+            report.notes.push(
+                "--keys-only: the credential files, MCP registrations and env projects in this \
+                 bundle were not looked at; re-run without the flag to restore them"
+                    .to_string(),
+            );
+            self.restore_keys(payload, options, &mut report);
+        } else {
+            self.restore_files(payload, options, &mut report)?;
+            self.restore_keys(payload, options, &mut report);
+            self.restore_mcp(payload, options, &mut report);
+            self.restore_env_projects(payload, options, &mut report);
+        }
 
         // The gaps are recomputed here rather than copied out of the manifest:
         // the manifest's list is what the *source* predicted, and by now some
@@ -174,6 +209,51 @@ impl Importer<'_> {
             Some(&payload.manifest),
         );
         Ok(report)
+    }
+
+    /// Ask the keystore whether it will accept a write at all, before anything
+    /// at all is written.
+    ///
+    /// A keychain that refuses one write refuses all of them: on macOS that is
+    /// what a session with no desktop login looks like, and it is a property of
+    /// how the command was started rather than of the bundle. So the answer is
+    /// worth one throwaway item ([`KeyRegistry::probe_writable`]) up front:
+    /// every credential file restored and then every secret in the bundle
+    /// dropped is the worst outcome this command has, and it must not be
+    /// reachable.
+    ///
+    /// A dry run cannot ask, because asking is writing. It says so instead.
+    fn preflight_keystore(
+        &self,
+        payload: &Payload,
+        options: &ImportOptions,
+        report: &mut ImportReport,
+    ) -> anyhow::Result<()> {
+        if payload.secrets.is_empty() {
+            return Ok(());
+        }
+        if options.dry_run {
+            report.notes.push(format!(
+                "the {} key value(s) in this bundle were NOT checked against the {}: the only way \
+                 to ask whether it will accept a write is to write, and a dry run writes nothing. \
+                 A real import asks before it copies a single file.",
+                payload.secrets.len(),
+                self.vault.store_name()
+            ));
+            return Ok(());
+        }
+        self.vault.probe_writable().map_err(|e| {
+            anyhow::anyhow!(
+                "the {} refused a test write, so none of the {} key value(s) in this bundle can \
+                 be stored ({e:#}) — nothing was written, and the bundle still holds them. On \
+                 macOS a keychain refuses every write from a session with no desktop login (ssh, \
+                 cron, a launchd job): re-run this from a Terminal in your own desktop session. \
+                 If the files are already here, `pb import <bundle> --keys-only` finishes just \
+                 the vault half.",
+                self.vault.store_name(),
+                payload.secrets.len()
+            )
+        })
     }
 
     fn restore_files(
@@ -477,6 +557,15 @@ mod tests {
 
     impl Machine {
         fn new(files: &[(&str, &str)]) -> Self {
+            Self::with_keystore(files, Box::new(MemoryKeystore::new()))
+        }
+
+        /// A machine whose vault is backed by something other than a working
+        /// store, for the keychain-refuses-everything paths.
+        fn with_keystore(
+            files: &[(&str, &str)],
+            store: Box<dyn crate::keystore::Keystore>,
+        ) -> Self {
             let dir = tempfile::tempdir().unwrap();
             for (rel, body) in files {
                 let path = dir.path().join(rel);
@@ -487,7 +576,7 @@ mod tests {
             let paths = Paths::for_test(&home);
             Self {
                 registry: Registry::all(paths.clone()),
-                vault: KeyRegistry::new(home.join("keys.json"), Box::new(MemoryKeystore::new())),
+                vault: KeyRegistry::new(home.join("keys.json"), store),
                 clients: McpClientRegistry::with_paths(paths.clone()),
                 envs: EnvRegistry::new(
                     home.join("projects.json"),
@@ -513,6 +602,21 @@ mod tests {
         }
 
         fn import(&self, payload: &Payload, dry_run: bool) -> ImportReport {
+            self.try_import(
+                payload,
+                &ImportOptions {
+                    dry_run,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        }
+
+        fn try_import(
+            &self,
+            payload: &Payload,
+            options: &ImportOptions,
+        ) -> anyhow::Result<ImportReport> {
             Importer {
                 paths: &self.paths,
                 registry: &self.registry,
@@ -520,8 +624,7 @@ mod tests {
                 clients: &self.clients,
                 envs: &self.envs,
             }
-            .run(payload, &ImportOptions { dry_run })
-            .unwrap()
+            .run(payload, options)
         }
 
         fn read(&self, rel: &str) -> String {
@@ -717,6 +820,146 @@ mod tests {
             .find(|i| i.id == "key:cf-api")
             .expect("a key that did not travel must be on the plan");
         assert!(gap.command.contains("pb key add cf-api"), "{gap:?}");
+    }
+
+    /// A store that takes the write probe and then refuses every real key.
+    ///
+    /// Only the probe's id can start with a `.` — `validate_id` refuses that
+    /// shape for a registered key — so this is the shape of a session that
+    /// locks *between* the preflight and the restore, which the preflight
+    /// cannot promise away.
+    struct RefusesEveryRealKey;
+
+    impl crate::keystore::Keystore for RefusesEveryRealKey {
+        fn put(&self, id: &str, _secret: &str) -> anyhow::Result<()> {
+            if id.starts_with('.') {
+                return Ok(());
+            }
+            anyhow::bail!("User interaction is not allowed")
+        }
+        fn get(&self, _id: &str) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+        fn delete(&self, _id: &str) -> anyhow::Result<bool> {
+            Ok(true)
+        }
+        fn describe(&self) -> &'static str {
+            "test keystore that refuses real keys"
+        }
+    }
+
+    /// The source machine of a bundle that carries files and one key value.
+    fn source_with_a_key() -> Machine {
+        let source = Machine::new(&source_files());
+        source
+            .vault
+            .add(
+                NewKey::new("cf-api", "cli").provider("cloudflare"),
+                "cf-secret-1234",
+                false,
+            )
+            .unwrap();
+        source
+    }
+
+    #[test]
+    fn test_a_keychain_that_refuses_writes_aborts_before_a_single_file_lands() {
+        let source = source_with_a_key();
+        let payload = source.payload(KeySelection::All);
+
+        let dest = Machine::with_keystore(&[], Box::new(MemoryKeystore::failing_put()));
+        let err = dest
+            .try_import(&payload, &ImportOptions::default())
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("refused a test write"), "{msg}");
+        // The cause and the fix, both named.
+        assert!(msg.contains("no desktop login"), "{msg}");
+        assert!(msg.contains("desktop session"), "{msg}");
+        assert!(msg.contains("--keys-only"), "{msg}");
+
+        // The whole point of the ordering: not one file was copied.
+        assert!(walk(&dest.home).is_empty(), "{:?}", walk(&dest.home));
+        assert!(!dest.exists(".aws/config"));
+    }
+
+    #[test]
+    fn test_a_dry_run_says_the_keychain_was_never_asked() {
+        let source = source_with_a_key();
+        let payload = source.payload(KeySelection::All);
+
+        // Even a store that would refuse: a dry run does not find out, because
+        // finding out is a write.
+        let dest = Machine::with_keystore(&[], Box::new(MemoryKeystore::failing_put()));
+        let report = dest
+            .try_import(
+                &payload,
+                &ImportOptions {
+                    dry_run: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            report.notes.iter().any(|n| n.contains("NOT checked")),
+            "{:?}",
+            report.notes
+        );
+        assert!(walk(&dest.home).is_empty());
+    }
+
+    #[test]
+    fn test_a_key_the_keychain_refuses_is_counted_not_hidden() {
+        let source = source_with_a_key();
+        let payload = source.payload(KeySelection::All);
+
+        let dest = Machine::with_keystore(&[], Box::new(RefusesEveryRealKey));
+        let report = dest.import(&payload, false);
+        assert_eq!(report.keys_refused(), 1);
+        match &report.keys[0].outcome {
+            FileOutcome::Skipped { reason } => {
+                assert!(reason.contains("User interaction"), "{reason}");
+                // The reason names the id and nothing else about the value.
+                assert!(!reason.contains("cf-secret-1234"), "{reason}");
+            }
+            other => panic!("expected a skip, got {other:?}"),
+        }
+        // One refusal does not abort the file half — which is why the count
+        // has to survive into the report at all.
+        assert!(report.written() >= 6, "{report:?}");
+    }
+
+    #[test]
+    fn test_keys_only_restores_the_vault_and_touches_nothing_else() {
+        let source = source_with_a_key();
+        crate::migrate::export::tests::seed_env_vault(
+            &source.envs,
+            &source.home.join("repos/pathors"),
+        );
+        let payload = source.payload(KeySelection::All);
+
+        let dest = Machine::new(&[]);
+        let report = dest
+            .try_import(
+                &payload,
+                &ImportOptions {
+                    keys_only: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(dest.vault.get_secret("cf-api").unwrap(), "cf-secret-1234");
+        assert!(report.files.is_empty());
+        assert!(report.mcp.is_empty());
+        assert!(report.env_projects.is_empty());
+        assert!(!dest.exists(".aws/config"));
+        assert!(dest.envs.projects().unwrap().is_empty());
+        assert!(
+            report.notes.iter().any(|n| n.contains("--keys-only")),
+            "{:?}",
+            report.notes
+        );
     }
 
     #[test]

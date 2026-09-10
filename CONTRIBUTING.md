@@ -27,6 +27,7 @@ cd app
 bun install
 bunx tauri dev      # panel + hot-reloading front end
 bunx tauri build    # bundle a .app / .dmg
+bun run test        # the front end's vitest suite (`--run` for one pass)
 ```
 
 ## Before you open a PR

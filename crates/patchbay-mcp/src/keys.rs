@@ -844,9 +844,10 @@ to the user about. A 'suggested' name is in neither: it is waiting on a human to
 ASK THE ISSUER whether a registered key still works. NOT gated: this returns a verdict, never \
 the value, so it is safe to call whenever the answer would change what you do.
 
-Makes one outbound HTTPS request to the provider using the stored secret, which patchbay reads \
-internally and never returns to you. Seconds, not milliseconds. Providers patchbay can \
-interrogate today: cloudflare and github. Anything else comes back 'unsupported'.
+Makes an outbound HTTPS request to the provider using the stored secret, which patchbay reads \
+internally and never returns to you — sometimes a second one, where the first answer does not \
+settle it. Seconds, not milliseconds. Providers patchbay can interrogate today: cloudflare and \
+github. Anything else comes back 'unsupported'.
 
 Call it when the user asks whether a key is still good, before relying on a key for something \
 expensive or destructive, or when an operation failed with something that smells like a bad \
@@ -862,6 +863,10 @@ expiry to the user when it is close.
 - 'invalid' — the issuer rejected it: revoked, deleted, disabled, or never real. Say so \
 plainly; the user needs to rotate it, and then re-register with store_key + overwrite.
 - 'expired' — the issuer knows it, its lifetime is over. Same action: rotate and re-store.
+- 'inconclusive' — the provider answered, and its answer fits a live key as well as a dead one. \
+A Cloudflare token scoped to one product is rejected by the same response a revoked token gets, \
+so patchbay declines to guess. Do NOT report this as a dead credential and do NOT advise \
+rotating; say patchbay could not tell, and that the token's own dashboard page can.
 - 'unsupported' — patchbay has no verification path for this provider. A normal answer, not a \
 failure. Do not retry; point the user at the provider's dashboard.
 - 'unreachable' — the provider could not be reached (DNS, timeout, rate limit, 5xx). This says \

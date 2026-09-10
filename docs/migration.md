@@ -12,6 +12,8 @@ with the exact command for every gap.
 ```sh
 # old machine
 pb export                       # -> patchbay-2026-08-13.pbx, encrypted
+                                #  + patchbay-2026-08-13-SETUP.md, in the clear:
+                                #    how to install pb on a machine with no pb
 
 # copy it across by AirDrop / USB / LAN — not by cloud sync
 
@@ -52,6 +54,7 @@ into a chat with your agent:
 | encrypted | yes, passphrase required | no — there is nothing to encrypt |
 | safe to commit | **no** | yes |
 | refuses a cloud-sync folder | yes | no; that is where it belongs |
+| readable without patchbay | only the `<bundle>-SETUP.md` sidecar: install commands, nothing about the machine | the whole file; that is the point of it |
 
 One thing does travel verbatim that is worth knowing about: a key's `purpose`
 note is free text written by whoever registered it. patchbay never puts a secret
@@ -84,6 +87,13 @@ One encrypted file, four parts:
    See [below](#the-project-env-vault).
 
 Parts 3 and 4 live *inside* the encrypted payload and are written out on import.
+
+Part 4 is *also* written outside it, as a cleartext `<bundle>-SETUP.md` beside
+the file. Instructions for installing `pb` that need a `pb` to be read are not
+instructions: on a real move the receiving Mac had neither, and the install
+command was looked up on the releases page by hand. So the sidecar carries the
+install step and the `pb import` line, and nothing else — no inventory, no tool
+list, no key id, no variable name. Assume it will be pasted into a chat.
 
 ## The project env vault
 
@@ -172,7 +182,12 @@ reason next to it. A probe added without a policy fails the build's
 
 - **Encryption** is `age` with a passphrase (scrypt recipient) — no key files to
   manage or lose. Prompted twice on export, hidden, never taken as an argument:
-  argv is visible to `ps` and lands in your shell history.
+  argv is visible to `ps` and lands in your shell history. Automation names a
+  source instead of being blocked — `--passphrase-file <path>`, which refuses a
+  file anybody else can read because with that flag the file *is* the secret, or
+  `--passphrase-fd <n>`, the way gpg, restic and age do it. A documented path
+  matters here: the refusal these replace was worked around with a pty wrapper,
+  which echoed the passphrase into a log.
 - **The bundle is `0600`** and starts with a 19-byte cleartext header
   (`patchbay-bundle/1`) so a version skew is refused before you type a
   passphrase. Nothing else about it is readable.
@@ -203,7 +218,25 @@ reason next to it. A probe added without a policy fails the build's
   `AWS_SHARED_CREDENTIALS_FILE` or a `[paths]` entry on the new machine decides
   where a file lands.
 - Several kubeconfigs land in one directory, with a note telling you the
-  `KUBECONFIG` line to set — kubectl only merges what the variable names.
+  `KUBECONFIG` line to set — kubectl only merges what the variable names. That
+  line does not live only in the import's output: `pb plan` re-derives it from
+  the directory, so the kubectl item carries the `export KUBECONFIG=…` itself
+  however long after the import you ask.
+- **The keychain is asked before anything is written.** A bundle carrying key
+  values starts by storing and deleting one throwaway keychain item. If that is
+  refused — on macOS every write from a session with no desktop login is, so
+  ssh and cron are — the import stops with nothing written and says to re-run
+  from a Terminal in your own desktop session. The ordering is the whole point:
+  the files are restored before the secrets, so without the probe an import over
+  ssh copies every credential file, drops every secret and exits 0. `--dry-run`
+  cannot ask, because asking is a write, and says so instead of guessing.
+- **An import that lost a secret exits 1**, like `pb plan`, so
+  `pb import x.pbx && ./something` does the obvious thing. Everything landed or
+  `unchanged` exits 0.
+- **`pb import <bundle> --keys-only`** restores the vault half alone — no files,
+  no MCP registrations, no env projects — which is how the move is finished once
+  the session is fixed. The file half is idempotent anyway, so a plain re-run is
+  just as safe.
 
 ## The AI-guided half
 

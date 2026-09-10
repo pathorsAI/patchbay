@@ -408,6 +408,28 @@ impl KeyRegistry {
 
     // --- writes -------------------------------------------------------------
 
+    /// Whether the keystore would accept a write at all, right now.
+    ///
+    /// There is no way to ask a keychain this except by trying, so a throwaway
+    /// item is stored and deleted again. It is filed under an id
+    /// [`validate_id`] refuses, so it can never collide with a registered key,
+    /// and it carries no credential material.
+    ///
+    /// [`crate::migrate::import`] asks before it restores anything: on macOS a
+    /// keychain refuses *every* write from a session with no desktop login
+    /// (ssh, cron), and discovering that one key at a time — after the
+    /// credential files have already landed — is how a machine ends up half
+    /// migrated.
+    pub fn probe_writable(&self) -> anyhow::Result<()> {
+        const PROBE_ID: &str = ".patchbay-write-probe";
+        self.store.put(PROBE_ID, "probe")?;
+        // The question has been answered by the line above. A delete that then
+        // fails leaves one valueless item behind, which is not worth turning a
+        // successful probe into a refusal.
+        let _ = self.store.delete(PROBE_ID);
+        Ok(())
+    }
+
     /// Register a key: metadata to disk, value to the keystore.
     ///
     /// Both or neither. The metadata file is written first; if the keystore
@@ -969,6 +991,20 @@ mod tests {
         assert_eq!(entry.source, "mcp:claude");
         assert_eq!(v.registry.list().unwrap().len(), 1);
         assert_eq!(v.store.get("dup").unwrap().as_deref(), Some("second-2222"));
+    }
+
+    #[test]
+    fn test_a_write_probe_leaves_neither_a_key_nor_a_stored_value() {
+        let v = vault();
+        v.registry.probe_writable().unwrap();
+        assert!(v.registry.list().unwrap().is_empty());
+        assert!(!v.registry.path().exists(), "the probe wrote metadata");
+        assert!(v.store.is_empty(), "the probe left its throwaway item");
+
+        // And a store that refuses writes says so, which is the answer an
+        // import needs before it touches a single file.
+        let refusing = vault_with(MemoryKeystore::failing_put());
+        assert!(refusing.registry.probe_writable().is_err());
     }
 
     #[test]

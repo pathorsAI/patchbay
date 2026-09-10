@@ -13,6 +13,11 @@
 //! 4. **`SETUP.md`** — written at export time so a machine with no patchbay on
 //!    it yet still has instructions.
 //!
+//! One thing is written *outside* the bundle: a cleartext `-SETUP.md` sidecar
+//! ([`sidecar_path`]) holding the install step and the import line, and nothing
+//! else. `SETUP.md` inside the payload cannot be read without a `pb`, which
+//! makes its own first step circular on the one machine that needs it.
+//!
 //! And one thing that travels as *metadata only, by construction*: the env
 //! vault's project manifest ([`crate::envs`]). Ids, environments, sync pins —
 //! never a value, and never this machine's `attachments.json`, whose paths mean
@@ -74,6 +79,9 @@ impl KeySelection {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExportReport {
     pub path: PathBuf,
+    /// The cleartext install instructions written beside the bundle. `None`
+    /// when that write failed — a warning says so, and the bundle is fine.
+    pub sidecar: Option<PathBuf>,
     pub files: usize,
     pub bytes: usize,
     /// Tools with at least one file in the bundle.
@@ -102,6 +110,18 @@ pub fn default_file_name(now: DateTime<Utc>) -> String {
         now.format("%Y-%m-%d"),
         bundle::BUNDLE_EXTENSION
     )
+}
+
+/// `patchbay-2026-08-13-SETUP.md` beside `patchbay-2026-08-13.pbx`.
+///
+/// Beside rather than inside, because this is the copy for a machine that has
+/// nothing yet: see [`setup::sidecar`] for what may be in it.
+pub fn sidecar_path(bundle: &Path) -> PathBuf {
+    let stem = bundle
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "patchbay".to_string());
+    bundle.with_file_name(format!("{stem}-SETUP.md"))
 }
 
 /// Directory names that mean "this file is about to be uploaded".
@@ -629,8 +649,26 @@ pub fn write(
     force: bool,
     work_factor: Option<u8>,
 ) -> anyhow::Result<ExportReport> {
-    let warnings = check_destination(path, force)?;
+    let mut warnings = check_destination(path, force)?;
     bundle::write(path, payload, passphrase, work_factor)?;
+
+    // The install step, in the clear, next to the file it explains. Not 0600
+    // and not encrypted on purpose: it holds no inventory and no name from this
+    // machine, and the whole reason it exists is to be readable by a laptop
+    // with no `pb` on it.
+    let sidecar = sidecar_path(path);
+    let mut sidecar_written = Some(sidecar.clone());
+    if let Err(e) = std::fs::write(&sidecar, setup::sidecar(&file_name(path))) {
+        // The bundle is already on disk and is the half that matters. Failing
+        // the export here would report that nothing was written when in fact
+        // every credential was packed.
+        warnings.push(format!(
+            "could not write the install instructions to {}: {e}. The bundle itself is fine — the \
+             same instructions are in `SETUP.md` inside it, once there is a `pb` to read them",
+            sidecar.display()
+        ));
+        sidecar_written = None;
+    }
 
     let mut tools_carried: Vec<String> = Vec::new();
     for file in &payload.files {
@@ -649,6 +687,7 @@ pub fn write(
 
     Ok(ExportReport {
         path: path.to_path_buf(),
+        sidecar: sidecar_written,
         files: payload.files.len(),
         bytes: payload.bytes_carried(),
         tools_carried,
@@ -673,6 +712,13 @@ pub fn write(
         gaps: payload.manifest.gaps.len(),
         warnings,
     })
+}
+
+/// The bundle's own name, for the import line in the sidecar.
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "<bundle>".to_string())
 }
 
 #[cfg(test)]
@@ -1212,6 +1258,43 @@ pub(crate) mod tests {
         assert!(report.keys_included.is_empty());
         assert!(report.warnings[0].contains("AirDrop"));
         assert!(path.is_file());
+    }
+
+    #[test]
+    fn test_the_install_instructions_land_beside_the_bundle_in_the_clear() {
+        let home = machine();
+        let out = tempfile::tempdir().unwrap();
+        let (paths, registry, vault, clients, envs) = exporter_parts(home.path());
+        vault
+            .add(
+                crate::keys::NewKey::new("cf-api", "cli").provider("cloudflare"),
+                "cf-secret-1234",
+                false,
+            )
+            .unwrap();
+        let payload = Exporter {
+            paths: &paths,
+            registry: &registry,
+            vault: &vault,
+            clients: &clients,
+            envs: &envs,
+        }
+        .payload(&KeySelection::All, Utc::now())
+        .unwrap();
+
+        let path = out.path().join("patchbay-2026-08-13.pbx");
+        let report = write(&path, &payload, "pass", false, Some(10)).unwrap();
+
+        let beside = report.sidecar.expect("the sidecar is the point of this");
+        assert_eq!(beside, out.path().join("patchbay-2026-08-13-SETUP.md"));
+        let text = std::fs::read_to_string(&beside).unwrap();
+        assert!(text.contains("releases/download"), "{text}");
+        assert!(text.contains("pb import patchbay-2026-08-13.pbx"), "{text}");
+        // It sits in the clear next to the bundle, so it carries nothing from
+        // the machine that wrote it — not a tool name, not a key id.
+        for forbidden in ["aws", "gcloud", "kubectl", "cf-api", "1234"] {
+            assert!(!text.contains(forbidden), "`{forbidden}` in:\n{text}");
+        }
     }
 
     #[test]

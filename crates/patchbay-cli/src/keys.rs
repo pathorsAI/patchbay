@@ -21,6 +21,7 @@ use patchbay_core::keys::{
     NewKey,
 };
 use patchbay_core::keys_verify::{verify_key, KeyVerifyOutcome, KeyVerifyStatus};
+use patchbay_core::run_bounded;
 
 use crate::render::{self, Styles};
 
@@ -37,7 +38,16 @@ const COL_ENV_MAX: usize = 22;
 const COL_LABEL_MAX: usize = 18;
 /// Width of the field-name column in `pb key edit`'s report of what changed.
 const FIELD_COL: usize = 9;
+/// Width of the verdict column in a `pb key verify` sweep: `inconclusive`, the
+/// longest label there is.
+const COL_VERDICT: usize = 12;
 const DASH: &str = "—";
+
+/// How many issuers a sweep talks to at once. Sixty round trips one after
+/// another is a minute of watching a cursor; the ceiling is there because a
+/// burst of parallel requests from one machine is what rate limiters exist to
+/// notice, and it matches the one the version check already settled on.
+const VERIFY_THREADS: usize = 8;
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
@@ -75,19 +85,16 @@ pub enum Command {
         #[arg(last = true, required = true, value_name = "CMD")]
         command: Vec<String>,
     },
-    /// Ask the issuer whether a key still works.
+    /// Ask the issuers whether keys still work.
     ///
-    /// Exit codes: 0 verified (or nothing patchbay can check), 1 the provider
-    /// says the key is dead, 2 the provider could not be reached.
-    Verify {
-        id: String,
-        #[arg(long)]
-        json: bool,
-        /// Report only: do not write the issuer's expiry and scopes back into
-        /// the registry.
-        #[arg(long)]
-        no_update: bool,
-    },
+    /// Exit codes: 1 a provider says one of them is dead, 2 nothing is dead but
+    /// a provider could not be reached, 0 everything else — including the keys
+    /// patchbay has no way to check.
+    #[command(after_help = "Examples:\n  \
+        pb key verify cf-r2-token-sonarqube-backups\n  \
+        pb key verify cf-api gh-pat neon-api-key\n  \
+        pb key verify --all")]
+    Verify(VerifyArgs),
     /// Unregister a key: metadata entry and keychain item both.
     Rm {
         id: String,
@@ -95,6 +102,28 @@ pub enum Command {
         #[arg(long)]
         yes: bool,
     },
+}
+
+/// Everything `pb key verify` takes.
+///
+/// Ids are plural because they have to be: a vault of sixty keys and a checker
+/// that answers one question per invocation is a checker nobody runs.
+#[derive(Args, Debug)]
+pub struct VerifyArgs {
+    /// Keys to check. Leave empty only with `--all`.
+    #[arg(value_name = "ID", required_unless_present = "all")]
+    ids: Vec<String>,
+    /// Check every registered key.
+    #[arg(long, conflicts_with = "ids")]
+    all: bool,
+    /// The verdicts as JSON: a list when several keys were asked about, the
+    /// bare object when it was one.
+    #[arg(long)]
+    json: bool,
+    /// Report only: do not write the issuer's expiry and scopes back into
+    /// the registry.
+    #[arg(long)]
+    no_update: bool,
 }
 
 /// Everything `pb key add` takes. The secret is deliberately absent: it is
@@ -213,11 +242,7 @@ pub fn run(command: Command, styles: &Styles) -> Result<i32> {
             aliases,
             command,
         } => run_command(&registry, &keys, &aliases, &command),
-        Command::Verify {
-            id,
-            json,
-            no_update,
-        } => verify(&registry, &id, json, no_update, styles),
+        Command::Verify(args) => verify(&registry, args, styles),
         Command::Rm { id, yes } => rm(&registry, &id, yes),
     }
 }
@@ -370,46 +395,248 @@ fn rm(registry: &KeyRegistry, id: &str, yes: bool) -> Result<i32> {
 // verify
 // ---------------------------------------------------------------------------
 
-/// `pb key verify` — ask the issuer, then report (and usually record) what it
-/// said. Returns the exit code the subcommand's own docs promise.
-fn verify(
-    registry: &KeyRegistry,
-    id: &str,
-    json: bool,
-    no_update: bool,
-    styles: &Styles,
-) -> Result<i32> {
-    let entry = registry
-        .get(id)?
-        .ok_or_else(|| anyhow::anyhow!("no key registered as `{id}`"))?;
-    // The secret lives for exactly this call and is never printed.
-    let secret = registry.get_secret(id)?;
-    let outcome = verify_key(&entry, &secret);
-    drop(secret);
+/// `pb key verify` — ask the issuers, then report (and usually record) what
+/// they said.
+fn verify(registry: &KeyRegistry, args: VerifyArgs, styles: &Styles) -> Result<i32> {
+    let VerifyArgs {
+        ids,
+        all,
+        json,
+        no_update,
+    } = args;
 
-    let updated = if no_update {
-        Vec::new()
-    } else {
-        absorb(registry, &entry, &outcome)?
-    };
-
-    if json {
-        let mut value = serde_json::to_value(&outcome)?;
-        if let Some(map) = value.as_object_mut() {
-            map.insert("id".into(), entry.id.clone().into());
-            map.insert("provider".into(), entry.provider.clone().into());
-            map.insert("metadata_updated".into(), updated.clone().into());
-        }
-        println!("{}", serde_json::to_string_pretty(&value)?);
-    } else {
-        print_verify(&entry, &outcome, &updated, styles);
+    let entries = verify_targets(registry, &ids, all)?;
+    if entries.is_empty() {
+        // Only reachable through `--all`. An id nobody registered is an error;
+        // an empty vault is not.
+        println!("no keys registered yet");
+        return Ok(0);
     }
-    Ok(match outcome.status {
-        KeyVerifyStatus::Valid | KeyVerifyStatus::Unsupported => 0,
-        KeyVerifyStatus::Invalid | KeyVerifyStatus::Expired => 1,
-        // Distinct from 1: nothing was learned about the key.
-        KeyVerifyStatus::Unreachable => 2,
+
+    let outcomes = verify_outcomes(registry, &entries)?;
+    let updated = absorb_all(registry, &entries, &outcomes, no_update)?;
+
+    // One key asked about by name keeps the answer it has always had: a full
+    // block, and a bare object under `--json` that existing readers can still
+    // index into. `--all` is a sweep and always answers as a list.
+    let sweep = all || entries.len() > 1;
+    if json {
+        print_verify_json(&entries, &outcomes, &updated, sweep)?;
+    } else if sweep {
+        print_verify_sweep(&entries, &outcomes, &updated, styles);
+    } else {
+        print_verify(&entries[0], &outcomes[0], &updated[0], styles);
+    }
+    Ok(verify_exit_code(&outcomes))
+}
+
+/// The keys a run is about: everything registered under `--all`, otherwise the
+/// ones named on the command line.
+///
+/// A named id nobody registered stops the run here rather than being filed as a
+/// verdict, because it is a question patchbay cannot answer, not an answer.
+fn verify_targets(registry: &KeyRegistry, ids: &[String], all: bool) -> Result<Vec<KeyEntry>> {
+    if all {
+        return registry.list();
+    }
+    ids.iter()
+        .map(|id| {
+            registry
+                .get(id)?
+                .ok_or_else(|| anyhow::anyhow!("no key registered as `{id}`"))
+        })
+        .collect()
+}
+
+/// Ask every issuer, a bounded number of them at a time.
+///
+/// Each secret is read inside the closure and dropped there, so even a sweep of
+/// the whole vault never holds more than VERIFY_THREADS of them at once, and
+/// none of them outlives its own request.
+///
+/// A value patchbay registered but cannot read back is a broken vault, not a
+/// verdict about a key, so it stops the sweep instead of being filed as one.
+fn verify_outcomes(registry: &KeyRegistry, entries: &[KeyEntry]) -> Result<Vec<KeyVerifyOutcome>> {
+    run_bounded(entries, VERIFY_THREADS, |entry| {
+        let secret = registry.get_secret(&entry.id)?;
+        let outcome = verify_key(entry, &secret);
+        drop(secret);
+        Ok(outcome)
     })
+    .into_iter()
+    .collect()
+}
+
+/// What [`absorb`] wrote back for each key, in step with `entries`. `--no-update`
+/// is a report-only run, so nothing is written and every key reports nothing.
+///
+/// Write-backs stay on this thread: they rewrite one metadata file, and eight
+/// threads doing that would be eight chances to lose an entry.
+fn absorb_all(
+    registry: &KeyRegistry,
+    entries: &[KeyEntry],
+    outcomes: &[KeyVerifyOutcome],
+    no_update: bool,
+) -> Result<Vec<Vec<String>>> {
+    let mut updated: Vec<Vec<String>> = Vec::new();
+    for (entry, outcome) in entries.iter().zip(outcomes) {
+        updated.push(if no_update {
+            Vec::new()
+        } else {
+            absorb(registry, entry, outcome)?
+        });
+    }
+    Ok(updated)
+}
+
+/// The verdicts as `--json`: a list for a sweep, the bare object for the one key
+/// that was asked about by name.
+fn print_verify_json(
+    entries: &[KeyEntry],
+    outcomes: &[KeyVerifyOutcome],
+    updated: &[Vec<String>],
+    sweep: bool,
+) -> Result<()> {
+    let mut values = Vec::new();
+    for ((entry, outcome), updated) in entries.iter().zip(outcomes).zip(updated) {
+        values.push(verify_json(entry, outcome, updated)?);
+    }
+    let value = if sweep {
+        serde_json::Value::Array(values)
+    } else {
+        values.remove(0)
+    };
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+/// A sweep: one line per key, then the tally.
+fn print_verify_sweep(
+    entries: &[KeyEntry],
+    outcomes: &[KeyVerifyOutcome],
+    updated: &[Vec<String>],
+    styles: &Styles,
+) {
+    let id_w = entries
+        .iter()
+        .map(|e| e.id.chars().count())
+        .max()
+        .unwrap_or_default();
+    for ((entry, outcome), updated) in entries.iter().zip(outcomes).zip(updated) {
+        println!("{}", verify_line(entry, outcome, id_w, styles));
+        // The one thing a sweep must not do quietly. Rare, because it only
+        // fires when the issuer knows something the registry did not.
+        if !updated.is_empty() {
+            println!(
+                "  updated the registry from the provider: {}",
+                updated.join(", ")
+            );
+        }
+    }
+    println!("{}", verify_summary(outcomes));
+}
+
+/// Three answers, because a script gating on this needs three.
+///
+/// `1` is the only one that means a key is dead, and it outranks everything: a
+/// sweep that found one revoked token and lost the wifi halfway through is
+/// still a sweep that found a revoked token. `2` is the honest answer when the
+/// worst thing that happened was not being able to ask, which is neither a
+/// clean bill of health nor a reason to rotate anything.
+///
+/// `inconclusive` and `unsupported` leave `0`, because both are patchbay
+/// declining to answer about a key that gave it no reason for concern — and a
+/// vault that is mostly providers patchbay cannot interrogate would otherwise
+/// never exit clean.
+fn verify_exit_code(outcomes: &[KeyVerifyOutcome]) -> i32 {
+    if outcomes.iter().any(|o| o.status.is_bad_news()) {
+        1
+    } else if outcomes
+        .iter()
+        .any(|o| o.status == KeyVerifyStatus::Unreachable)
+    {
+        2
+    } else {
+        0
+    }
+}
+
+/// One verdict as `--json`: the outcome, plus who it is about.
+fn verify_json(
+    entry: &KeyEntry,
+    outcome: &KeyVerifyOutcome,
+    updated: &[String],
+) -> Result<serde_json::Value> {
+    let mut value = serde_json::to_value(outcome)?;
+    if let Some(map) = value.as_object_mut() {
+        map.insert("id".into(), entry.id.clone().into());
+        map.insert("provider".into(), entry.provider.clone().into());
+        map.insert("metadata_updated".into(), updated.to_vec().into());
+    }
+    Ok(value)
+}
+
+/// One key's row in a sweep: the same verdict voice as the single-key report,
+/// with the provider's message trimmed to whatever the line has left.
+///
+/// The id is never truncated, however wide it makes the column: the next thing
+/// anyone does with a bad row is paste that id into another `pb key` command.
+fn verify_line(
+    entry: &KeyEntry,
+    outcome: &KeyVerifyOutcome,
+    id_w: usize,
+    styles: &Styles,
+) -> String {
+    let verdict = styles.paint(
+        verdict_style(outcome.status),
+        &pad(outcome.status.label(), COL_VERDICT),
+    );
+    let detail_w = TABLE_WIDTH
+        .saturating_sub(id_w + COL_VERDICT + GAP * 2)
+        .max(20);
+    let detail = render::truncate(&one_line(&outcome.detail), detail_w);
+    let gap = " ".repeat(GAP);
+    format!("{}{gap}{verdict}{gap}{detail}", pad(&entry.id, id_w))
+        .trim_end()
+        .to_string()
+}
+
+/// The tally that closes a sweep. Worst news first, and silent about the
+/// verdicts nothing came back as.
+fn verify_summary(outcomes: &[KeyVerifyOutcome]) -> String {
+    const WORST_FIRST: [KeyVerifyStatus; 6] = [
+        KeyVerifyStatus::Invalid,
+        KeyVerifyStatus::Expired,
+        KeyVerifyStatus::Inconclusive,
+        KeyVerifyStatus::Unreachable,
+        KeyVerifyStatus::Unsupported,
+        KeyVerifyStatus::Valid,
+    ];
+    let tally: Vec<String> = WORST_FIRST
+        .iter()
+        .filter_map(|status| {
+            let n = outcomes.iter().filter(|o| o.status == *status).count();
+            (n > 0).then(|| format!("{n} {}", status.label()))
+        })
+        .collect();
+    format!(
+        "checked {} {}: {}",
+        outcomes.len(),
+        if outcomes.len() == 1 { "key" } else { "keys" },
+        tally.join(", ")
+    )
+}
+
+/// The colour a verdict draws in: green for good news, red for bad, and dim
+/// for the answers that are not about the key at all.
+fn verdict_style(status: KeyVerifyStatus) -> anstyle::Style {
+    match status {
+        KeyVerifyStatus::Valid => green(),
+        KeyVerifyStatus::Invalid | KeyVerifyStatus::Expired => red(),
+        KeyVerifyStatus::Inconclusive
+        | KeyVerifyStatus::Unsupported
+        | KeyVerifyStatus::Unreachable => dim(),
+    }
 }
 
 /// Write back what the issuer just told us, and report what changed.
@@ -446,16 +673,11 @@ fn absorb(
 }
 
 fn print_verify(entry: &KeyEntry, outcome: &KeyVerifyOutcome, updated: &[String], styles: &Styles) {
-    let style = match outcome.status {
-        KeyVerifyStatus::Valid => green(),
-        KeyVerifyStatus::Invalid | KeyVerifyStatus::Expired => red(),
-        KeyVerifyStatus::Unsupported | KeyVerifyStatus::Unreachable => dim(),
-    };
     println!(
         "{} (…{}) — {}",
         entry.id,
         entry.last4,
-        styles.paint(style, outcome.status.label())
+        styles.paint(verdict_style(outcome.status), outcome.status.label())
     );
     println!("  {}", one_line(&outcome.detail));
 
@@ -475,7 +697,14 @@ fn print_verify(entry: &KeyEntry, outcome: &KeyVerifyOutcome, updated: &[String]
             updated.join(", ")
         );
     }
-    if outcome.status == KeyVerifyStatus::Unsupported && entry.endpoint.is_none() {
+    // `unsupported` covers two different situations: an issuer patchbay cannot
+    // interrogate at all, and one it could if it had an address. Only the
+    // second wants an endpoint, and the way to tell them apart is that the
+    // provider's own message asked for one.
+    if outcome.status == KeyVerifyStatus::Unsupported
+        && entry.endpoint.is_none()
+        && outcome.detail.contains("--endpoint")
+    {
         println!(
             "  set one with: pb key add {} --provider {} --endpoint <url> --overwrite",
             entry.id, entry.provider
@@ -483,6 +712,9 @@ fn print_verify(entry: &KeyEntry, outcome: &KeyVerifyOutcome, updated: &[String]
     }
     if outcome.status == KeyVerifyStatus::Unreachable {
         println!("  the key was not tested — this is a connection problem, not a verdict");
+    }
+    if outcome.status == KeyVerifyStatus::Inconclusive {
+        println!("  patchbay is not saying the key is dead — it is saying it cannot tell");
     }
 }
 
@@ -1166,6 +1398,7 @@ mod tests {
         for status in [
             KeyVerifyStatus::Unreachable,
             KeyVerifyStatus::Unsupported,
+            KeyVerifyStatus::Inconclusive,
             KeyVerifyStatus::Invalid,
             KeyVerifyStatus::Expired,
         ] {
@@ -1202,6 +1435,138 @@ mod tests {
         assert_eq!(
             registry.get("cf-api").unwrap().unwrap().scopes,
             vec!["workers:edit"]
+        );
+    }
+
+    /// `pb key …` as clap sees it, without standing up the whole `pb` parser.
+    #[derive(clap::Parser, Debug)]
+    struct KeyCli {
+        #[command(subcommand)]
+        command: Command,
+    }
+
+    fn parse_verify(argv: &[&str]) -> Result<VerifyArgs, clap::Error> {
+        use clap::Parser;
+        match KeyCli::try_parse_from(argv)?.command {
+            Command::Verify(args) => Ok(args),
+            other => panic!("expected verify, parsed {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_verify_takes_a_list_of_ids_and_all_takes_none() {
+        // What this replaces: `pb key verify a b c` was "unexpected argument
+        // 'b' found", which made a 64-key vault 64 invocations.
+        let args = parse_verify(&["pb", "verify", "a", "b", "c"]).unwrap();
+        assert_eq!(args.ids, vec!["a", "b", "c"]);
+        assert!(!args.all);
+
+        let args = parse_verify(&["pb", "verify", "--all"]).unwrap();
+        assert!(args.all && args.ids.is_empty());
+
+        // Naming nothing is a mistake, not a sweep, and naming ids alongside
+        // `--all` is two different questions at once.
+        assert!(parse_verify(&["pb", "verify"]).is_err());
+        assert!(parse_verify(&["pb", "verify", "--all", "a"]).is_err());
+    }
+
+    #[test]
+    fn test_a_sweep_line_keeps_the_whole_id_and_spends_what_is_left_on_the_detail() {
+        let long = "cf-r2-token-sonarqube-backups";
+        let id_w = long.chars().count();
+        let mut wordy = outcome(KeyVerifyStatus::Inconclusive);
+        wordy.detail = "Cloudflare said `Invalid API Token` to both checks patchbay can make, \
+                        and a token scoped to one product answers exactly like a revoked one"
+            .to_string();
+
+        let line = verify_line(&entry(long, None), &wordy, id_w, &Styles::new(false));
+        assert!(line.starts_with(long), "the id must survive intact: {line}");
+        assert!(line.contains("inconclusive"), "{line}");
+        assert!(line.ends_with('…'), "a long detail is trimmed, not wrapped");
+        assert!(line.chars().count() <= TABLE_WIDTH, "{line}");
+
+        // A shorter id in the same sweep still lines its verdict up with the
+        // widest one's.
+        let short = verify_line(
+            &entry("cf-api", None),
+            &outcome(KeyVerifyStatus::Valid),
+            id_w,
+            &Styles::new(false),
+        );
+        assert_eq!(
+            short.find("valid").unwrap(),
+            line.find("inconclusive").unwrap(),
+            "{short}\n{line}"
+        );
+    }
+
+    #[test]
+    fn test_the_sweep_summary_leads_with_the_bad_news_and_names_only_what_came_back() {
+        let outcomes = vec![
+            outcome(KeyVerifyStatus::Valid),
+            outcome(KeyVerifyStatus::Valid),
+            outcome(KeyVerifyStatus::Unsupported),
+            outcome(KeyVerifyStatus::Inconclusive),
+            outcome(KeyVerifyStatus::Invalid),
+        ];
+        assert_eq!(
+            verify_summary(&outcomes),
+            "checked 5 keys: 1 invalid, 1 inconclusive, 1 unsupported, 2 valid"
+        );
+        assert_eq!(
+            verify_summary(&[outcome(KeyVerifyStatus::Valid)]),
+            "checked 1 key: 1 valid"
+        );
+    }
+
+    #[test]
+    fn test_only_a_provider_saying_a_key_is_dead_fails_the_command() {
+        for status in [
+            KeyVerifyStatus::Valid,
+            KeyVerifyStatus::Unsupported,
+            KeyVerifyStatus::Inconclusive,
+        ] {
+            assert_eq!(verify_exit_code(&[outcome(status)]), 0, "{status:?}");
+        }
+        for status in [KeyVerifyStatus::Invalid, KeyVerifyStatus::Expired] {
+            assert_eq!(verify_exit_code(&[outcome(status)]), 1, "{status:?}");
+        }
+        // One dead key does not get lost in a sweep of good ones.
+        assert_eq!(
+            verify_exit_code(&[
+                outcome(KeyVerifyStatus::Valid),
+                outcome(KeyVerifyStatus::Expired),
+                outcome(KeyVerifyStatus::Unsupported),
+            ]),
+            1
+        );
+    }
+
+    #[test]
+    fn test_a_provider_that_could_not_be_reached_is_its_own_exit_code() {
+        // Neither a clean bill of health nor a reason to rotate: a script that
+        // gates on this needs to be able to tell "nothing wrong" from "could
+        // not ask".
+        assert_eq!(
+            verify_exit_code(&[outcome(KeyVerifyStatus::Unreachable)]),
+            2
+        );
+        assert_eq!(
+            verify_exit_code(&[
+                outcome(KeyVerifyStatus::Valid),
+                outcome(KeyVerifyStatus::Unreachable),
+                outcome(KeyVerifyStatus::Inconclusive),
+            ]),
+            2
+        );
+        // Bad news outranks it. A sweep that found a revoked token and then
+        // lost the wifi still found a revoked token.
+        assert_eq!(
+            verify_exit_code(&[
+                outcome(KeyVerifyStatus::Unreachable),
+                outcome(KeyVerifyStatus::Invalid),
+            ]),
+            1
         );
     }
 
