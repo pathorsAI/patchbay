@@ -40,13 +40,12 @@ pub fn plan(
     envs: &EnvRegistry,
     manifest: Option<&Manifest>,
 ) -> Vec<SetupItem> {
-    let _ = paths;
     let mut items = Vec::new();
     let statuses = registry.status_all();
 
     for status in &statuses {
         let expected = manifest.and_then(|m| m.tool(&status.tool));
-        items.extend(tool_items(status, expected));
+        items.extend(tool_items(paths, status, expected));
     }
     items.extend(key_items(vault, manifest));
     items.extend(mcp_items(clients, manifest));
@@ -85,7 +84,7 @@ fn source_had_something(expected: Option<&ToolRecord>, status: &ToolStatus) -> b
     }
 }
 
-fn tool_items(status: &ToolStatus, expected: Option<&ToolRecord>) -> Vec<SetupItem> {
+fn tool_items(paths: &Paths, status: &ToolStatus, expected: Option<&ToolRecord>) -> Vec<SetupItem> {
     let Some(policy) = policy_for(&status.tool) else {
         return Vec::new();
     };
@@ -180,6 +179,9 @@ fn tool_items(status: &ToolStatus, expected: Option<&ToolRecord>) -> Vec<SetupIt
             ));
         }
     }
+    if status.tool == "kubectl" && login_status == SetupStatus::Open {
+        login = kubeconfig_fix(paths, login);
+    }
     items.push(login);
 
     // 3. Logged in, but as somebody else. patchbay can fix this one itself.
@@ -206,6 +208,62 @@ fn tool_items(status: &ToolStatus, expected: Option<&ToolRecord>) -> Vec<SetupIt
         }
     }
     items
+}
+
+/// Replace kubectl's login command with the `KUBECONFIG` line the files on this
+/// machine actually need — the one gap an import *creates*.
+///
+/// Several kubeconfigs land in one directory and kubectl merges only what the
+/// variable names, so the fix is a shell line rather than a login. The import
+/// says so in its own output, but that has scrolled away by the time anybody
+/// runs `pb plan`, which used to offer `kubectl config get-contexts` — a
+/// command that shows the problem again rather than fixing it.
+///
+/// Nothing has to be persisted for this: the files themselves are the record,
+/// so the line is re-derived from the directory every time.
+fn kubeconfig_fix(paths: &Paths, item: SetupItem) -> SetupItem {
+    let unmerged = unmerged_kubeconfigs(paths);
+    if unmerged.is_empty() {
+        return item;
+    }
+    let dir = super::policy::Location::KubeConfigs.destination(paths, "");
+    let list: Vec<String> = unmerged.iter().map(|p| p.display().to_string()).collect();
+    item.command(format!("export KUBECONFIG={}", list.join(":")), false)
+        .detail(format!(
+            "{} kubeconfig(s) are already in {} — an import puts them there — but KUBECONFIG \
+             names none of them, and kubectl merges only the files it names",
+            unmerged.len(),
+            dir.display()
+        ))
+}
+
+/// Kubeconfigs in the directory an import restores them into that
+/// `KUBECONFIG` does not name.
+///
+/// The `.yaml`/`.yml` test is the one the kubectl probe already applies when it
+/// scans a config *directory*. Everything else in `~/.kube` — `cache/`,
+/// `http-cache/`, a `.patchbay-bak` this import wrote — is not a kubeconfig,
+/// and a `KUBECONFIG` line naming one of those is worse than none.
+fn unmerged_kubeconfigs(paths: &Paths) -> Vec<std::path::PathBuf> {
+    let named = paths.kube_configs();
+    let dir = super::policy::Location::KubeConfigs.destination(paths, "");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<std::path::PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .filter(|path| {
+            matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("yaml") | Some("yml")
+            )
+        })
+        .filter(|path| !named.contains(path))
+        .collect();
+    found.sort();
+    found
 }
 
 // ---------------------------------------------------------------------------
@@ -851,6 +909,89 @@ mod tests {
             "tool:invented",
         )
         .is_none());
+    }
+
+    /// The state the real move ended in: kubectl installed, several
+    /// kubeconfigs sitting where the import put them, and `KUBECONFIG`
+    /// naming none of them.
+    fn machine_with_loose_kubeconfigs() -> (tempfile::TempDir, Paths) {
+        let dir = tempfile::tempdir().unwrap();
+        let kube = dir.path().join(".kube");
+        fs::create_dir_all(kube.join("cache")).unwrap();
+        for name in ["prod.yaml", "staging.yaml"] {
+            fs::write(kube.join(name), "apiVersion: v1\nclusters: []\n").unwrap();
+        }
+        // Neither of these is a kubeconfig, and neither may reach the line.
+        fs::write(kube.join("config.patchbay-bak"), "apiVersion: v1\n").unwrap();
+        fs::write(kube.join("http-cache.json"), "{}").unwrap();
+
+        // `has_binary` is true under a scripted exec, which is what makes
+        // kubectl read as installed with nothing logged in.
+        let paths = Paths::for_test(dir.path())
+            .with_exec(std::sync::Arc::new(crate::util::FakeExec::new()));
+        (dir, paths)
+    }
+
+    fn plan_for(paths: &Paths) -> Vec<SetupItem> {
+        let registry = Registry::all(paths.clone());
+        let vault = KeyRegistry::new(
+            paths.home().join("keys.json"),
+            Box::new(MemoryKeystore::new()),
+        );
+        let clients = McpClientRegistry::with_paths(paths.clone());
+        let envs = EnvRegistry::new(
+            paths.home().join("projects.json"),
+            paths.home().join("attachments.json"),
+            Box::new(MemoryKeystore::new()),
+        );
+        plan(paths, &registry, &vault, &clients, &envs, None)
+    }
+
+    #[test]
+    fn test_the_kubectl_item_carries_the_kubeconfig_line_an_import_needs() {
+        let (dir, paths) = machine_with_loose_kubeconfigs();
+        let items = plan_for(&paths);
+        let kubectl = item(&items, "tool:kubectl");
+        assert!(kubectl.is_open(), "{kubectl:?}");
+
+        // The fix, not another look at the problem.
+        assert!(
+            kubectl.command.starts_with("export KUBECONFIG="),
+            "{kubectl:?}"
+        );
+        let kube = dir.path().join(".kube");
+        assert_eq!(
+            kubectl.command,
+            format!(
+                "export KUBECONFIG={}:{}",
+                kube.join("prod.yaml").display(),
+                kube.join("staging.yaml").display()
+            )
+        );
+        assert!(
+            kubectl.detail.iter().any(|d| d.contains("merges only")),
+            "{kubectl:?}"
+        );
+    }
+
+    #[test]
+    fn test_kubeconfigs_the_variable_already_names_change_nothing() {
+        let (dir, _) = machine_with_loose_kubeconfigs();
+        let kube = dir.path().join(".kube");
+        let list = format!(
+            "{}:{}",
+            kube.join("prod.yaml").display(),
+            kube.join("staging.yaml").display()
+        );
+        // Same files, this time merged: there is no gap to describe, so the
+        // item goes back to the policy's own command.
+        let paths = Paths::for_test(dir.path())
+            .with_exec(std::sync::Arc::new(crate::util::FakeExec::new()))
+            .with_env("KUBECONFIG", &list);
+        let items = plan_for(&paths);
+        let kubectl = item(&items, "tool:kubectl");
+        assert_eq!(kubectl.command, "kubectl config get-contexts");
+        assert!(kubectl.detail.is_empty(), "{kubectl:?}");
     }
 
     #[test]

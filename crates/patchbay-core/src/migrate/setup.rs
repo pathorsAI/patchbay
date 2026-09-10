@@ -7,9 +7,63 @@
 //!
 //! Same rule as the manifest it is generated from: **no secret values.** It is
 //! rendered from a [`Manifest`], which cannot contain any.
+//!
+//! One step of it is written twice. Everything here is inside the encrypted
+//! payload, which makes the first step circular — you need `pb` to read the
+//! instructions for installing `pb` — so [`sidecar`] emits that step on its own,
+//! in the clear, next to the bundle. It is the only part that may travel
+//! unencrypted, and it says nothing about the machine.
 
 use super::manifest::Manifest;
 use super::policy::{policy_for, PortabilityKind};
+
+/// The heading of the install step, so the bundle's `SETUP.md` and the
+/// cleartext [`sidecar`] name the same thing.
+const INSTALL_HEADING: &str = "Get patchbay onto this machine";
+
+/// The install commands themselves, without a heading.
+///
+/// A function rather than prose written twice: `pb export` emits these both
+/// inside the bundle and in the clear beside it, and the copy that drifted
+/// would be the one somebody was reading on a laptop with no `pb` on it.
+fn install_body() -> &'static str {
+    "```sh\n\
+     # CLI + MCP server (Apple silicon; use x86_64-apple-darwin on Intel)\n\
+     tag=v0.1.0; arch=aarch64-apple-darwin; tmp=$(mktemp -d)\n\
+     curl -fsSL \"https://github.com/pathorsAI/patchbay/releases/download/$tag/pb-$tag-$arch.tar.gz\" \\\n\
+     \x20 | tar xz -C \"$tmp\"\n\
+     sudo mv \"$tmp/pb\" /usr/local/bin/\n\
+     ```\n\n\
+     Or build it: `git clone https://github.com/pathorsAI/patchbay && cd patchbay && \
+     cargo install --path crates/patchbay-cli`.\n\n"
+}
+
+/// The install step, in the clear, to be written *beside* the bundle.
+///
+/// `SETUP.md` is the fuller document and it lives inside the encrypted
+/// payload, which makes the first step of it circular: you need `pb` to read
+/// the instructions for installing `pb`. On a real move the receiving Mac had
+/// neither, and the command was looked up on the releases page by hand.
+///
+/// So this copy is cleartext, and therefore says **nothing about the machine**
+/// — no inventory, no tool list, no key id, no variable name. It takes no
+/// [`Manifest`], which is the guarantee rather than the intention: assume it
+/// gets pasted into a chat. `bundle` is used for the import line and nothing
+/// else.
+pub fn sidecar(bundle: &str) -> String {
+    format!(
+        "# {INSTALL_HEADING}\n\n\
+         {}\
+         ## Then import\n\n\
+         ```sh\n\
+         pb import {bundle} --dry-run   # see the plan, write nothing\n\
+         pb import {bundle}             # do it\n\
+         ```\n\n\
+         The passphrase is not in this file. Everything else about the move is inside the bundle, \
+         as `SETUP.md`, which the import writes out.\n",
+        install_body()
+    )
+}
 
 /// The whole document, as Markdown.
 pub fn render(manifest: &Manifest) -> String {
@@ -23,18 +77,8 @@ pub fn render(manifest: &Manifest) -> String {
         manifest.source.patchbay_version, manifest.source.os
     ));
 
-    out.push_str(
-        "## 1. Get patchbay onto this machine\n\n\
-         ```sh\n\
-         # CLI + MCP server (Apple silicon; use x86_64-apple-darwin on Intel)\n\
-         tag=v0.1.0; arch=aarch64-apple-darwin; tmp=$(mktemp -d)\n\
-         curl -fsSL \"https://github.com/pathorsAI/patchbay/releases/download/$tag/pb-$tag-$arch.tar.gz\" \\\n\
-         \x20 | tar xz -C \"$tmp\"\n\
-         sudo mv \"$tmp/pb\" /usr/local/bin/\n\
-         ```\n\n\
-         Or build it: `git clone https://github.com/pathorsAI/patchbay && cd patchbay && \
-         cargo install --path crates/patchbay-cli`.\n\n",
-    );
+    out.push_str(&format!("## 1. {INSTALL_HEADING}\n\n"));
+    out.push_str(install_body());
 
     out.push_str(
         "## 2. Import\n\n\
@@ -299,6 +343,45 @@ mod tests {
         assert!(md.contains("pb import"), "{md}");
         assert!(md.contains("--dry-run"), "{md}");
         assert!(md.contains(".patchbay-bak"), "{md}");
+    }
+
+    #[test]
+    fn test_the_cleartext_sidecar_carries_the_install_step_and_nothing_else() {
+        let md = sidecar("patchbay-2026-08-13.pbx");
+        // The one step that cannot be read from inside the bundle.
+        assert!(md.contains("releases/download"), "{md}");
+        assert!(
+            md.contains("cargo install --path crates/patchbay-cli"),
+            "{md}"
+        );
+        assert!(md.contains("pb import patchbay-2026-08-13.pbx"), "{md}");
+
+        // Assume it is pasted into a chat. `sidecar` takes no manifest at all,
+        // which is the real guarantee; this is here so that a change which
+        // hands it one gets caught. (`gh` and `pathors` are not on the list:
+        // both are substrings of the patchbay repo URL.)
+        let manifest = manifest();
+        for forbidden in [
+            "aws",
+            "cf-api",
+            "9876",
+            "GRAFANA_TOKEN",
+            "cursor",
+            "octocat",
+            "me@work.com",
+        ] {
+            assert!(
+                !md.contains(forbidden),
+                "`{forbidden}` in the sidecar:\n{md}"
+            );
+        }
+        // …and the inventory really is in the document it sits beside, so the
+        // loop above is a difference between the two rather than a vacuous
+        // assertion.
+        let inside = render(&manifest);
+        for present in ["aws", "cf-api", "9876", "me@work.com"] {
+            assert!(inside.contains(present), "`{present}` missing:\n{inside}");
+        }
     }
 
     #[test]
