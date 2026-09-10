@@ -5,6 +5,99 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-09-10
+
+### Fixed
+
+- **An import could finish with every credential file in place and not one
+  secret in it, and exit 0.** A real move of 64 keys onto a second Mac wrote all
+  53 credential files, then had every one of the 64 keychain writes refused
+  (macOS will not let a session with no desktop login write to a keychain), and
+  reported success. The reason was recorded per key and then thrown away by the
+  printer, so what you saw was a column of bare `skip` and no fact that
+  explained it.
+
+  Three changes, because the failure had three halves. `pb import` now probes
+  whether the keystore will take a write **before** it copies a file, and
+  refuses the whole import if it will not — 53 files followed by 64 dropped
+  secrets was the worst reachable outcome and is no longer reachable. A key that
+  is refused prints its reason like a file always did, plus one summary line
+  saying the bundle still holds the values, so nothing is lost. And an import
+  that dropped secrets exits 1: `pb import && ./something` was the one caller
+  that could not tell.
+
+- **The install instructions could not reach the machine that needed them.** A
+  bundle's `SETUP.md` explains how to install patchbay on a machine that does
+  not have it, and lived inside the encrypted payload — so reading the
+  instructions for installing `pb` required a `pb`. On the move above the
+  receiving Mac had neither and the command was looked up on the releases page
+  by hand. `pb export` now also writes a cleartext `<bundle>-SETUP.md` beside
+  the bundle: the install step and the `pb import` line, and nothing else. It
+  takes no manifest at all, which is the structural reason no inventory can
+  leak into it.
+
+- **A Cloudflare token that works was reported `invalid`.**
+  `/user/tokens/verify` only answers for user-owned tokens; an account-owned or
+  scoped token gets the same "Invalid API Token" rejection whether it is live or
+  revoked. patchbay believed the rejection and told you to replace working
+  keys — the exact mistake the verdict enum's own doc comment warns about. A
+  rejection now falls back to listing accounts with the token: if that works the
+  token demonstrably does, and if it does not, the answer is the new
+  `inconclusive` verdict rather than a death sentence, because a revoked token
+  and a narrowly scoped one are the same HTTP response. Nine keys in a real
+  vault moved from red to honest.
+
+- **A GitHub App private key was reported `invalid` for the same reason.** A PEM
+  is not a token `GET /user` can ever authenticate, so the request could only
+  ever say "Bad credentials". A PEM-shaped value is now `unsupported` before any
+  request is made, with the note that an App key is verified by minting a JWT
+  and patchbay has no app id to mint one with.
+
+- **The panel's refresh button did nothing on two of its three pages.** It only
+  ever re-fetched the tool board, so on the key vault and the MCP matrix it
+  spun, moved the timestamp, and left the table that was loaded on mount. A
+  header that already names the view you are in has to refresh that view.
+  Alongside it: a failed re-read of the MCP matrix now leaves the matrix on
+  screen with the error above it, instead of replacing a working board with a
+  banner.
+
+- **`pb plan` lost the one fix an import knew.** Several kubeconfigs land in one
+  directory and the import tells you the `KUBECONFIG` line to set; by the time
+  you ran `pb plan` the item said only "nothing is logged in". The item now
+  carries the real `export KUBECONFIG=…` line, re-derived from the files
+  themselves so nothing has to be persisted to stay true.
+
+- **`pb key verify` offered Grafana's `--endpoint` advice to every unsupported
+  provider**, including the 52 in a real vault that have no endpoint to set.
+
+### Added
+
+- **`--passphrase-file <path>` and `--passphrase-fd <n>` on `pb export` and
+  `pb import`.** The old rule refused a passphrase from anything but a
+  terminal. Its reason — argv is visible to `ps` and lands in shell history — is
+  right and is kept, but a TTY test is the wrong instrument for it: it stops no
+  attacker and it stopped every legitimate automation, including a real move
+  that worked around it with a pty wrapper whose echo wrote the passphrase into
+  a log. That is the leak the rule exists to prevent, caused by the rule. So
+  patchbay now lets automation name its source the way gpg, restic, borg and age
+  do. A passphrase file that the group or the world can read is refused, because
+  with that flag the file *is* the secret. Still no passphrase as an argument.
+
+- **`pb import <bundle> --keys-only`** — restore just the vault half, for
+  finishing a move whose keychain writes were refused.
+
+- **`pb key verify <ID>...` and `pb key verify --all`.** It took exactly one id,
+  which in a vault of 64 keys means nobody checks. A sweep runs the network
+  calls bounded-concurrent and prints a tally. Exit codes are now three: 1 if a
+  provider says a key is dead, 2 if a provider could not be reached, 0
+  otherwise — and `inconclusive` and `unsupported` are in that 0, because
+  neither is a fact about the key.
+
+- **Frontend tests.** The panel had none, and the refresh bug above is exactly
+  the kind nothing else could catch. vitest + Testing Library, mocked at
+  `invoke` — the one thing genuinely absent from a test process — with the four
+  regressions that fail if the fix is reverted.
+
 ## [0.7.0] - 2026-09-08
 
 ### Added
