@@ -39,6 +39,17 @@ export default function App() {
   const [version, setVersion] = useState("");
   const [filters, setFilters] = useState<Filters>(NO_FILTERS);
   const [view, setView] = useState<View>("board");
+  /**
+   * Bumped by every refresh, and read by the views that own their own data.
+   *
+   * The board is the only thing `statusAll` answers, so a refresh used to
+   * leave the key vault and the MCP matrix exactly as they were loaded on
+   * mount: the button spun, the stamp moved, and the table on screen was the
+   * one from ten minutes ago. A header that already names the view you are in
+   * has to refresh *that* view, so the poll and the button both bump this and
+   * every view re-reads.
+   */
+  const [reload, setReload] = useState(0);
 
   const [detail, setDetail] = useState<{ tool: string; permissions: boolean } | null>(null);
   const [verdicts, setVerdicts] = useState<Record<string, VerifyOutcome | null>>({});
@@ -53,6 +64,7 @@ export default function App() {
 
   const refresh = useCallback(async () => {
     setRefreshing(true);
+    setReload((n) => n + 1);
     try {
       setStatuses(await statusAll());
       setError(null);
@@ -233,8 +245,8 @@ export default function App() {
               and never worth covering the thing the window is for. */}
           <UpdateBanner />
 
-          {view === "keys" && <KeysView />}
-          {view === "mcp" && <McpView />}
+          {view === "keys" && <KeysView reload={reload} />}
+          {view === "mcp" && <McpView reload={reload} />}
 
           {view === "board" && (
             /* Same wrapper the other two views use: one idiom for "a view",

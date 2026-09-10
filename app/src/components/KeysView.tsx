@@ -20,7 +20,7 @@ import { KEY_EXPIRY_LABEL, KEY_EXPIRY_LEVEL, type KeyRow } from "../types";
  * so the rule was protecting nothing here and cost the panel the one action a
  * key vault is for.
  */
-export function KeysView() {
+export function KeysView({ reload }: { reload: number }) {
   const [rows, setRows] = useState<KeyRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
@@ -39,9 +39,13 @@ export function KeysView() {
     }
   }, []);
 
+  // `reload` is the header's refresh (and its poll). A vault registered from a
+  // terminal a moment ago is the ordinary case, so re-reading is the point.
+  // `load` keeps the rows it has if the read fails, so a transient error can
+  // never blank a table that was fine.
   useEffect(() => {
     void load();
-  }, [load]);
+  }, [load, reload]);
 
   const remove = async (id: string) => {
     setRemoving(id);

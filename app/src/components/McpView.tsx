@@ -34,7 +34,7 @@ type Open = { mode: "add" } | { mode: "edit"; name: string };
  * edit that client's copy, copy it to the clients that are missing it, or take
  * it out. `pb mcp add/copy/rm` still does the same work from a terminal.
  */
-export function McpView() {
+export function McpView({ reload }: { reload: number }) {
   const [clients, setClients] = useState<McpClient[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [open, setOpen] = useState<Open | null>(null);
@@ -56,15 +56,23 @@ export function McpView() {
     setOpen(next);
   };
 
+  // `reload` is the header's refresh (and its poll): six config files edited by
+  // six other programs is exactly the state that goes stale while you look at
+  // it. A failed re-read leaves `clients` alone, so the matrix you had stays on
+  // screen with the error above it rather than vanishing.
   useEffect(() => {
     let live = true;
     mcpList()
-      .then((c) => live && setClients(c))
+      .then((c) => {
+        if (!live) return;
+        setClients(c);
+        setError(null);
+      })
       .catch((e) => live && setError(String(e)));
     return () => {
       live = false;
     };
-  }, []);
+  }, [reload]);
 
   const servers = useMemo(() => {
     if (!clients) return [];
@@ -73,7 +81,7 @@ export function McpView() {
     return [...names].sort((a, b) => a.localeCompare(b));
   }, [clients]);
 
-  if (error) {
+  if (error && !clients) {
     return (
       <div className="banner">
         <span className="glyph">△</span>
@@ -98,6 +106,13 @@ export function McpView() {
           add server
         </button>
       </div>
+
+      {error && (
+        <div className="banner">
+          <span className="glyph">△</span>
+          <span>{error}</span>
+        </div>
+      )}
 
       {note && (
         <div className="switch-note">
